@@ -2,16 +2,17 @@
  * Wire the harness-tools read/write/grep/glob/lsp tools with a permission
  * policy scoped to the workspace.
  */
+// Each tool comes from its own package. The @agent-sh/harness-tools bundle
+// would also load the tools this runtime does not offer (bash, batch,
+// webfetch and others) and their dependencies.
+import { read, readToolDefinition, type TextReadResult } from '@agent-sh/harness-read';
 import {
-  read, readToolDefinition,
   write, writeToolDefinition, edit, editToolDefinition,
   multiEdit, multieditToolDefinition,
-  grep, grepToolDefinition, defaultGrepEngine,
-  glob, globToolDefinition,
-  lsp, lspToolDefinition,
-  type GrepEngine,
-  type TextReadResult,
-} from '@agent-sh/harness-tools';
+} from '@agent-sh/harness-write';
+import { grep, grepToolDefinition, defaultGrepEngine, type GrepEngine } from '@agent-sh/harness-grep';
+import { glob, globToolDefinition } from '@agent-sh/harness-glob';
+import { lsp, lspToolDefinition, createSpawnLspClient, type LspManifest } from '@agent-sh/harness-lsp';
 import {
   defaultNodeOperations,
   defaultNodeWriteOperations,
@@ -24,7 +25,6 @@ import {
 } from '@agent-sh/harness-core';
 import { realpath } from 'node:fs/promises';
 import path from 'node:path';
-import { createSpawnLspClient, type LspManifest } from '@agent-sh/harness-tools/lsp';
 import { adaptHarnessTool } from './adapter.js';
 
 export interface HarnessToolsBundle {

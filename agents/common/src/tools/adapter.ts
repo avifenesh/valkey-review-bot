@@ -1,7 +1,7 @@
 /**
- * Bridge @agent-sh/harness-tools tools into @strands-agents/sdk tools.
+ * Bridge @agent-sh/harness-* tools into @strands-agents/sdk tools.
  *
- * harness-tools exposes each tool as a definition ({ name, description,
+ * Each harness package exposes its tool as a definition ({ name, description,
  * inputSchema as JSON Schema }) plus a function (input, session) => result.
  * Strands validates tool input with a zod schema, so the JSON Schema is
  * converted to zod and the function is wrapped as the tool callback.
@@ -34,7 +34,7 @@ interface JsonSchemaNode {
 }
 
 /**
- * Convert the subset of JSON Schema that harness-tools emits (flat
+ * Convert the subset of JSON Schema that the harness tools emit (flat
  * string/number/boolean/array/object schemas with `required`) to zod.
  * Anything else becomes z.any(), which accepts the value as is.
  */

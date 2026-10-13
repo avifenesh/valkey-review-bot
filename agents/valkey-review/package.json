@@ -17,7 +17,11 @@
   },
   "dependencies": {
     "@agent-sh/harness-core": "^0.2.0",
-    "@agent-sh/harness-tools": "^0.6.0",
+    "@agent-sh/harness-glob": "^0.2.0",
+    "@agent-sh/harness-grep": "^0.4.0",
+    "@agent-sh/harness-lsp": "^0.2.0",
+    "@agent-sh/harness-read": "^0.4.0",
+    "@agent-sh/harness-write": "^0.6.0",
     "@aws-sdk/client-agent-registry-control": "^3.1150.0",
     "@aws-sdk/client-bedrock-runtime": "^3.1067.0",
     "@aws-sdk/client-dynamodb": "^3.1045.0",
