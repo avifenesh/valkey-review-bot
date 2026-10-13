@@ -104,8 +104,10 @@ export interface CheckResult {
 }
 
 /**
- * Checks of a skill in a row whose diff was read only in part, after
- * which the next such check confirms too. See confirmableCommit.
+ * Partial checks of a skill (isPartial), counted once per maintenance
+ * message since its verification last moved, after which the next
+ * partial check confirms too: with 2, the third partial message. See
+ * confirmableCommit and partialCountWrite.
  */
 export const PARTIAL_CHECKS_BEFORE_CONFIRM = 2;
 
@@ -116,10 +118,112 @@ export function isPartial(result: CheckResult): boolean {
 
 export interface ConfirmOptions {
   /**
-   * The caller's count of earlier checks of the skill, in a row since
-   * its verification last moved, whose result isPartial. Default 0.
+   * The partial checks of the skill counted before this one:
+   * partialChecksBefore(record, maintenance_id). Never the raw
+   * partial_checks, which already holds this message's own count when
+   * the message is run again. Default 0; NaN counts as 0.
    */
   readonly partialBefore?: number;
+}
+
+/**
+ * The partial count on a skill's record, as the check run read it (step
+ * 1, consistent read). Pass the record item itself.
+ */
+export interface PartialCountRecord {
+  /** N: partial checks counted since the verification last moved. Missing, negative or not a finite number counts as 0; a fraction is rounded down. */
+  readonly partial_checks?: unknown;
+  /** S: the maintenance_id of the message counted last. */
+  readonly partial_check_id?: unknown;
+}
+
+/**
+ * What the write that records a check's outcome does to the partial
+ * count: REMOVE both attributes, SET both to the values given, or write
+ * neither. See partialCountWrite.
+ */
+export type PartialCountWrite =
+  | { readonly kind: 'reset' }
+  | { readonly kind: 'count'; readonly partial_checks: number; readonly partial_check_id: string }
+  | { readonly kind: 'keep' };
+
+function storedCount(value: unknown): number {
+  return typeof value === 'number' && Number.isFinite(value) && value > 0 ? Math.floor(value) : 0;
+}
+
+function requireMessageId(id: unknown): asserts id is string {
+  if (typeof id !== 'string' || id.length === 0) throw new TypeError('partial count: the maintenance_id of the message is required');
+}
+
+/**
+ * opts.partialBefore for a check run of maintenance message
+ * `maintenanceId`: the partial checks counted before this message. A
+ * count this message made itself, in an earlier run of the same message
+ * (a redelivery after a throw or a 15-minute cut, or a second run that
+ * started alongside), is left out, so a message never confirms on its
+ * own count.
+ */
+export function partialChecksBefore(record: PartialCountRecord, maintenanceId: string): number {
+  requireMessageId(maintenanceId);
+  const n = storedCount(record.partial_checks);
+  return record.partial_check_id === maintenanceId ? Math.max(0, n - 1) : n;
+}
+
+/**
+ * What the write that records a check's check_outcome does to the
+ * record's partial count, for a run of maintenance message
+ * `maintenanceId`. Pass the result of the check of the skill as it was
+ * (never the 10(c) re-run on an edited body), the record as read, and
+ * whether this write sets verified_sha.
+ *
+ * - reset, when the write sets verified_sha: REMOVE partial_checks and
+ *   partial_check_id. That is every confirmation: clean (step 6),
+ *   accurate, revised (10(c)), and one through the way past a partial
+ *   diff, whatever the result.
+ * - count, when the result isPartial, the write leaves verified_sha as
+ *   it was, and the record does not already hold this message's count:
+ *   SET partial_checks and partial_check_id to the values returned (the
+ *   count + 1, and this maintenance_id). The check_outcome the write
+ *   records does not matter. It counts for inconclusive (the usual case:
+ *   incomplete and nothing flagged, so no model call and the claim is
+ *   kept), and equally for suspect, obsolete, error, or an accurate or
+ *   revise verdict that could not move the verification because
+ *   confirmableCommit was null.
+ * - keep, otherwise: write neither attribute. That is a result that is
+ *   not partial while verified_sha stays: a first check (no base), a
+ *   base that was malformed, missing, not fetched or gone, or a diff
+ *   read in full whose audit did not confirm. It is also a partial
+ *   result of a message already counted, by an earlier run of it.
+ *
+ * A run that ends before checkSkill (skipped, registry CREATING or
+ * UPDATING, no upstream), or that throws before its outcome write,
+ * changes neither attribute, whatever it records; a redelivered copy is
+ * counted when it writes.
+ *
+ * Put the count in the same UpdateItem as check_outcome, under the
+ * claim's condition (maintenance_id = :id AND #grn = :name), and for
+ * count also under the count as read:
+ * (attribute_not_exists(partial_check_id) OR partial_check_id <> :id)
+ * AND partial_checks = :read, or attribute_not_exists(partial_checks)
+ * when it was missing. When two runs of one message read the record
+ * before either wrote, their count writes are the same and the second
+ * loses the condition: finish it skipped, as for any
+ * ConditionalCheckFailed.
+ *
+ * Each message needs its own maintenance_id for the count to be exact.
+ * A reused one is counted once, which can only delay the way past a
+ * partial diff, never hasten it.
+ */
+export function partialCountWrite(
+  result: CheckResult,
+  record: PartialCountRecord,
+  maintenanceId: string,
+  opts: { readonly movesVerification: boolean },
+): PartialCountWrite {
+  requireMessageId(maintenanceId);
+  if (opts.movesVerification) return { kind: 'reset' };
+  if (!isPartial(result) || record.partial_check_id === maintenanceId) return { kind: 'keep' };
+  return { kind: 'count', partial_checks: storedCount(record.partial_checks) + 1, partial_check_id: maintenanceId };
 }
 
 /**
@@ -142,7 +246,9 @@ export interface ConfirmOptions {
  * result that is incomplete because its base was malformed, missing or
  * could not be fetched never confirms. A commit returned while
  * `incomplete` is not empty means this way was taken, and the caller
- * records that it was.
+ * records that it was. The caller keeps the count with
+ * partialChecksBefore and partialCountWrite, so that a message run more
+ * than once is counted once.
  */
 export function confirmableCommit(result: CheckResult, opts: ConfirmOptions = {}): string | null {
   if (result.incomplete.length === 0) return result.commit;

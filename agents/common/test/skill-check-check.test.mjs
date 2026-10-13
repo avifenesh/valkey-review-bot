@@ -8,7 +8,7 @@ import test from 'node:test';
 // No resolve hook: these modules must load under plain type stripping.
 const {
   areaFileCounts, checkSkill, confirmableCommit, DIFF_BUDGET_BYTES, DIFF_FILES_PER_CALL, DIFF_MAX_BYTES, globToRegExp, isPartial,
-  PARTIAL_CHECKS_BEFORE_CONFIRM, RARE_MAX,
+  PARTIAL_CHECKS_BEFORE_CONFIRM, partialChecksBefore, partialCountWrite, RARE_MAX,
 } = await import('../src/skill-check/check.ts');
 const { extractNames } = await import('../src/skill-check/names.ts');
 const { createGitRunner } = await import('../src/skill-check/upstream.ts');
@@ -401,6 +401,115 @@ test(`a check whose diff stays partial confirms after ${PARTIAL_CHECKS_BEFORE_CO
     assert.equal(confirmableCommit(result, { partialBefore: 99 }), null, input.baseSha);
   }
   r.cleanup();
+});
+
+/** Real results of each kind, from one repository: a diff read in part, and the other cases. */
+async function resultKinds() {
+  const r = repo({ 'a.txt': 'int rare_pc_name = 1;\n' }, { 'a.txt': 'int rare_pc_name = 2;\n' });
+  const n = names('`rare_pc_name`');
+  const cutting = async (args, opts) => (args.includes('-U0')
+    ? { code: -1, truncated: true, stderr: '', stdout: 'diff --git a/a.txt b/a.txt\n@@ -1 +1 @@\n-int rare_pc_name = 1;\n+int rare_pc_name = 2;\n+xxxx' }
+    : r.git(args, opts));
+  const check = (git, input) => checkSkill(git, { names: n, baseline: ['rare_pc_name'], ...input });
+  const kinds = {
+    partial: await check(cutting, { baseSha: r.baseSha }),
+    complete: await check(r.git, { baseSha: r.baseSha }),
+    first: await check(r.git, {}),
+    malformed: await check(cutting, { baseSha: 'HEAD~1' }),
+    missing: await check(cutting, { baseSha: 'f'.repeat(40) }),
+    notFetched: await check(cutting, { baseSha: r.baseSha, checkout: { baseAvailable: false, baseGone: false } }),
+    gone: await check(cutting, { baseSha: r.baseSha, checkout: { baseAvailable: false, baseGone: true } }),
+  };
+  r.cleanup();
+  assert.deepEqual(Object.keys(kinds).filter((k) => isPartial(kinds[k])), ['partial']);
+  return { kinds, tip: r.tipSha };
+}
+
+test('the partial count counts each maintenance message once, however often it runs', async () => {
+  const { kinds, tip } = await resultKinds();
+  // One curator run of message `id`, as the contract has it: read the record, ask for the commit, then write the outcome
+  // with the claim's condition and the count as read. Returns the commit it may record, or false when its write lost.
+  const run = (rec, id, result) => {
+    const read = { ...rec };
+    const commit = confirmableCommit(result, { partialBefore: partialChecksBefore(read, id) });
+    const write = partialCountWrite(result, read, id, { movesVerification: commit !== null });
+    return () => {
+      if (rec.maintenance_id !== id) return false;
+      if (write.kind === 'count') {
+        if (rec.partial_check_id === id || rec.partial_checks !== read.partial_checks) return false;
+        rec.partial_checks = write.partial_checks;
+        rec.partial_check_id = write.partial_check_id;
+      } else if (write.kind === 'reset') {
+        delete rec.partial_checks;
+        delete rec.partial_check_id;
+        delete rec.maintenance_id;
+      }
+      return commit;
+    };
+  };
+  const count = (rec) => [rec.partial_checks, rec.partial_check_id];
+
+  const rec = { maintenance_id: 'check#r#id#2026-10-01' };
+  // A partial check, then two redelivered copies of the same message (after a throw, or a cut at 15 minutes).
+  for (let i = 0; i < 3; i++) {
+    assert.equal(run(rec, 'check#r#id#2026-10-01', kinds.partial)(), null, `receive ${i + 1}`);
+    assert.deepEqual(count(rec), [1, 'check#r#id#2026-10-01'], `receive ${i + 1}`);
+  }
+
+  // The next message: two copies that read the record before either wrote make the same write, and the second loses.
+  rec.maintenance_id = 'check#r#id#2026-10-08';
+  const first = run(rec, 'check#r#id#2026-10-08', kinds.partial);
+  const second = run(rec, 'check#r#id#2026-10-08', kinds.partial);
+  assert.equal(first(), null);
+  assert.equal(second(), false);
+  assert.deepEqual(count(rec), [2, 'check#r#id#2026-10-08']);
+  // A later copy of it does not confirm on its own count: one partial check came before it, not two.
+  assert.equal(run(rec, 'check#r#id#2026-10-08', kinds.partial)(), null);
+  assert.deepEqual(count(rec), [2, 'check#r#id#2026-10-08']);
+
+  // A check whose base could not be fetched neither counts nor resets.
+  rec.maintenance_id = 'check#r#id#2026-10-15';
+  assert.equal(run(rec, 'check#r#id#2026-10-15', kinds.notFetched)(), null);
+  assert.deepEqual(count(rec), [2, 'check#r#id#2026-10-08']);
+
+  // The third partial message takes the way past the partial diff, and the confirmation resets the count.
+  rec.maintenance_id = 'check#r#id#2026-10-22';
+  assert.equal(run(rec, 'check#r#id#2026-10-22', kinds.partial)(), tip);
+  assert.deepEqual(count(rec), [undefined, undefined]);
+  rec.maintenance_id = 'check#r#id#2026-10-29';
+  assert.equal(run(rec, 'check#r#id#2026-10-29', kinds.partial)(), null);
+  assert.deepEqual(count(rec), [1, 'check#r#id#2026-10-29']);
+});
+
+test('only a partial result that leaves the verification counts; every write that moves it resets the count', async () => {
+  const { kinds } = await resultKinds();
+  const id = 'check#r#id#2026-10-13';
+  const counted = { partial_checks: 1, partial_check_id: 'check#r#id#2026-10-06' };
+  for (const [kind, result] of Object.entries(kinds)) {
+    for (const rec of [{}, counted, { partial_checks: 2, partial_check_id: id }]) {
+      assert.deepEqual(partialCountWrite(result, rec, id, { movesVerification: true }), { kind: 'reset' }, kind);
+    }
+    // Unchanged when it is not partial, whatever outcome the run records, and when this message was counted already.
+    const expected = kind === 'partial' ? { kind: 'count', partial_checks: 2, partial_check_id: id } : { kind: 'keep' };
+    assert.deepEqual(partialCountWrite(result, counted, id, { movesVerification: false }), expected, kind);
+    assert.deepEqual(partialCountWrite(result, { partial_checks: 2, partial_check_id: id }, id, { movesVerification: false }), { kind: 'keep' }, kind);
+  }
+  assert.deepEqual(partialCountWrite(kinds.partial, {}, id, { movesVerification: false }), { kind: 'count', partial_checks: 1, partial_check_id: id });
+
+  // A count that is missing or not a usable number is 0; one this message made itself is left out.
+  for (const bad of [undefined, null, '2', -1, Number.NaN, Number.POSITIVE_INFINITY]) {
+    assert.equal(partialChecksBefore({ partial_checks: bad, partial_check_id: 'other' }, id), 0, String(bad));
+    assert.deepEqual(partialCountWrite(kinds.partial, { partial_checks: bad }, id, { movesVerification: false }), { kind: 'count', partial_checks: 1, partial_check_id: id }, String(bad));
+  }
+  assert.equal(partialChecksBefore({}, id), 0);
+  assert.equal(partialChecksBefore({ partial_checks: 2.5, partial_check_id: 'other' }, id), 2);
+  assert.equal(partialChecksBefore(counted, id), 1);
+  assert.equal(partialChecksBefore({ partial_checks: 2, partial_check_id: id }, id), 1);
+  assert.equal(partialChecksBefore({ partial_checks: 0, partial_check_id: id }, id), 0);
+  for (const bad of ['', undefined, 7]) {
+    assert.throws(() => partialChecksBefore(counted, bad), TypeError);
+    assert.throws(() => partialCountWrite(kinds.partial, counted, bad, { movesVerification: false }), TypeError);
+  }
 });
 
 test('word counts are exact when patterns overlap and pass one grep call', async () => {
