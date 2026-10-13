@@ -31,8 +31,9 @@ import { errorText, fail, ok, type CuratorRun } from './run.js';
  *   decay_score, updated_at           1.0 and the time of the last reinforcement; ops/src/decay.ts lowers the score
  *   edited_at                         last area/context edit that was not a reinforcement
  *   graduated_record_name, graduated_at   set by submit_skill
- *   skill_generation                  generation of the published skill, 1 when absent;
- *   previous_record_name              with the retired name it replaced, set by submit_skill
+ *   skill_generation                  generation of the published skill, 1 when absent
+ *   previous_record_name              the retired skill a later generation replaced;
+ *                                     both set by submit_skill
  *   retired_at, retired_reason        the skill was retired (decayed, obsolete or operator);
  *                                     the record stays as a tombstone
  *   verified_*, check_*, stale_names  the release check's last result
