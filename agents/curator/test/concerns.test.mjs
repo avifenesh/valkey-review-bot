@@ -485,3 +485,18 @@ test('update_concern marks the run as having edited a graduated record, and only
   assert.equal(out.ok, false);
   assert.equal(t.run.edited, null, 'an edit that did not land marks nothing');
 });
+
+test('a reinforced tombstone is eligible to graduate again unless an operator retired it', async () => {
+  for (const [reason, eligible] of [['decayed', true], ['obsolete', true], [undefined, true], ['operator', false], ['other', false]]) {
+    const extra = { retired_at: '2026-09-01T00:00:00.000Z', ...(reason ? { retired_reason: reason } : {}) };
+    const bumpDdb = fakeDdb({ UpdateCommand: () => ({ Attributes: checked('r1', 5, extra) }) });
+    const bumped = parse(await tools(bumpDdb).bump_concern.invoke({ area_bucket: 'src', record_id: 'r1' }));
+    assert.equal(bumped.ok, true);
+    assert.equal(bumped.eligible_for_graduation, eligible, `bump, ${reason}`);
+
+    const { ddb } = concernsTable([checked('tgt1', 4, extra), record('src1', 1)]);
+    const { out } = await mergeInto(ddb);
+    assert.equal(out.ok, true);
+    assert.equal(out.eligible_for_graduation, eligible, `merge, ${reason}`);
+  }
+});

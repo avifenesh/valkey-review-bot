@@ -125,6 +125,17 @@ function isRetired(item: Item): boolean {
   return graduatedName(item) !== '' && item.retired_at !== undefined;
 }
 
+/**
+ * Whether submit_skill could publish this record's skill again: not for
+ * a skill an operator retired, or one retired for a reason it does not
+ * know. Decayed and obsolete skills come back under a new name.
+ */
+function republishable(item: Item): boolean {
+  if (!isRetired(item)) return true;
+  const reason = item.retired_reason;
+  return reason === undefined || reason === 'decayed' || reason === 'obsolete';
+}
+
 function stringList(value: unknown): string[] | undefined {
   if (value instanceof Set) return [...value].map(String).sort();
   return Array.isArray(value) ? value.map(String) : undefined;
@@ -415,7 +426,7 @@ export function buildBumpConcernTool(deps: ConcernsDeps) {
 
 Optional \`area\` and \`context_addition\` apply in the same write, for a reinforcement that also widens the scope or explains why.
 
-The result says whether the record is now eligible for graduation (reinforcement_count >= ${deps.run.graduationThreshold}).`,
+The result says whether the record is now eligible for graduation (reinforcement_count >= ${deps.run.graduationThreshold}, and its skill was not retired by an operator).`,
     inputSchema: z.object({ area_bucket: areaBucketField, record_id: recordIdField, ...editFields }),
     callback: (input) => oneWrite(deps, 'bump_concern', { structural: false, action: `bump_concern ${input.record_id}`, areaBucket: input.area_bucket }, async () => {
       const { run } = deps;
@@ -450,7 +461,11 @@ The result says whether the record is now eligible for graduation (reinforcement
         run.reinforced = { areaBucket: input.area_bucket, recordId: input.record_id };
         return {
           changed: true,
-          text: ok({ reinforced: true, record: recordView(record), eligible_for_graduation: count(record) >= run.graduationThreshold }),
+          text: ok({
+            reinforced: true,
+            record: recordView(record),
+            eligible_for_graduation: count(record) >= run.graduationThreshold && republishable(record),
+          }),
         };
       } catch (err) {
         if (!isConditionFailure(err)) throw err;
@@ -611,7 +626,7 @@ A record that has graduated to a skill can only be the target. Use this only aft
             target_record_id: input.target_record_id,
             deleted_record_id: input.source_record_id,
             reinforcement_count: total,
-            eligible_for_graduation: total >= deps.run.graduationThreshold,
+            eligible_for_graduation: total >= deps.run.graduationThreshold && republishable(target),
           }),
         };
       });
