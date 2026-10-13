@@ -70,8 +70,9 @@ async function readPullRequestRuns(prefix: string): Promise<PullRequestRun[]> {
  * A review of new commits holds its pull request's pending marker until
  * its run starts (src/store.ts); from then on a push can queue the next
  * round. A message that still holds it has never run. Without
- * IDEMPOTENCY_TABLE the worker cannot tell: it runs the message like any
- * review and the marker expires on its own.
+ * IDEMPOTENCY_TABLE, or without the grant to read it, the worker cannot
+ * tell: it runs the message like any review and the marker expires on
+ * its own. Any other failed read throws, and the message is retried.
  */
 async function holdsMarker(marker: PendingMarker | undefined, tag: string): Promise<boolean> {
   if (!marker) return false;
@@ -79,7 +80,13 @@ async function holdsMarker(marker: PendingMarker | undefined, tag: string): Prom
     console.warn(`[pending] ${tag} IDEMPOTENCY_TABLE is not set; the pending marker stays until it expires`);
     return false;
   }
-  return holdsPendingReview(ddb, config.idempotencyTable, marker.repo, marker.prNumber, marker.markerId);
+  try {
+    return await holdsPendingReview(ddb, config.idempotencyTable, marker.repo, marker.prNumber, marker.markerId);
+  } catch (err) {
+    if ((err as { name?: string } | null)?.name !== 'AccessDeniedException') throw err;
+    console.error(`[pending] ${tag} may not read ${config.idempotencyTable}; the pending marker stays until it expires`, err);
+    return false;
+  }
 }
 
 /**

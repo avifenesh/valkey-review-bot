@@ -130,6 +130,17 @@ test('a failed marker read leaves the message for a retry', async () => {
   assert.deepEqual(ops(), ['GetCommand idempotency']);
 });
 
+test('a worker not allowed to read the marker runs the review like any other', async () => {
+  ddbAnswer = async (command) => {
+    if (command.constructor.name === 'GetCommand') throw Object.assign(new Error('not authorized'), { name: 'AccessDeniedException' });
+    throw new Error(`unexpected ${command.constructor.name}`);
+  };
+  const { result, lines } = await run(sqsEvent({ ...review, pending_marker: 'marker-1' }));
+  assert.deepEqual(result, { batchItemFailures: [] });
+  assert.deepEqual(ops(), ['GetCommand idempotency', 'InvokeAgentRuntimeCommand']);
+  assert.ok(lines.some((l) => /may not read idempotency; the pending marker stays until it expires/.test(l)), lines.join('\n'));
+});
+
 test('a redelivery whose marker is gone is watched like any review', async () => {
   ddbAnswer = tables({ heartbeat: { status: 'running', last_activity: Date.now() } });
   const alive = await run(sqsEvent({ ...review, pending_marker: 'marker-1' }, 2));
