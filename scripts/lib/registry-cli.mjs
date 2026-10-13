@@ -39,9 +39,10 @@ export function registrySdk() {
 
 /**
  * Registry id from --registry-id, or from the first of `outputKeys`
- * present on the CloudFormation stack given with --stack.
+ * present on the CloudFormation stack given with --stack. `values` is
+ * what cliArgs returned, keyed by flag name.
  */
-export function resolveRegistryId({ registryId, stack, region }, outputKeys) {
+export function resolveRegistryId({ 'registry-id': registryId, stack, region }, outputKeys) {
   if (registryId && stack) fail('pass --registry-id or --stack, not both');
   if (registryId) return registryId;
   if (!stack) fail('pass --registry-id ID or --stack STACK_NAME');
