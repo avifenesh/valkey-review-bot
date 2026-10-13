@@ -285,9 +285,11 @@ async function startRun(
 
   let instruction = requestText;
   if (finding) {
-    const loc = finding.path ? `${finding.path}${finding.line ? `:${finding.line}` : ''}` : 'the PR';
+    // finding.path is a file name from the PR, so it is quoted as a JSON
+    // string rather than set in backticks the name could close.
+    const loc = finding.path ? `${JSON.stringify(finding.path)}${finding.line ? ` line ${finding.line}` : ''}` : 'the PR';
     instruction = [
-      `This is a re-review request in a review thread. You left this review comment on \`${loc}\`:`,
+      `This is a re-review request in a review thread. You left this review comment on ${loc}:`,
       '',
       `> ${finding.body.replace(/\n/g, '\n> ')}`,
       '',

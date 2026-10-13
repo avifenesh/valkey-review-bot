@@ -135,7 +135,7 @@ function toToolList(tools: readonly unknown[]): Tool[] {
   });
 }
 
-function mentionBlock(payload: Payload): string[] {
+export function mentionBlock(payload: Payload): string[] {
   const lines = [
     '',
     '---',
@@ -145,7 +145,9 @@ function mentionBlock(payload: Payload): string[] {
     'This review was requested by a maintainer tagging you on the PR. Their instruction below is the MAIN directive of this review: prioritize it over the default review flow, while still applying your evidence bar.',
   ];
   if (payload.trigger_path) {
-    lines.push(`The request was made inline on \`${payload.trigger_path}\`${payload.trigger_line ? ` line ${payload.trigger_line}` : ''}; weight that area accordingly.`);
+    // The path comes from the PR (a file name the author chose), so it is
+    // quoted as a JSON string: no newline or backtick can end the sentence.
+    lines.push(`The request was made inline on ${JSON.stringify(payload.trigger_path)}${payload.trigger_line ? ` line ${payload.trigger_line}` : ''}; weight that area accordingly.`);
   }
   lines.push(
     '',
