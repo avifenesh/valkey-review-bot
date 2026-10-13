@@ -41,6 +41,14 @@ export interface ConcernsDeps {
 
 /** Records list_concerns returns, after sorting the whole bucket. */
 export const LIST_LIMIT = 20;
+/**
+ * area_bucket values that start with this are reserved for items the
+ * skill lifecycle keeps in the table, such as the repo skill check item
+ * (RESERVED_BUCKET_PREFIX in ops/src/decay.ts). They are not concern
+ * records: every tool refuses such a bucket, and no tool output shows
+ * their items.
+ */
+export const RESERVED_BUCKET_PREFIX = '#';
 /** Upper bound on a record's context, so repeated additions cannot grow it without limit. */
 export const CONTEXT_MAX_CHARS = 4000;
 
@@ -93,6 +101,17 @@ function isConditionFailure(err: unknown): boolean {
   return (err as { name?: string } | null)?.name === 'ConditionalCheckFailedException';
 }
 
+export function isReservedBucket(areaBucket: unknown): boolean {
+  return typeof areaBucket === 'string' && areaBucket.startsWith(RESERVED_BUCKET_PREFIX);
+}
+
+/** The refusal for a tool given a reserved area_bucket, or null. */
+export function reservedBucketError(toolName: string, areaBucket: string): string | null {
+  return isReservedBucket(areaBucket)
+    ? fail(`${toolName}: area_bucket values starting with "${RESERVED_BUCKET_PREFIX}" are reserved and hold no concern records`)
+    : null;
+}
+
 /**
  * What the model sees of a record. The reinforcers set holds GitHub
  * logins, which must not end up in records or skills, so only its size
@@ -133,10 +152,12 @@ interface WriteOutcome {
 async function oneWrite(
   deps: ConcernsDeps,
   toolName: string,
-  opts: { structural: boolean; action: string },
+  opts: { structural: boolean; action: string; areaBucket: string },
   write: () => Promise<WriteOutcome>,
 ): Promise<string> {
   const { run } = deps;
+  const reserved = reservedBucketError(toolName, opts.areaBucket);
+  if (reserved) return reserved;
   if (opts.structural && !run.allowsStructuralChange) {
     return fail(`${toolName}: feedback of kind "${run.kind}" can only bump an existing record`);
   }
@@ -271,6 +292,8 @@ export function buildListConcernsTool(deps: ConcernsDeps) {
 Call it with each candidate bucket derived from the anchor path and the touched files, and read the records before deciding.`,
     inputSchema: z.object({ area_bucket: areaBucketField }),
     callback: async (input) => {
+      const reserved = reservedBucketError('list_concerns', input.area_bucket);
+      if (reserved) return reserved;
       try {
         const items: Item[] = [];
         let startKey: Record<string, any> | undefined;
@@ -281,7 +304,7 @@ Call it with each candidate bucket derived from the anchor path and the touched 
             ExpressionAttributeValues: { ':b': input.area_bucket },
             ExclusiveStartKey: startKey,
           }));
-          items.push(...(page.Items ?? []));
+          items.push(...(page.Items ?? []).filter((item) => !isReservedBucket(item.area_bucket)));
           startKey = page.LastEvaluatedKey;
         } while (startKey);
         items.sort((a, b) => count(b) - count(a) || String(b.updated_at ?? '').localeCompare(String(a.updated_at ?? '')));
@@ -299,6 +322,8 @@ export function buildGetConcernTool(deps: ConcernsDeps) {
     description: 'Read one concern record in full. Returns `record: null` when it does not exist.',
     inputSchema: z.object({ area_bucket: areaBucketField, record_id: recordIdField }),
     callback: async (input) => {
+      const reserved = reservedBucketError('get_concern', input.area_bucket);
+      if (reserved) return reserved;
       try {
         const item = await getRecord(deps, input.area_bucket, input.record_id);
         return ok({ record: item ? recordView(item) : null });
@@ -317,7 +342,7 @@ export function buildCreateConcernTool(deps: ConcernsDeps) {
 
 \`area_bucket\` is the partition list_concerns reads; \`record.area\` lists the globs the record applies to, which can be narrower or wider than the bucket.`,
     inputSchema: z.object({ area_bucket: areaBucketField, record: concernShape }),
-    callback: (input) => oneWrite(deps, 'create_concern', { structural: true, action: 'create_concern' }, async () => {
+    callback: (input) => oneWrite(deps, 'create_concern', { structural: true, action: 'create_concern', areaBucket: input.area_bucket }, async () => {
       const recordId = randomUUID();
       const now = new Date().toISOString();
       await deps.ddb.send(new PutCommand({
@@ -353,7 +378,7 @@ Optional \`area\` and \`context_addition\` apply in the same write, for a reinfo
 
 The result says whether the record is now eligible for graduation (reinforcement_count >= ${deps.run.graduationThreshold}).`,
     inputSchema: z.object({ area_bucket: areaBucketField, record_id: recordIdField, ...editFields }),
-    callback: (input) => oneWrite(deps, 'bump_concern', { structural: false, action: `bump_concern ${input.record_id}` }, async () => {
+    callback: (input) => oneWrite(deps, 'bump_concern', { structural: false, action: `bump_concern ${input.record_id}`, areaBucket: input.area_bucket }, async () => {
       const { run } = deps;
       if ((input.area || input.context_addition) && !run.allowsStructuralChange) {
         return { changed: false, text: fail(`bump_concern: feedback of kind "${run.kind}" can bump a record but not edit it`) };
@@ -416,7 +441,7 @@ export function buildUpdateConcernTool(deps: ConcernsDeps) {
 
 \`area\` replaces the glob list; \`context_addition\` is appended to the existing context. Give at least one. reinforcement_count, decay_score and updated_at do not change.`,
     inputSchema: z.object({ area_bucket: areaBucketField, record_id: recordIdField, ...editFields }),
-    callback: (input) => oneWrite(deps, 'update_concern', { structural: true, action: `update_concern ${input.record_id}` }, async () => {
+    callback: (input) => oneWrite(deps, 'update_concern', { structural: true, action: `update_concern ${input.record_id}`, areaBucket: input.area_bucket }, async () => {
       if (!input.area && !input.context_addition) {
         return { changed: false, text: fail('update_concern: give area, context_addition, or both') };
       }
@@ -463,7 +488,7 @@ A record that has graduated to a skill can only be the target. Use this only aft
       if (input.target_record_id === input.source_record_id) {
         return fail('merge_concerns: target_record_id and source_record_id are the same record');
       }
-      return oneWrite(deps, 'merge_concerns', { structural: true, action: `merge_concerns ${input.source_record_id} -> ${input.target_record_id}` }, async () => {
+      return oneWrite(deps, 'merge_concerns', { structural: true, action: `merge_concerns ${input.source_record_id} -> ${input.target_record_id}`, areaBucket: input.area_bucket }, async () => {
         const [target, source] = await Promise.all([
           getRecord(deps, input.area_bucket, input.target_record_id),
           getRecord(deps, input.area_bucket, input.source_record_id),
@@ -559,7 +584,7 @@ export function buildDeleteConcernTool(deps: ConcernsDeps) {
 
 Do not use it for feedback that is merely unhelpful; make no change instead.`,
     inputSchema: z.object({ area_bucket: areaBucketField, record_id: recordIdField }),
-    callback: (input) => oneWrite(deps, 'delete_concern', { structural: true, action: `delete_concern ${input.record_id}` }, async () => {
+    callback: (input) => oneWrite(deps, 'delete_concern', { structural: true, action: `delete_concern ${input.record_id}`, areaBucket: input.area_bucket }, async () => {
       const condition = 'attribute_exists(#rid) AND attribute_not_exists(#grn)';
       try {
         await deps.ddb.send(new DeleteCommand({

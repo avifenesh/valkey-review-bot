@@ -213,3 +213,13 @@ test('list_skill_authoring takes no input and falls back when unconfigured', asy
   assert.equal(failed.ok, false);
   assert.match(failed.reason, /denied/);
 });
+
+test('submit_skill refuses a reserved area_bucket', async () => {
+  const { submit, ddb, published, run } = setup({ item: { reinforcement_count: 9 }, reinforced: { areaBucket: '#maintenance', recordId: 'r1' } });
+  const out = parse(await submit.invoke({ ...INPUT, area_bucket: '#maintenance' }));
+  assert.equal(out.ok, false);
+  assert.match(out.error, /reserved/);
+  assert.equal(ddb.calls.length, 0);
+  assert.equal(published.length, 0);
+  assert.equal(run.take('skill_submit', 'next'), null);
+});

@@ -357,3 +357,35 @@ test('curator_done ends the run and later tools are refused', async () => {
   const again = parse(await t.curator_done.invoke({ decision: 'noop', summary: 'x' }));
   assert.equal(again.ok, false);
 });
+
+test('every concerns tool refuses a reserved area_bucket without touching the table', async () => {
+  const ddb = fakeDdb({});
+  const t = tools(ddb);
+  const bucket = '#maintenance';
+  const concern = { area: ['src/**'], subject: 's', concern: 'c', context: '' };
+  const calls = {
+    list_concerns: { area_bucket: bucket },
+    get_concern: { area_bucket: bucket, record_id: 'repo-skill' },
+    create_concern: { area_bucket: bucket, record: concern },
+    bump_concern: { area_bucket: bucket, record_id: 'repo-skill' },
+    update_concern: { area_bucket: bucket, record_id: 'repo-skill', context_addition: 'why' },
+    merge_concerns: { area_bucket: bucket, target_record_id: 'repo-skill', source_record_id: 'x', merged: concern },
+    delete_concern: { area_bucket: bucket, record_id: 'repo-skill' },
+  };
+  for (const [name, input] of Object.entries(calls)) {
+    const out = parse(await t[name].invoke(input));
+    assert.equal(out.ok, false, name);
+    assert.match(out.error, new RegExp(`^${name}: area_bucket values starting with "#" are reserved`), name);
+  }
+  assert.equal(ddb.calls.length, 0);
+  assert.equal(t.run.take('concern_write', 'next'), null, 'a refused write does not use the slot');
+});
+
+test('list_concerns never returns an item from a reserved bucket', async () => {
+  const ddb = fakeDdb({
+    QueryCommand: () => ({ Items: [record('r1', 1), { area_bucket: '#maintenance', record_id: 'repo-skill', verified_release: '9.1.2' }] }),
+  });
+  const out = parse(await tools(ddb).list_concerns.invoke({ area_bucket: 'src' }));
+  assert.equal(out.total, 1);
+  assert.deepEqual(out.records.map((r) => r.record_id), ['r1']);
+});

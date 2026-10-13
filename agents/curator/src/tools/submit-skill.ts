@@ -3,7 +3,7 @@ import { z } from 'zod';
 import { tool } from '@strands-agents/sdk';
 import { UpdateCommand } from '@aws-sdk/lib-dynamodb';
 import { GRADUATED_SKILL_MAX_CHARS, type UpsertSkillInput } from '../../../common/src/skills-registry.js';
-import { getRecord, type ConcernsDeps } from './concerns-ddb.js';
+import { getRecord, reservedBucketError, type ConcernsDeps } from './concerns-ddb.js';
 import { errorText, fail, ok } from './run.js';
 
 /**
@@ -114,6 +114,8 @@ Do not delete the source record afterwards; it stays as the skill's provenance.`
     }),
     callback: async (input) => {
       const { run } = deps;
+      const reserved = reservedBucketError('submit_skill', input.area_bucket);
+      if (reserved) return reserved;
       const busy = run.take('skill_submit', 'submit_skill');
       if (busy) return fail(busy);
       let published = false;
