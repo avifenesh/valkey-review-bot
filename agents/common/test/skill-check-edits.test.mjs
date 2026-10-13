@@ -224,22 +224,22 @@ test('numbers may change in prose, with emphasis, sentence punctuation or a vers
   const skillMd = ['---', 'name: p', 'description: "x"', '---', ...lines, ''].join('\n');
   const table = {
     'src/config.c:1': 'createIntConfig("hash-max-listpack-entries", 1024)',
-    'src/version.h:1': '#define VERSION "9.1.0" /* v9.1 */',
-    'src/version.h:2': '/* 9.0.2 */',
+    'src/db.c:1': '/* emptyDB is lazy since v9.1 (9.1.0) */',
+    'src/db.c:2': '/* emptyDB: 9.0.2 */',
   };
   const flagged = ['hash-max-listpack-entries', 'emptyDB'];
   const edits = [
     { original: lines[0], replacement: '`hash-max-listpack-entries` defaults to **1024**.', evidence: [cite('src/config.c', 1)] },
-    { original: lines[1], replacement: 'Since v9.1 (and 9.0.2) `emptyDB` is lazy.', evidence: [cite('src/version.h', 1), cite('src/version.h', 2)] },
+    { original: lines[1], replacement: 'Since v9.1 (and 9.0.2) `emptyDB` is lazy.', evidence: [cite('src/db.c', 1), cite('src/db.c', 2)] },
   ];
   const out = await validateEdits(skillMd, edits, ctx({ flagged }), resolver(table));
   assert.deepEqual(out.problems, []);
   assert.deepEqual(listSuppressedBlocks(out.skillMd).map((b) => b.reason), ['`512` is now `1024`', '`v9.0` is now `v9.1`; `9.0.1` is now `9.0.2`']);
   // A number must stand alone on the cited line: 9.1 is not in 9.1.0.
-  const partial = { original: lines[1], replacement: 'Since v9.0 (and 9.1) `emptyDB` is lazy.', evidence: [cite('src/version.h', 1)] };
-  assert.deepEqual((await validateEdits(skillMd, [partial], ctx({ flagged }), resolver(table))).problems, [
-    `edit 1: evidence ${REPO}@${SHA}:src/version.h:1: the line supports none of the changed names`,
-    'edit 1: no cited line contains `9.1`',
+  const partial = { original: lines[1], replacement: 'Since v9.0 (and 9.1) `emptyDB` is lazy.', evidence: [cite('src/db.c', 2)] };
+  assert.deepEqual((await validateEdits(skillMd, [partial], ctx({ flagged }), resolver({ 'src/db.c:2': '/* emptyDB: 9.1.0 */' }))).problems, [
+    `edit 1: evidence ${REPO}@${SHA}:src/db.c:2: the line supports none of the changed names`,
+    'edit 1: no cited line contains `9.1` together with a code name of line 1 (`emptyDB`)',
   ]);
 });
 
@@ -305,6 +305,46 @@ test('an original without a flagged name is refused', async () => {
   assert.deepEqual(await problemsFor({}, { flagged: ['empty'] }), ['edit 1: the original contains none of the flagged names'], 'a flagged name must match as a word');
 });
 
+test('only flagged names change, and a number only on a line that names one and with a cited code name', async () => {
+  const lines = [
+    'Flag `emptyDB` callers that allocate more than **3** times.',
+    'Never flag functions under 80 lines.',
+    'Keep `MUST_FLAG every caller` and `dictEntry` for `emptyDB`.',
+    'Flag emptyDB callers more than 3 times.',
+  ];
+  const skillMd = ['---', 'name: p', 'description: "x"', '---', ...lines, ''].join('\n');
+  const table = {
+    'src/db.c:1': '    return 0;',
+    'src/db.c:2': '#define X 8000',
+    'src/db.c:3': '#define EMPTYDB_MAX 0 /* emptyDB */',
+    'src/db.c:4': 'int NOT_FLAG, hashtableEntry;',
+    'src/db.c:5': 'emptyData(4);',
+  };
+  const problems = async (original, replacement, line, flagged = ['emptyDB']) =>
+    (await validateEdits(skillMd, [{ original, replacement, evidence: [cite('src/db.c', line)] }], ctx({ flagged }), resolver(table))).problems;
+  // A threshold cited from a line about something else.
+  assert.deepEqual(await problems(lines[0], lines[0].replace('**3**', '**0**'), 1), [
+    `edit 1: evidence ${REPO}@${SHA}:src/db.c:1: the line supports none of the changed names`,
+    'edit 1: no cited line contains `0` together with a code name of line 1 (`emptyDB`)',
+  ]);
+  assert.deepEqual(await problems(lines[0], lines[0].replace('**3**', '**0**'), 3), []);
+  // A threshold on a neighbouring line of the piece.
+  const two = `${lines[0]}\n${lines[1]}`;
+  assert.deepEqual(await problems(two, two.replace('80', '8000'), 2),
+    ['edit 1: the number 80 is on line 2 of the original, which has no flagged name; a number may change only on a line that names one']);
+  // Names the check did not flag, in a multi-word span or not.
+  assert.deepEqual(await problems(lines[2], lines[2].replace('MUST_FLAG', 'NOT_FLAG'), 4),
+    ['edit 1: `MUST_FLAG` is not a flagged name; only the names the check flagged (lost, new and absent, or touched) may change']);
+  assert.deepEqual(await problems(lines[2], lines[2].replace('dictEntry', 'hashtableEntry'), 4),
+    ['edit 1: `dictEntry` is not a flagged name; only the names the check flagged (lost, new and absent, or touched) may change']);
+  assert.deepEqual(await problems(lines[2], lines[2].replace('dictEntry', 'hashtableEntry'), 4, ['emptyDB', 'dictEntry']), []);
+  // A line that names the flagged name only in prose has no code name to cite with a number.
+  assert.deepEqual(await problems(lines[3], lines[3].replace('3', '4'), 5),
+    ['edit 1: the number 3 is on line 1 of the original, which has no code name in backticks to cite with it']);
+  // The renamed name of the replacement line counts too.
+  assert.deepEqual(await problems(lines[0], lines[0].replace('`emptyDB`', '`emptyData`').replace('**3**', '**4**'), 5), []);
+});
+
 test('more than MAX_EDITS edits, or none, are refused', async () => {
   const many = Array.from({ length: MAX_EDITS + 1 }, () => renamed);
   assert.deepEqual((await validateEdits(SKILL, many, ctx(), resolver())).problems, [`at most ${MAX_EDITS} edits per check, got ${MAX_EDITS + 1}`]);
@@ -349,7 +389,7 @@ test('pieces of more than 5 lines or 800 characters, and more than 6 edits, are 
   assert.deepEqual(await problemsFor(swap(long), {}, UPSTREAM, skillMd), ['edit 1: the original has 811 characters; at most 800']);
   const short = `- \`emptyDB\` \`a_bc\` ${'w '.repeat(380).trim()}`;
   const grown = { original: short, replacement: short.replace('`a_bc`', `\`a_${'b'.repeat(100)}\``), evidence: [cite('src/db.c', 120)] };
-  assert.deepEqual(checkEdits(`${skillMd}${short}\n`, [grown], ctx()), [`edit 1: the replacement has ${short.length + 98} characters; at most 800`]);
+  assert.deepEqual(checkEdits(`${skillMd}${short}\n`, [grown], ctx({ flagged: ['emptyDB', 'a_bc'] })), [`edit 1: the replacement has ${short.length + 98} characters; at most 800`]);
   const seven = lines.map(swap);
   assert.deepEqual((await validateEdits(skillMd, seven, ctx(), resolver())).problems, ['at most 6 edits per check, got 7']);
   assert.deepEqual((await validateEdits(skillMd, seven.slice(0, 6), ctx(), resolver())).problems, []);
@@ -412,7 +452,7 @@ test('a qualified name is supported by its changed part; a path, directory or gl
     '.github/CODEOWNERS:3': 'glide-core/src/conn/** @valkey-io/glide-maintainers',
     'glide-core/Cargo.toml:5': 'include = ["glide-core/src/new/"]',
   };
-  const flagged = ['ConnectionManager::reconnect'];
+  const flagged = ['ConnectionManager::reconnect', 'glide-core/src/client/**', 'glide-core/src/old/'];
   const evidence = [cite('glide-core/src/conn/mod.rs', 10), cite('.github/CODEOWNERS', 3), cite('glide-core/Cargo.toml', 5)];
   const ok = await validateEdits(skillMd, [{ original, replacement, evidence }], ctx({ flagged }), resolver(table));
   assert.deepEqual(ok.problems, []);
@@ -449,7 +489,7 @@ test('an edit that gives its own reason is refused; the reason is always generat
     evidence: [cite('src/hashtable.c', 2)],
   };
   const table = { 'src/hashtable.c:2': '/* src/hashtable.c: hashtableEntry */' };
-  const out = await validateEdits(SKILL, [two], ctx(), resolver(table));
+  const out = await validateEdits(SKILL, [two], ctx({ flagged: ['src/dict.c', 'dictEntry'] }), resolver(table));
   assert.deepEqual(out.problems, []);
   assert.equal(listSuppressedBlocks(out.skillMd)[0].reason, '`src/dict.c` is now `src/hashtable.c`; `dictEntry` is now `hashtableEntry`');
 });

@@ -26,7 +26,11 @@
  * the text between tokens must be identical and the token count equal.
  * Every changed token must be a code name inside an inline code span
  * (backticks) replacing a code name of the same sort, or a number
- * replacing a number, and appear on one of the edit's cited lines. Words
+ * replacing a number, and appear on one of the edit's cited lines. A
+ * changed name must be one the check flagged. A number may change only
+ * on a line that holds a flagged name, and its cited line must also
+ * hold a code name from that line, so a threshold elsewhere in the
+ * piece, or one cited from an unrelated line, cannot change. Words
  * outside code spans never change, so an edit cannot turn "NEVER flag"
  * into "ALWAYS flag", add or remove a word, a sentence or punctuation,
  * and the replacement has as many lines as the original. An escaped
@@ -63,7 +67,11 @@ export interface SuppressEdit {
 }
 
 export interface EditContext {
-  /** Names the check flagged (lost, new_absent or touched). Every piece must contain one. */
+  /**
+   * Names the check flagged (lost, new_absent or touched). Every piece
+   * must contain one, every changed name must be one, and a number may
+   * change only on a line that contains one.
+   */
   readonly flagged: readonly string[];
   /** The release named in the marker: a GA tag, or "<branch>@<sha12>" when no tag is known (see releaseLabel). */
   readonly release: string;
@@ -390,6 +398,10 @@ interface Change {
   readonly to: string;
   /** A number replacing a number, rather than a name replacing a name. */
   readonly number: boolean;
+  /** Index of the line of the piece the change is on. */
+  readonly line: number;
+  /** The code names in backticks on that line of the original and of the replacement. */
+  readonly lineNames: readonly string[];
 }
 
 interface Tokens {
@@ -518,6 +530,21 @@ function diffTokens(original: string, replacement: string): { changes: Change[] 
       return { problem: `the replacement changes the text between words (spacing, punctuation, markup or line breaks): ${snippet(a.seps[i]!)} became ${snippet(b.seps[i]!)}` };
     }
   }
+  // The separators are the same in both, so a token is on the same line in both.
+  const lineOf: number[] = [];
+  for (let i = 0, line = 0; i < a.tokens.length; i++) {
+    line += a.seps[i]!.split('\n').length - 1;
+    lineOf.push(line);
+  }
+  const namesOn = new Map<number, Set<string>>();
+  for (const t of [a, b]) {
+    t.tokens.forEach((token, i) => {
+      const core = unwrapCode(token).core;
+      if (!inCodeSpan(t, i) || nameKind(core) === null) return;
+      if (!namesOn.has(lineOf[i]!)) namesOn.set(lineOf[i]!, new Set());
+      namesOn.get(lineOf[i]!)!.add(core);
+    });
+  }
   const changes: Change[] = [];
   for (let i = 0; i < a.tokens.length; i++) {
     if (a.tokens[i] === b.tokens[i]) continue;
@@ -540,7 +567,7 @@ function diffTokens(original: string, replacement: string): { changes: Change[] 
     if (!numbers && !(kx && ky && nameSort(kx) === nameSort(ky))) {
       return { problem: `"${b.tokens[i]}" replaces "${a.tokens[i]}", but only a code name can replace a code name of the same sort (file, identifier or config), or a number a number` };
     }
-    changes.push({ from: x.core, to: y.core, number: numbers });
+    changes.push({ from: x.core, to: y.core, number: numbers, line: lineOf[i]!, lineNames: [...(namesOn.get(lineOf[i]!) ?? [])] });
   }
   if (changes.length === 0) return { problem: 'the replacement is the same as the original' };
   return { changes };
@@ -592,16 +619,28 @@ function changedComponents(from: string, to: string): string[] | null {
   return out;
 }
 
+/** Whether `line` names a code name: as a word, a prefix by a word starting with its stem, a qualified name by all its parts. */
+function mentions(line: string, name: string): boolean {
+  if (containsWord(line, name)) return true;
+  switch (nameKind(name)) {
+    case 'prefix': return containsWordStart(line, name.slice(0, -1));
+    case 'qualified': return name.split(/::|\.|->/).every((p) => containsWord(line, p));
+    default: return false;
+  }
+}
+
 /**
- * Whether a cited line supports a changed name: the line contains the
- * new name (a path, directory or glob too, as text: the file a line
- * comes from is not evidence) or the new number. A new prefix is
- * supported by a word starting with its stem, and a new qualified name
- * by a line that has each component that changed.
+ * Whether a cited line supports a change: the line contains the new
+ * name (a path, directory or glob too, as text: the file a line comes
+ * from is not evidence). A new prefix is supported by a word starting
+ * with its stem, and a new qualified name by a line that has each
+ * component that changed. A new number needs the number and a code
+ * name of its line of the piece (or of the replacement line), so the
+ * cited line is about the same thing.
  */
 function supports(change: Change, line: string): boolean {
   const to = change.to;
-  if (change.number) return containsNumber(line, to);
+  if (change.number) return containsNumber(line, to) && change.lineNames.some((name) => mentions(line, name));
   if (containsWord(line, to)) return true;
   switch (nameKind(to)) {
     case 'prefix': return containsWordStart(line, to.slice(0, -1));
@@ -675,7 +714,7 @@ interface Plan {
   /** Problems, each with the edit it belongs to (-1 for the whole set). */
   readonly problems: { readonly edit: number; readonly message: string }[];
   readonly planned: Planned[];
-  /** Edits whose changes and citations are well formed, so their evidence can be looked up. */
+  /** Edits whose changes and citations are well formed and in scope, so their evidence can be looked up. */
   readonly checkable: Map<number, { readonly changes: readonly Change[]; readonly evidence: readonly Citation[] }>;
 }
 
@@ -734,6 +773,7 @@ function plan(skillMd: string, edits: readonly SuppressEdit[], ctx: EditContext)
     const want = original.split('\n').map(stripCr);
     const replacementLines = replacement.split('\n').map(stripCr);
 
+    const pieceFlagged = ctx.flagged.some((name) => containsWord(original, name));
     let start = -1;
     if (original.trim() === '') fail('the original is empty');
     else if (want.length > MAX_PIECE_LINES) fail(`the original has ${want.length} lines; at most ${MAX_PIECE_LINES}`);
@@ -748,9 +788,7 @@ function plan(skillMd: string, edits: readonly SuppressEdit[], ctx: EditContext)
       const end = start + want.length - 1;
       const overlap = planned.find((p) => start <= p.start + p.count - 1 && p.start <= end);
       if (overlap) fail(`it overlaps edit ${overlap.index + 1}`);
-      if (!ctx.flagged.some((name) => containsWord(original, name))) {
-        fail('the original contains none of the flagged names');
-      }
+      if (!pieceFlagged) fail('the original contains none of the flagged names');
     }
     const unclear = want.findIndex((line) => !lineCodeSpans(line).clear);
     if (unclear >= 0) {
@@ -773,9 +811,29 @@ function plan(skillMd: string, edits: readonly SuppressEdit[], ctx: EditContext)
       fail('an edit cannot give a reason; the marker\'s reason is generated from the changed names');
     }
 
+    // Only once the piece holds a flagged name, so a wrong piece gets one message.
+    let outOfScope = 0;
+    if ('changes' in diff && pieceFlagged) {
+      const flagged = new Set(ctx.flagged);
+      const scope = (message: string) => {
+        outOfScope++;
+        fail(message);
+      };
+      for (const from of new Set(diff.changes.filter((c) => !c.number && !flagged.has(c.from)).map((c) => c.from))) {
+        scope(`\`${from}\` is not a flagged name; only the names the check flagged (lost, new and absent, or touched) may change`);
+      }
+      for (const c of diff.changes.filter((ch) => ch.number)) {
+        if (!ctx.flagged.some((name) => containsWord(want[c.line]!, name))) {
+          scope(`the number ${c.from} is on line ${c.line + 1} of the original, which has no flagged name; a number may change only on a line that names one`);
+        } else if (c.lineNames.length === 0) {
+          scope(`the number ${c.from} is on line ${c.line + 1} of the original, which has no code name in backticks to cite with it`);
+        }
+      }
+    }
+
     let reason = '';
     if ('changes' in diff) {
-      if (citationProblems.length === 0 && evidence.length > 0 && evidence.length <= MAX_CITATIONS_PER_EDIT) {
+      if (outOfScope === 0 && citationProblems.length === 0 && evidence.length > 0 && evidence.length <= MAX_CITATIONS_PER_EDIT) {
         checkable.set(index, { changes: diff.changes, evidence });
       }
       reason = generatedReason(diff.changes);
@@ -854,7 +912,10 @@ async function evidenceProblems(
       }
     });
     const unsupported = changes.filter((ch) => !lines.some((line) => typeof line === 'string' && supports(ch, line)));
-    for (const to of new Set(unsupported.map((ch) => ch.to))) problems.push({ edit, message: `no cited line contains \`${to}\`` });
+    const messages = unsupported.map((ch) => (ch.number
+      ? `no cited line contains \`${ch.to}\` together with a code name of line ${ch.line + 1} (${ch.lineNames.map((n) => `\`${n}\``).join(', ')})`
+      : `no cited line contains \`${ch.to}\``));
+    for (const message of new Set(messages)) problems.push({ edit, message });
   }
   return problems;
 }
