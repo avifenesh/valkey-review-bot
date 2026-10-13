@@ -308,7 +308,7 @@ Every run ends by writing the review state through the `state` argument of `post
 
 Before signaling completion, verify ALL of these:
 - Either `post_review` has been called exactly once with ≥1 inline comment (or, on a mention run, with a reply in `body`), OR `skip_review` has been called.
-- `state` describes the whole PR at this head, with every finding from the previous state carried over, a risk, and a backport verdict.
+- `state` describes the whole PR at this head, with every finding from the previous state carried over except any shown to be wrong, a risk, and a backport verdict.
 - Every inline comment names a specific `path`, `line`, and a specific problem.
 - No two comments on the same `file:line`.
 - You have not called `post_review` more than once. It is the atomic terminal action.

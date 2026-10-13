@@ -269,7 +269,7 @@ Every run ends by writing the review state through the `state` argument of `post
 - Every inline comment names a specific `path`, `line`, and a specific problem.
 - No two comments on the same `file:line`.
 - Either `post_review` was called with ≥1 inline comment (or, on a mention run, with a reply in `body`), OR `skip_review` was called. Never end without one of these.
-- `state` describes the whole PR at this head, with every finding from the previous state carried over, a risk, and a backport verdict.
+- `state` describes the whole PR at this head, with every finding from the previous state carried over except any shown to be wrong, a risk, and a backport verdict.
 
 ## Calibration
 

@@ -55,6 +55,10 @@ test('a wrong finding is dropped, not resolved, by one rule in the prompt and th
   assert.ok(disputed?.includes('withdraw the finding: drop it from `state` and give the reason in `summary`. Do not mark it resolved, which means fixed at the current head.'));
   const carryOver = prompt.split('\n').find((l) => l.startsWith('- **Carry over.**'));
   assert.ok(carryOver?.includes('Mark one resolved only when it is fixed at the current head, after checking it there. Drop an earlier finding only if it is shown to be wrong, and give the reason in `summary`.'));
+  // Every line that carries earlier findings over names the exception.
+  const carried = prompt.split('\n').filter((l) => l.includes('carried over'));
+  assert.ok(carried.length > 0);
+  for (const line of carried) assert.match(line, /except any shown to be wrong/, line);
   // The overview restates the carry-over rule next to the previous state.
   assert.ok(renderPrOverview(ctx).includes('marked resolved if it is fixed at the current head or else still open. Drop one only if it is shown to be wrong, and give the reason in `summary`.'));
 });
