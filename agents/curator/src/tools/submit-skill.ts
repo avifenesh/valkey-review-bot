@@ -33,6 +33,14 @@ import { errorText, fail, ok, type TouchedRecord } from './run.js';
  * suffix derived from "<record_id>#g<n>". A skill an operator retired
  * (retired_reason "operator") is never published again by the curator.
  *
+ * A new generation is claimed on the record while it stays a tombstone:
+ * the claim sets the new name and previous_record_name and removes
+ * graduated_at, and only the write after the publish sets graduated_at
+ * and removes retired_at. Until then retired_* describe the skill the
+ * generation replaces. The lifecycle never retires a tombstone's skill,
+ * so a claimed generation the registry shows retired was retired by an
+ * operator.
+ *
  * Suppressed pieces. The release check edits a published skill in
  * suppress-and-add form (agents/common/src/skill-check/edits.ts): a
  * superseded piece stays between markers that name the release and cite
@@ -233,6 +241,24 @@ function graduatedName(item: Item): string {
   return typeof item.graduated_record_name === 'string' ? item.graduated_record_name : '';
 }
 
+/** Add a condition that `name` still holds `value` as read, or is still absent. */
+function asRead(conditions: string[], values: Record<string, unknown>, name: string, placeholder: string, value: unknown): void {
+  if (value === undefined) {
+    conditions.push(`attribute_not_exists(${name})`);
+  } else {
+    conditions.push(`${name} = ${placeholder}`);
+    values[placeholder] = value;
+  }
+}
+
+/**
+ * A tombstone whose graduated_record_name is a generation claimed after
+ * the retirement, not yet recorded as published.
+ */
+function unfinishedGeneration(item: Item): boolean {
+  return item.retired_at !== undefined && item.graduated_at === undefined && typeof item.previous_record_name === 'string';
+}
+
 /** Where to publish, and the conditional write that claims the name on the source record first. */
 interface Target {
   readonly name: string;
@@ -307,6 +333,24 @@ async function markRetired(deps: SubmitSkillDeps, key: Key, name: string, reinfo
     : `skill "${name}" was retired by the skill lifecycle while this run worked; only a reinforcement can publish it again`;
 }
 
+/**
+ * The registry record `name` of an unfinished generation is retired.
+ * Nothing in the lifecycle retires it, so an operator did: record that,
+ * best effort, conditioned on the record as `source` read it, and
+ * return the refusal.
+ */
+async function markGenerationRetired(deps: SubmitSkillDeps, key: Key, name: string, source: Item): Promise<string> {
+  const conditions = ['#grn = :name', 'attribute_exists(#ret)', 'attribute_not_exists(#ga)'];
+  const values: Record<string, unknown> = { ':name': name, ':now': new Date().toISOString(), ':reason': 'operator' };
+  asRead(conditions, values, '#rr', ':readReason', source.retired_reason);
+  try {
+    await deps.ddb.send(updateCommand(deps.table, key, 'SET #ret = :now, #rr = :reason', conditions, values));
+  } catch (err) {
+    console.warn(`[submit_skill] retirement of "${name}" not recorded on ${key.record_id}: ${errorText(err)}`);
+  }
+  return `skill "${name}" was retired by an operator; it is not published again`;
+}
+
 /** The name to publish under, or the refusal. */
 async function chooseTarget(
   deps: SubmitSkillDeps,
@@ -370,6 +414,9 @@ async function chooseTarget(
     const before = typeof source.previous_record_name === 'string' ? await deps.registry.get(source.previous_record_name) : null;
     return keep(true, before?.skillMd ?? null);
   }
+  if (unfinishedGeneration(source)) {
+    return markGenerationRetired(deps, { area_bucket: input.area_bucket, record_id: input.source_record_id }, current, source);
+  }
 
   const generation = (typeof source.skill_generation === 'number' ? source.skill_generation : 1) + 1;
   const name = suffixedName(slugify(input.subject), `${input.source_record_id}#g${generation}`);
@@ -378,7 +425,7 @@ async function chooseTarget(
   }
   return {
     name,
-    update: `SET #grn = :name, #sg = :gen, #prn = :old ${CANCEL_MAINTENANCE}`,
+    update: `SET #grn = :name, #sg = :gen, #prn = :old ${CANCEL_MAINTENANCE}, #ga`,
     conditions: [...gate, '#grn = :old', 'attribute_exists(#ret)'],
     values: { ':name': name, ':gen': generation, ':old': current, ':t': threshold },
     replaces: current,
@@ -463,7 +510,11 @@ Do not delete the source record afterwards; it stays as the skill's provenance.`
           });
         } catch (err) {
           if ((err as { name?: string } | null)?.name !== 'SkillRetiredError') throw err;
-          return fail(`submit_skill: ${await markRetired(deps, key, target.name, reinforced)}`);
+          // The claim left the record a tombstone, and the lifecycle never retires a tombstone's skill.
+          const refusal = target.tombstone
+            ? await markGenerationRetired(deps, key, target.name, source)
+            : await markRetired(deps, key, target.name, reinforced);
+          return fail(`submit_skill: ${refusal}`);
         }
         published = true;
 

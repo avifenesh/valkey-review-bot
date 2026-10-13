@@ -526,6 +526,85 @@ test('an unfinished re-publication finishes under the name it claimed', async ()
   }
 });
 
+/** A tombstone that claimed generation 2 after its retirement and has not recorded the publish. */
+const unfinished = (extra = {}) => {
+  const item = tombstone({ graduated_record_name: generationName(2), skill_generation: 2, previous_record_name: OLD, ...extra });
+  delete item.graduated_at;
+  return item;
+};
+
+test('a generation claim keeps the tombstone and removes graduated_at until the publish is recorded', async () => {
+  const w = world({ item: tombstone(), skills: DEPRECATED });
+  const out = parse(await w.submit.invoke(INPUT));
+  assert.equal(out.ok, true, out.error);
+  const [claim] = w.ddb.calls.filter((c) => c.op === 'UpdateCommand').map((c) => c.input);
+  assert.match(claim.UpdateExpression, /^SET #grn = :name, #sg = :gen, #prn = :old REMOVE #mid, #mra, #mr, #ga$/);
+  assert.equal(claim.ExpressionAttributeNames['#ga'], 'graduated_at');
+  assertUpdatesWellFormed(w.ddb);
+});
+
+test('an unfinished generation an operator retired is recorded as an operator retirement', async () => {
+  const w = world({ item: unfinished(), skills: { ...DEPRECATED, [generationName(2)]: { status: 'DEPRECATED', skillMd: 'gen 2 body' } } });
+  const out = parse(await w.submit.invoke(INPUT));
+  assert.equal(out.ok, false);
+  assert.match(out.error, new RegExp(`skill "${generationName(2)}" was retired by an operator; it is not published again`));
+  assert.ok(!w.registry.calls.some((c) => c.startsWith('upsert')), 'no third generation');
+  const rec = w.record();
+  assert.equal(rec.retired_reason, 'operator');
+  assert.equal(rec.graduated_record_name, generationName(2));
+  assert.equal(w.run.take('skill_submit', 'next'), null, 'the slot is free');
+  assertUpdatesWellFormed(w.ddb);
+
+  const again = parse(await w.nextRun().submit.invoke(INPUT));
+  assert.equal(again.ok, false);
+  assert.match(again.error, /retired by an operator/);
+});
+
+test('an operator retiring a generation whose publish was not recorded is not undone by the next reinforcement', async () => {
+  let failing = true;
+  const w = world({
+    item: tombstone(),
+    skills: DEPRECATED,
+    intercept: (command) => { if (failing && isPublishWrite(command)) throw throttled(); },
+  });
+  await capturingLogs(async () => { assert.equal(parse(await w.submit.invoke(INPUT)).ok, true); });
+  failing = false;
+  w.registry.skills.get(generationName(2)).status = 'DEPRECATED';
+
+  const out = parse(await w.nextRun().submit.invoke(INPUT));
+  assert.equal(out.ok, false);
+  assert.match(out.error, /retired by an operator/);
+  assert.equal(w.registry.skills.has(generationName(3)), false);
+  assert.equal(w.record().retired_reason, 'operator');
+});
+
+test('a published generation the lifecycle retired comes back as the next one', async () => {
+  // graduated_at is set: generation 2 was published, then retired as a live skill.
+  const item = tombstone({ graduated_record_name: generationName(2), skill_generation: 2, previous_record_name: OLD });
+  const w = world({ item, skills: { ...DEPRECATED, [generationName(2)]: { status: 'DEPRECATED', skillMd: 'gen 2 body' } } });
+  const out = parse(await w.submit.invoke(INPUT));
+  assert.equal(out.ok, true, out.error);
+  assert.equal(out.record_name, generationName(3));
+  assert.equal(out.replaces, generationName(2));
+  assert.equal(w.record().previous_record_name, generationName(2));
+});
+
+test('an unfinished generation retired between the read and the update is recorded as an operator retirement', async () => {
+  const registry = fakeRegistry({ ...DEPRECATED, [generationName(2)]: { status: 'DRAFT', skillMd: 'gen 2 body' } });
+  const get = registry.get;
+  registry.get = async (name) => {
+    const seen = await get(name);
+    if (name === generationName(2)) registry.skills.set(name, { ...seen, status: 'DEPRECATED' });
+    return seen;
+  };
+  const w = world({ item: unfinished(), registry });
+  const out = parse(await w.submit.invoke(INPUT));
+  assert.equal(out.ok, false);
+  assert.match(out.error, /retired by an operator/);
+  assert.ok(registry.calls.includes(`upsert ${generationName(2)}`), 'the refusal came from upsert');
+  assert.equal(w.record().retired_reason, 'operator');
+});
+
 test('the write that takes a re-published record out of tombstone state is retried', async () => {
   let failures = 2;
   const w = world({
