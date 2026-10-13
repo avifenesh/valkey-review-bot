@@ -42,7 +42,8 @@ import { isRepoName, latestReleaseTag, RELEASE_TAG_RE } from './releases.js';
  * REPO_SKILL_KEY in the reviewer's concerns table holds that claim and
  * the release the file was last checked at. Its area_bucket starts with
  * RESERVED_BUCKET_PREFIX: such items are not concern records, and the
- * pass never scores, deletes or queues them as records.
+ * pass never scores, deletes or queues them as records. It counts any
+ * other item in such a bucket and lists it for the operator.
  *
  * Writes are conditioned on the updated_at, decayed_at and decay_score
  * the scan saw, so a record reinforced, or re-scored by the curator,
@@ -252,7 +253,7 @@ export interface RetireMessage {
 export const RESERVED_BUCKET_PREFIX = '#';
 
 /** Whether an area_bucket is reserved (RESERVED_BUCKET_PREFIX). */
-export const isReservedBucket = (areaBucket: unknown): boolean =>
+export const isReservedBucket = (areaBucket: unknown): areaBucket is string =>
   typeof areaBucket === 'string' && areaBucket.startsWith(RESERVED_BUCKET_PREFIX);
 
 /**
@@ -315,6 +316,9 @@ const MAX_REVIEWER_ID = 100;
 const MAX_AREA_BUCKET = 200;
 const MAX_RECORD_ID = 100;
 
+/** Reserved-bucket items listed one per line in a table's pass; the rest are only counted. */
+const MAX_RESERVED_LINES = 20;
+
 const maintenanceId = (reason: MaintenanceMessage['reason'], reviewerId: string, recordId: string, nowIso: string): string =>
   `${reason}#${reviewerId}#${recordId}#${nowIso}`;
 
@@ -373,12 +377,14 @@ export interface Stats {
   readonly wouldRetire: number;
   /** Candidates over a per-pass cap; they are due again at the next pass. */
   readonly deferred: number;
+  /** Items in reserved buckets other than REPO_SKILL_KEY, left unwritten. */
+  readonly reserved: number;
 }
 
 export function summaryLine(s: Stats): string {
   return `[decay] ${s.table} scanned=${s.scanned} decayed=${s.decayed} deleted=${s.deleted} skipped=${s.skipped} errors=${s.errors}`
     + ` kept_retired=${s.keptRetired} checks_requested=${s.checksRequested} retire_requested=${s.retireRequested}`
-    + ` would_retire=${s.wouldRetire} deferred=${s.deferred}`;
+    + ` would_retire=${s.wouldRetire} deferred=${s.deferred} reserved=${s.reserved}`;
 }
 
 function isConditionFailure(err: unknown): boolean {
@@ -497,6 +503,7 @@ export async function decayTable(
   let retireRequested = 0;
   let wouldRetire = 0;
   let deferred = 0;
+  let reserved = 0;
   let cursor: Record<string, unknown> | undefined;
   const nowIso = new Date(nowMs).toISOString();
 
@@ -647,8 +654,16 @@ export async function decayTable(
         repoSkill = item;
         continue;
       }
-      // Any other item in a reserved bucket is not a concern record either.
-      if (isReservedBucket(areaBucket)) continue;
+      // Any other item in a reserved bucket is not a concern record
+      // either. It is left as it is, but listed, so the operator can find
+      // a record the curator created there before its tools refused it.
+      if (isReservedBucket(areaBucket)) {
+        reserved += 1;
+        if (reserved <= MAX_RESERVED_LINES) {
+          console.warn(`[decay] reserved-bucket ${tableName} bucket=${quoted(areaBucket)} id=${quoted(String(recordId))}: not a concern record, left as it is`);
+        }
+        continue;
+      }
       const updatedAt = stringOrEmpty(item.updated_at);
       const decayedAt = stringOrEmpty(item.decayed_at);
       const updatedMs = Date.parse(updatedAt);
@@ -711,6 +726,9 @@ export async function decayTable(
       await writeScore(record);
     }
   } while (cursor);
+  if (reserved > MAX_RESERVED_LINES) {
+    console.warn(`[decay] reserved-bucket ${tableName}: ${reserved - MAX_RESERVED_LINES} more items in reserved buckets, not listed`);
+  }
 
   // Retirements, lowest score first.
   retirements.sort((a, b) => a.nextScore - b.nextScore || byKey(a, b));
@@ -801,7 +819,7 @@ export async function decayTable(
     }
   }
 
-  return { table: tableName, scanned, decayed, deleted, skipped, errors, keptRetired, checksRequested, retireRequested, wouldRetire, deferred };
+  return { table: tableName, scanned, decayed, deleted, skipped, errors, keptRetired, checksRequested, retireRequested, wouldRetire, deferred, reserved };
 }
 
 /**

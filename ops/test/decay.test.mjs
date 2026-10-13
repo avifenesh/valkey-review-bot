@@ -15,8 +15,8 @@ const QUEUE = 'https://sqs.us-east-1.amazonaws.com/123456789012/curator';
 const CONFIG = { tables: { 'valkey-review': 'concerns' }, halfLifeSeconds: HALF_LIFE, floor: 0.05 };
 const GRADUATED_HALF_LIFE = 180 * DAY;
 const LIFECYCLE = { ...CONFIG, graduatedHalfLifeSeconds: GRADUATED_HALF_LIFE };
-// Stats fields for skill maintenance, all zero for a table with nothing to queue.
-const NOTHING_QUEUED = { keptRetired: 0, checksRequested: 0, retireRequested: 0, wouldRetire: 0, deferred: 0 };
+// Stats fields for skill maintenance and reserved items, all zero for a table with nothing to queue.
+const NOTHING_QUEUED = { keptRetired: 0, checksRequested: 0, retireRequested: 0, wouldRetire: 0, deferred: 0, reserved: 0 };
 
 test('the score halves every half-life', () => {
   assert.equal(decayedScore(1, 0, HALF_LIFE), 1);
@@ -598,8 +598,8 @@ async function reportLines(t, bucket, name) {
   const warn = t.mock.method(console, 'warn', () => {});
   const boom = () => Object.assign(new Error('internal error'), { name: 'InternalServerError' });
 
-  // would-retire, and a record that is not a valid concern record
-  await decayTable(table([faded('a', { area_bucket: bucket }), { area_bucket: bucket, record_id: 'h' }]), 'concerns', { ...FULL, retireSkills: false }, NOW, maintenance().ctx);
+  // would-retire, a record that is not a valid concern record, and an item in a reserved bucket
+  await decayTable(table([faded('a', { area_bucket: bucket }), { area_bucket: bucket, record_id: 'h' }, { area_bucket: `#${bucket}`, record_id: name }]), 'concerns', { ...FULL, retireSkills: false }, NOW, maintenance().ctx);
   // retire-requested, deferred, check-requested, and a record that cannot be queued
   await decayTable(table([
     faded('b', { area_bucket: bucket, updated_at: daysAgo(2000) }),
@@ -619,11 +619,14 @@ async function reportLines(t, bucket, name) {
     assert.ok(lines.some((l) => l.startsWith(`[decay] ${kind} `)), `a ${kind} line was logged`);
   }
   assert.ok(lines.some(isDump), 'the invalid record was logged');
+  assert.equal(lines.filter(isReserved).length, 1, 'the reserved item was logged');
   return lines;
 }
 
 /** The warning that dumps an invalid record as JSON. */
 const isDump = (line) => line.startsWith('[decay] concerns: record without ');
+/** The warning that lists an item in a reserved bucket. */
+const isReserved = (line) => line.startsWith('[decay] reserved-bucket ');
 
 test('values read from the table are JSON-quoted in every report line', async (t) => {
   // area_bucket is chosen by the curator model; this one tries to end the
@@ -634,9 +637,10 @@ test('values read from the table are JSON-quoted in every report line', async (t
 
   for (const line of lines) {
     assert.ok(!line.includes('\n'), `one line: ${JSON.stringify(line)}`);
-    if (line.includes(' id=') && !isDump(line)) assert.ok(line.includes(` bucket=${JSON.stringify(bucket)} id="`), `bucket quoted: ${JSON.stringify(line)}`);
+    if (line.includes(' id=') && !isDump(line) && !isReserved(line)) assert.ok(line.includes(` bucket=${JSON.stringify(bucket)} id="`), `bucket quoted: ${JSON.stringify(line)}`);
   }
   assert.ok(lines.some((l) => l.includes(`graduated_record_name ${JSON.stringify(name)} is not`)), 'the rejected name is quoted');
+  assert.ok(lines.includes(`[decay] reserved-bucket concerns bucket=${JSON.stringify(`#${bucket}`)} id=${JSON.stringify(name)}: not a concern record, left as it is`));
   const report = lines.filter((l) => /^\[decay\] (would-retire|retire-requested|deferred|check-requested) /.test(l));
   assert.equal(report.length, 4);
   const head = ` bucket=${JSON.stringify(bucket)} id="`;
@@ -665,8 +669,9 @@ test('report lines strip invisible format and line-separator characters from tab
   const shown = JSON.stringify(`src/ko ${'x'.repeat(invisible.length - 1)} id="forged"`);
   for (const line of lines) {
     for (const c of invisible) assert.ok(!line.includes(c), `U+${c.codePointAt(0).toString(16)} in ${JSON.stringify(line)}`);
-    if (line.includes(' id=') && !isDump(line)) assert.ok(line.includes(` bucket=${shown} id="`), `bucket shown: ${JSON.stringify(line)}`);
+    if (line.includes(' id=') && !isDump(line) && !isReserved(line)) assert.ok(line.includes(` bucket=${shown} id="`), `bucket shown: ${JSON.stringify(line)}`);
   }
+  assert.ok(lines.includes(`[decay] reserved-bucket concerns bucket=${JSON.stringify(`#${JSON.parse(shown)}`)} id="NotASlug": not a concern record, left as it is`));
   assert.ok(lines.some((l) => l.includes('graduated_record_name "NotASlug" is not')), 'the rejected name is stripped');
   assert.ok(lines.some((l) => isDump(l) && l.includes(`"area_bucket":${shown}`)), 'the record dump is stripped');
 });
@@ -674,9 +679,9 @@ test('report lines strip invisible format and line-separator characters from tab
 test('the summary line names every counter', () => {
   const line = summaryLine({
     table: 'valkey_review_concerns', scanned: 9, decayed: 5, deleted: 1, skipped: 1, errors: 0,
-    keptRetired: 2, checksRequested: 3, retireRequested: 1, wouldRetire: 0, deferred: 4,
+    keptRetired: 2, checksRequested: 3, retireRequested: 1, wouldRetire: 0, deferred: 4, reserved: 6,
   });
-  assert.equal(line, '[decay] valkey_review_concerns scanned=9 decayed=5 deleted=1 skipped=1 errors=0 kept_retired=2 checks_requested=3 retire_requested=1 would_retire=0 deferred=4');
+  assert.equal(line, '[decay] valkey_review_concerns scanned=9 decayed=5 deleted=1 skipped=1 errors=0 kept_retired=2 checks_requested=3 retire_requested=1 would_retire=0 deferred=4 reserved=6');
 });
 
 test('the manual event turns on recheck_all and dry_run only when set to true', () => {
@@ -834,8 +839,9 @@ test('the repo skill check takes a slot of checksPerDay', async (t) => {
   assert.equal(stats.deferred, 1);
 });
 
-test('items in reserved buckets are never scored, deleted or queued as records', async (t) => {
+test('items in reserved buckets are never scored, deleted or queued as records, but are counted and listed', async (t) => {
   quietLogs(t);
+  const warn = t.mock.method(console, 'warn', () => {});
   assert.equal(RESERVED_BUCKET_PREFIX, '#');
   assert.ok(REPO_SKILL_KEY.area_bucket.startsWith(RESERVED_BUCKET_PREFIX), 'the repo skill item is in a reserved bucket');
   assert.ok(isReservedBucket('#maintenance') && isReservedBucket('#'));
@@ -853,7 +859,26 @@ test('items in reserved buckets are never scored, deleted or queued as records',
   const stats = await decayTable(ddb, 'concerns', FULL, NOW, ctx);
   assert.equal(ddb.writes.length, 0);
   assert.equal(ctx.sqs.sent.length, 0);
-  assert.deepEqual(stats, { table: 'concerns', scanned: 5, decayed: 0, deleted: 0, skipped: 0, errors: 0, ...NOTHING_QUEUED });
+  // The repo skill item is not counted.
+  assert.deepEqual(stats, { table: 'concerns', scanned: 5, decayed: 0, deleted: 0, skipped: 0, errors: 0, ...NOTHING_QUEUED, reserved: 4 });
+  assert.deepEqual(warn.mock.calls.map((c) => c.arguments[0]), [
+    '[decay] reserved-bucket concerns bucket="#maintenance" id="other": not a concern record, left as it is',
+    '[decay] reserved-bucket concerns bucket="#future" id="state": not a concern record, left as it is',
+    '[decay] reserved-bucket concerns bucket="#maintenance" id="gone": not a concern record, left as it is',
+    '[decay] reserved-bucket concerns bucket="#x" id="unchecked": not a concern record, left as it is',
+  ]);
+});
+
+test('reserved-bucket items past the first 20 are counted on one line', async (t) => {
+  const warn = t.mock.method(console, 'warn', () => {});
+  const items = Array.from({ length: 23 }, (_, i) => ({ area_bucket: '#old', record_id: `r${i}`, updated_at: daysAgo(1) }));
+  const stats = await decayTable(fakeDdb([items.slice(0, 10), items.slice(10)]), 'concerns', LIFECYCLE, NOW);
+  assert.equal(stats.reserved, 23);
+  assert.equal(stats.scanned, 23);
+  const lines = warn.mock.calls.map((c) => c.arguments[0]);
+  assert.equal(lines.length, 21);
+  assert.equal(lines[19], '[decay] reserved-bucket concerns bucket="#old" id="r19": not a concern record, left as it is');
+  assert.equal(lines[20], '[decay] reserved-bucket concerns: 3 more items in reserved buckets, not listed');
 });
 
 test('no repo skill check without an upstream or with checks off, and the item is left alone', async (t) => {
