@@ -1,0 +1,14 @@
+{
+  "name": "valkey-reviewer-scripts",
+  "version": "0.1.0",
+  "private": true,
+  "license": "BSD-3-Clause",
+  "type": "module",
+  "description": "Operator scripts for valkey-reviewer. They load code from agents/common and ops, so run npm ci there before npm test here.",
+  "engines": {
+    "node": ">=24"
+  },
+  "scripts": {
+    "test": "node --test test/*.test.mjs"
+  }
+}

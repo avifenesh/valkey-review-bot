@@ -1,8 +1,8 @@
 // Fakes of the AWS CLI for the script tests. No test calls AWS.
 //
-// Run the tests from the repository root with
-//   node --test scripts/test/*.test.mjs
-// after `npm ci` in agents/common and ops.
+// Run the tests with `npm test` in scripts/ (or, from the repository
+// root, node --test scripts/test/*.test.mjs) after `npm ci` in
+// agents/common and ops. They also need git, bash and jq.
 
 import { execFile } from 'node:child_process';
 import { chmodSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
