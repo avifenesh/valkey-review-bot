@@ -161,7 +161,9 @@ function mentionBlock(payload: Payload): string[] {
 /**
  * The invocation handler: one review per payload, streamed as SSE frames.
  * bedrock-agentcore stops reading, and closes this generator at its next
- * yield, when the client disconnects.
+ * yield, when the client disconnects. A close before the review phase
+ * ends the run; a close during it does not, and the review runs to its
+ * end before the generator finishes closing.
  */
 export function createReviewHandler(opts: ReviewHandlerOpts): (payload: Payload) => AsyncGenerator<RunEvent, void, unknown> {
   const { env, assembleTools } = opts;
@@ -285,9 +287,9 @@ export function createReviewHandler(opts: ReviewHandlerOpts): (payload: Payload)
       });
       callLimit.attach(agent);
       // Beat on agent activity, not only on relayed frames. If the SSE
-      // consumer closes the stream, Strands drains the rest of the loop
-      // without relaying events; the run must not look dead to the
-      // watchdog while it is still working toward a terminal tool.
+      // consumer closes the stream, the review goes on without relaying
+      // events; the run must not look dead to the watchdog while it is
+      // still working toward a terminal tool.
       agent.addHook(BeforeModelCallEvent, () => heartbeat.beat());
       agent.addHook(AfterToolCallEvent, () => heartbeat.beat());
 
@@ -326,32 +328,57 @@ export function createReviewHandler(opts: ReviewHandlerOpts): (payload: Payload)
         return null;
       };
 
-      try {
-        for await (const event of agent.stream(userMessage)) {
-          const outgoing = handleAgentEvent(event);
-          if (outgoing) yield outgoing;
-        }
-        if (terminal.tool === null) {
-          if (callLimit.reached) console.warn(`[stream] model call limit (${env.maxIterations}) reached without a terminal tool`);
-          callLimit.reserve(TERMINAL_RETRY_CALLS);
-          yield { event: 'status', data: { phase: 'terminal_retry' } };
-          for await (const event of agent.stream(TERMINAL_RETRY_MESSAGE)) {
+      // The model turns: the review, then the terminal-retry prompt if
+      // the review ended without a terminal tool.
+      const turns = async function* (): AsyncGenerator<RunEvent, void, undefined> {
+        try {
+          for await (const event of agent.stream(userMessage)) {
             const outgoing = handleAgentEvent(event);
             if (outgoing) yield outgoing;
           }
+          if (terminal.tool === null) {
+            if (callLimit.reached) console.warn(`[stream] model call limit (${env.maxIterations}) reached without a terminal tool`);
+            callLimit.reserve(TERMINAL_RETRY_CALLS);
+            yield { event: 'status', data: { phase: 'terminal_retry' } };
+            for await (const event of agent.stream(TERMINAL_RETRY_MESSAGE)) {
+              const outgoing = handleAgentEvent(event);
+              if (outgoing) yield outgoing;
+            }
+          }
+        } catch (err) {
+          const msg = err instanceof Error ? err.message : String(err);
+          if (terminal.tool === null) {
+            console.error(`[stream] unhandled error before a terminal tool: ${msg}`);
+            throw err;
+          }
+          // The terminal tool has done its work, so the review is
+          // complete. Failing the run now would make the invoker
+          // redeliver it and post a second review. The usual case is a
+          // model that ends its stream without a closing message right
+          // after the terminal call.
+          console.warn(`[stream] error after terminal tool ${terminal.tool}; treating the run as completed: ${msg}`);
         }
-      } catch (err) {
-        const msg = err instanceof Error ? err.message : String(err);
-        if (terminal.tool === null) {
-          console.error(`[stream] unhandled error before a terminal tool: ${msg}`);
-          throw err;
+      };
+
+      // A review outlives the 15-minute worker that started it, so a
+      // closed stream must not stop it. The frames are relayed by hand,
+      // not with for await or yield*, so that closing this generator does
+      // not close the turns or the agent stream under them. If the
+      // consumer closes it mid-review, the finally runs the turns to the
+      // end without relaying anything; for turns that already ended,
+      // next() returns done at once.
+      const review = turns();
+      try {
+        for (let r = await review.next(); !r.done; r = await review.next()) yield r.value;
+      } finally {
+        try {
+          let r = await review.next();
+          if (!r.done) console.warn('[stream] stream closed during the review; finishing it without relaying frames');
+          while (!r.done) r = await review.next();
+        } catch {
+          // turns() has logged the error, and the finally below records
+          // the run as failed.
         }
-        // The terminal tool has done its work, so the review is
-        // complete. Failing the run now would make the invoker
-        // redeliver it and post a second review. The usual case is a
-        // model that ends its stream without a closing message right
-        // after the terminal call.
-        console.warn(`[stream] error after terminal tool ${terminal.tool}; treating the run as completed: ${msg}`);
       }
 
       if (terminal.tool === null) {

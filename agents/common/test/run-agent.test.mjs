@@ -54,6 +54,17 @@ const skipTurn = toolTurn('skip_review', { reason: 'Nothing new met the bar.', s
 const noopTurn = toolTurn('noop', {});
 const noop = tool({ name: 'noop', description: 'does nothing', inputSchema: z.object({}), callback: () => 'ok' });
 
+/** Some text, then a noop call, in one model turn. */
+const narratedNoopTurn = async function* (n) {
+  yield { type: 'modelMessageStartEvent', role: 'assistant' };
+  yield { type: 'modelContentBlockDeltaEvent', delta: { type: 'textDelta', text: 'Checking the error path first.' } };
+  yield { type: 'modelContentBlockStopEvent' };
+  yield { type: 'modelContentBlockStartEvent', start: { type: 'toolUseStart', name: 'noop', toolUseId: `call-${n}` } };
+  yield { type: 'modelContentBlockDeltaEvent', delta: { type: 'toolUseInputDelta', input: '{}' } };
+  yield { type: 'modelContentBlockStopEvent' };
+  yield { type: 'modelMessageStopEvent', stopReason: 'toolUse' };
+};
+
 /** Heartbeat statuses written to DynamoDB, in order. */
 function recordHeartbeats(t) {
   const written = [];
@@ -122,7 +133,7 @@ test('the run is recorded as completed as soon as the terminal tool succeeds', a
   assert.deepEqual(written, ['running', 'completed']);
 });
 
-test('a stream closed before any terminal tool is recorded as failed', async (t) => {
+test('a stream closed before the review starts is recorded as failed', async (t) => {
   const written = recordHeartbeats(t);
   const r = reviewRun([skipTurn, textTurn('Done.')]);
   await consume(r.run(), (f) => f.event === 'status' && f.data.phase === 'review');
@@ -131,9 +142,8 @@ test('a stream closed before any terminal tool is recorded as failed', async (t)
 });
 
 test('a stream closed during a tool call is completed when the drained turn calls a terminal tool', async (t) => {
-  // Closing agent.stream() while a tool runs does not stop Strands: it
-  // drains the rest of the agent loop without yielding, so skip_review
-  // still runs before the handler's finally block.
+  // The handler runs the rest of the review without relaying it, so
+  // skip_review still runs before the handler's finally block.
   const written = recordHeartbeats(t);
   const r = reviewRun([noopTurn, skipTurn, textTurn('Done.')]);
   const frames = await consume(r.run(), (f) => f.event === 'tool_use');
@@ -142,7 +152,40 @@ test('a stream closed during a tool call is completed when the drained turn call
   assert.deepEqual(written, ['running', 'completed']);
 });
 
-test('the heartbeat keeps beating while Strands drains the loop after the stream is closed', async (t) => {
+test('a stream closed at a text frame still runs the review to its terminal tool', async (t) => {
+  // bedrock-agentcore closes the handler at its next yield when the
+  // worker goes away, which is often a text frame. The rest of that
+  // model turn, the noop call and skip_review must still run.
+  const written = recordHeartbeats(t);
+  const r = reviewRun([narratedNoopTurn, skipTurn, textTurn('Done.')]);
+  const frames = await consume(r.run(), (f) => f.event === 'message');
+  assert.equal(frames.some((f) => f.event === 'tool_use'), false);
+  assert.equal(r.model.calls, 3);
+  assert.equal(r.stateBodies.length, 1);
+  assert.deepEqual(written, ['running', 'completed']);
+});
+
+test('a stream closed at a text frame still runs the terminal-retry turn', async (t) => {
+  const written = recordHeartbeats(t);
+  const r = reviewRun([textTurn('Here is my review in prose.'), skipTurn, textTurn('Done.')]);
+  await consume(r.run(), (f) => f.event === 'message');
+  assert.equal(r.model.calls, 3);
+  assert.match(textOf(r.model.sent[1].at(-1)), /ended without calling a terminal review tool/);
+  assert.equal(r.stateBodies.length, 1);
+  assert.deepEqual(written, ['running', 'completed']);
+});
+
+test('a review that fails after the stream is closed is recorded as failed', async (t) => {
+  const written = recordHeartbeats(t);
+  const r = reviewRun([textTurn('Here is my review in prose.'), failingTurn(new Error('model unavailable'))]);
+  // The error is logged, not thrown at the closed stream.
+  await consume(r.run(), (f) => f.event === 'message');
+  assert.equal(r.model.calls, 2);
+  assert.equal(r.stateBodies.length, 0);
+  assert.deepEqual(written, ['running', 'failed']);
+});
+
+test('the heartbeat keeps beating while the review goes on after the stream is closed', async (t) => {
   recordHeartbeats(t);
   const model = new ScriptedModel([noopTurn, noopTurn, skipTurn, textTurn('Done.')]);
   let beats = 0;
