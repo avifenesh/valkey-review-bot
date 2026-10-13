@@ -227,6 +227,10 @@ const FULL = {
 };
 const NOW_ISO = new Date(NOW).toISOString();
 
+/** The reviewer's repo skill.md item, checked at the current release, so record tests see no repo check. */
+const REPO_SKILL_CHECKED = { area_bucket: '#maintenance', record_id: 'repo-skill', verified_release: '9.1.2', verified_at: daysAgo(10) };
+const table = (items, onWrite) => fakeDdb([[REPO_SKILL_CHECKED, ...items]], onWrite);
+
 function fakeSqs(events = [], onSend = () => ({})) {
   const sent = [];
   return {
@@ -268,7 +272,7 @@ test('retirement off: candidates are logged as would-retire, given the score wri
   const log = quietLogs(t);
   for (const [config, fields] of [[{ ...FULL, retireSkills: false }, {}], [FULL, { dryRun: true }]]) {
     const { ctx } = maintenance(fields);
-    const ddb = fakeDdb([[faded('r1'), faded('r2', { obsolete_release: 'unstable@0eb4ba3c1d2e', decay_score: 0 })]]);
+    const ddb = table([faded('r1'), faded('r2', { obsolete_release: 'unstable@0eb4ba3c1d2e', decay_score: 0 })]);
     const stats = await decayTable(ddb, 'concerns', config, NOW, ctx);
     assert.equal(stats.wouldRetire, 2);
     assert.equal(stats.retireRequested, 0);
@@ -287,7 +291,7 @@ test('a retirement is claimed on the record, then sent', async (t) => {
   quietLogs(t);
   const { ctx, events } = maintenance();
   const record = faded('r1');
-  const ddb = fakeDdb([[record]], (_op, input) => { events.push(`write ${input.Key.record_id}`); return {}; });
+  const ddb = table([record], (_op, input) => { events.push(`write ${input.Key.record_id}`); return {}; });
   const stats = await decayTable(ddb, 'concerns', FULL, NOW, ctx);
 
   assert.deepEqual(events, ['write r1', 'send r1'], 'the claim comes before the message');
@@ -332,13 +336,13 @@ test('a retirement is claimed on the record, then sent', async (t) => {
 test('retirements go lowest score first, within maxRetirementsPerDay, with reason obsolete when a check found the subject gone', async (t) => {
   const log = quietLogs(t);
   const { ctx } = maintenance();
-  const ddb = fakeDdb([[
+  const ddb = table([
     faded('d900', { updated_at: daysAgo(900) }),
     faded('d2000', { updated_at: daysAgo(2000) }),
     faded('obs', { decay_score: 0, updated_at: daysAgo(20), obsolete_release: '9.1.2' }),
     faded('d1500', { updated_at: daysAgo(1500) }),
     faded('d800', { updated_at: daysAgo(800) }),
-  ]]);
+  ]);
   const stats = await decayTable(ddb, 'concerns', { ...FULL, maxRetirementsPerDay: 3 }, NOW, ctx);
 
   assert.deepEqual(bodies(ctx.sqs).map((b) => [b.record_id, b.retire_reason]), [['obs', 'obsolete'], ['d2000', 'decayed'], ['d1500', 'decayed']]);
@@ -364,11 +368,12 @@ test('each check-due rule queues a check, and a record checked at the current re
   ];
   for (const [label, fields, ctxFields, due] of cases) {
     const { ctx } = maintenance(ctxFields);
-    const ddb = fakeDdb([[live('r', fields)]]);
-    const stats = await decayTable(ddb, 'concerns', FULL, NOW, ctx);
-    assert.equal(stats.checksRequested, due ? 1 : 0, label);
-    assert.equal(ddb.writes.length, 1, label);
-    assert.equal(ddb.writes[0].input.ExpressionAttributeValues[':mr'], due ? 'check' : undefined, label);
+    const ddb = table([live('r', fields)]);
+    await decayTable(ddb, 'concerns', FULL, NOW, ctx);
+    assert.equal(bodies(ctx.sqs).filter((m) => m.reason === 'check').length, due ? 1 : 0, label);
+    const writes = ddb.writes.filter((w) => w.input.Key.record_id === 'r');
+    assert.equal(writes.length, 1, label);
+    assert.equal(writes[0].input.ExpressionAttributeValues[':mr'], due ? 'check' : undefined, label);
   }
 });
 
@@ -377,7 +382,7 @@ test('a check request carries the release tag, the record and dry_run', async (t
   for (const [releaseTag, dryRun] of [['9.1.2', false], [null, true]]) {
     const { ctx } = maintenance({ releaseTag, dryRun });
     const record = live('r1', { verified_at: undefined });
-    const ddb = fakeDdb([[record]]);
+    const ddb = table([record]);
     await decayTable(ddb, 'concerns', FULL, NOW, ctx);
     const id = `check#valkey-review#r1#${NOW_ISO}`;
     assert.deepEqual(bodies(ctx.sqs), [{
@@ -400,7 +405,7 @@ test('a check request carries the release tag, the record and dry_run', async (t
 test('the release tag is checked again before it reaches a message', async (t) => {
   quietLogs(t);
   const { ctx } = maintenance({ releaseTag: '9.2.0-rc1' });
-  const ddb = fakeDdb([[live('r1', { verified_at: undefined })]]);
+  const ddb = table([live('r1', { verified_at: undefined })]);
   await decayTable(ddb, 'concerns', FULL, NOW, ctx);
   assert.equal(bodies(ctx.sqs)[0].release_tag, '');
 });
@@ -408,11 +413,11 @@ test('the release tag is checked again before it reaches a message', async (t) =
 test(`no new request within ${MAINTENANCE_RETRY_DAYS} days of the last one`, async (t) => {
   quietLogs(t);
   const { ctx } = maintenance();
-  const ddb = fakeDdb([[
+  const ddb = table([
     live('pending', { verified_at: undefined, maintenance_requested_at: daysAgo(6.9) }),
     faded('pending-retire', { maintenance_requested_at: daysAgo(1) }),
     live('stale', { verified_at: undefined, maintenance_requested_at: daysAgo(7.1) }),
-  ]]);
+  ]);
   const stats = await decayTable(ddb, 'concerns', FULL, NOW, ctx);
   assert.deepEqual(bodies(ctx.sqs).map((b) => b.record_id), ['stale']);
   assert.equal(stats.decayed, 3, 'in-flight records still decay');
@@ -422,14 +427,14 @@ test(`no new request within ${MAINTENANCE_RETRY_DAYS} days of the last one`, asy
 test('checks go never checked first, then re-published, then the oldest check, within checksPerDay', async (t) => {
   quietLogs(t);
   const { ctx } = maintenance();
-  const ddb = fakeDdb([[
+  const ddb = table([
     live('old-check', { verified_release: '9.1.1', verified_at: daysAgo(80) }),
     live('older-check', { verified_release: '9.1.1', verified_at: daysAgo(85) }),
     live('republished', { graduated_at: daysAgo(1), verified_at: daysAgo(20) }),
     live('new', { verified_at: undefined, graduated_at: daysAgo(3) }),
     live('newer', { verified_at: undefined, graduated_at: daysAgo(1) }),
     live('recent-check', { verified_release: '9.1.1', verified_at: daysAgo(2) }),
-  ]]);
+  ]);
   const stats = await decayTable(ddb, 'concerns', { ...FULL, checksPerDay: 4 }, NOW, ctx);
   assert.deepEqual(bodies(ctx.sqs).map((b) => b.record_id), ['new', 'newer', 'republished', 'older-check']);
   assert.equal(stats.checksRequested, 4);
@@ -443,14 +448,14 @@ test('check requests are staggered by a minute each, up to the SQS maximum', asy
   quietLogs(t);
   const { ctx } = maintenance();
   const records = Array.from({ length: 20 }, (_, i) => live(`r${String(i).padStart(2, '0')}`, { verified_at: undefined, graduated_at: daysAgo(100 - i) }));
-  await decayTable(fakeDdb([records]), 'concerns', { ...FULL, checksPerDay: 20 }, NOW, ctx);
+  await decayTable(table(records), 'concerns', { ...FULL, checksPerDay: 20 }, NOW, ctx);
   assert.deepEqual(ctx.sqs.sent.map((m) => m.DelaySeconds), [0, 60, 120, 180, 240, 300, 360, 420, 480, 540, 600, 660, 720, 780, 840, 900, 900, 900, 900, 900]);
 });
 
 test('retire requests are not delayed and do not shift the check stagger', async (t) => {
   quietLogs(t);
   const { ctx } = maintenance();
-  await decayTable(fakeDdb([[faded('gone'), live('a', { verified_at: undefined }), live('b', { verified_at: undefined })]]), 'concerns', FULL, NOW, ctx);
+  await decayTable(table([faded('gone'), live('a', { verified_at: undefined }), live('b', { verified_at: undefined })]), 'concerns', FULL, NOW, ctx);
   assert.deepEqual(ctx.sqs.sent.map((m) => [JSON.parse(m.MessageBody).reason, m.DelaySeconds]), [['retire', 0], ['check', 0], ['check', 60]]);
 });
 
@@ -462,7 +467,7 @@ test('a failed send releases the claim and counts an error', async (t) => {
     reviewerId: 'valkey-review', releaseTag: '9.1.2', recheckAll: false, dryRun: false,
     sqs: fakeSqs(events, () => { throw new Error('queue unavailable'); }),
   };
-  const ddb = fakeDdb([[live('r1', { verified_at: undefined })]]);
+  const ddb = table([live('r1', { verified_at: undefined })]);
   const stats = await decayTable(ddb, 'concerns', FULL, NOW, ctx);
   assert.equal(stats.errors, 1);
   assert.equal(stats.checksRequested, 0);
@@ -477,7 +482,7 @@ test('a failed send releases the claim and counts an error', async (t) => {
 test('a record that changed after the scan loses its claim, and the next candidate takes the slot', async (t) => {
   quietLogs(t);
   const { ctx } = maintenance();
-  const ddb = fakeDdb([[live('raced', { verified_at: undefined, graduated_at: daysAgo(9) }), live('next', { verified_at: undefined, graduated_at: daysAgo(1) })]], (_op, input) => {
+  const ddb = table([live('raced', { verified_at: undefined, graduated_at: daysAgo(9) }), live('next', { verified_at: undefined, graduated_at: daysAgo(1) })], (_op, input) => {
     if (input.Key.record_id === 'raced') throw Object.assign(new Error('conditional'), { name: 'ConditionalCheckFailedException' });
     return {};
   });
@@ -497,7 +502,7 @@ test('no checks without an upstream, with checks off or without a queue; retirem
   ];
   for (const [config, fields] of setups) {
     const { ctx } = maintenance(fields);
-    const ddb = fakeDdb([[live('unchecked', { verified_at: undefined }), faded('gone')]]);
+    const ddb = table([live('unchecked', { verified_at: undefined }), faded('gone')]);
     const stats = await decayTable(ddb, 'concerns', config, NOW, ctx);
     assert.equal(stats.checksRequested, 0);
     assert.equal(stats.retireRequested + stats.wouldRetire, 1);
@@ -509,11 +514,11 @@ test('a record the curator could not accept is never queued', async (t) => {
   quietLogs(t);
   const warn = t.mock.method(console, 'warn', () => {});
   const { ctx } = maintenance();
-  const ddb = fakeDdb([[
+  const ddb = table([
     live('r1', { verified_at: undefined, graduated_record_name: 'Not A Slug' }),
     faded('r2', { graduated_record_name: '-leading-dash' }),
     live('x'.repeat(101), { verified_at: undefined }),
-  ]]);
+  ]);
   const stats = await decayTable(ddb, 'concerns', FULL, NOW, ctx);
   assert.equal(ctx.sqs.sent.length, 0);
   assert.equal(stats.errors, 3);
@@ -597,4 +602,120 @@ test('skill maintenance settings are validated', () => {
   for (const bad of ['valkey', 'valkey-io/valkey/tree', 'owner/..', 'https://github.com/valkey-io/valkey']) {
     assert.throws(() => loadDecayConfig({ ...on, UPSTREAM_REPOS_JSON: JSON.stringify({ 'valkey-review': bad }) }), /must look like "owner\/name"/, bad);
   }
+});
+
+// The reviewer's skill.md in this repository: one check per GA release.
+
+const REPO_SKILL = { area_bucket: '#maintenance', record_id: 'repo-skill' };
+const repoItem = (fields) => ({ ...REPO_SKILL, ...fields });
+
+test('the first repo skill check creates its item with the claim and is queued ahead of the records', async (t) => {
+  quietLogs(t);
+  const { ctx, events } = maintenance();
+  const ddb = fakeDdb([[live('r1', { verified_at: undefined })]], (_op, input) => { events.push(`write ${input.Key.record_id}`); return {}; });
+  const stats = await decayTable(ddb, 'concerns', FULL, NOW, ctx);
+
+  assert.deepEqual(events, ['write repo-skill', 'send repo-skill', 'write r1', 'send r1']);
+  assert.equal(stats.checksRequested, 2);
+  const claim = ddb.writes[0].input;
+  assert.deepEqual(claim.Key, REPO_SKILL);
+  assert.equal(claim.UpdateExpression, 'SET #mid = :mid, #mra = :now, #mr = :mr');
+  assert.equal(claim.ConditionExpression, 'attribute_not_exists(#rid)');
+  assert.deepEqual(claim.ExpressionAttributeNames, { '#mid': 'maintenance_id', '#mra': 'maintenance_requested_at', '#mr': 'maintenance_reason', '#rid': 'record_id' });
+  const id = `repo_check#valkey-review#repo-skill#${NOW_ISO}`;
+  assert.deepEqual(claim.ExpressionAttributeValues, { ':mid': id, ':now': NOW_ISO, ':mr': 'repo_check' });
+
+  const [repo, record] = ctx.sqs.sent;
+  assert.deepEqual(JSON.parse(repo.MessageBody), {
+    maintenance_id: id,
+    reason: 'repo_check',
+    reviewer_id: 'valkey-review',
+    area_bucket: '#maintenance',
+    record_id: 'repo-skill',
+    release_tag: '9.1.2',
+    dry_run: false,
+  });
+  assert.equal(repo.DelaySeconds, 0);
+  assert.equal(repo.MessageAttributes.reason.StringValue, 'repo_check');
+  assert.equal(record.DelaySeconds, 60, 'record checks are staggered after it');
+});
+
+test('a repo skill checked at an older release is checked again, in the state the scan read', async (t) => {
+  quietLogs(t);
+  for (const [fields, condition] of [
+    [{ verified_release: '9.1.1', verified_at: daysAgo(40) }, '#vr = :vr AND attribute_not_exists(#mra)'],
+    [{ verified_release: '9.1.1', maintenance_requested_at: daysAgo(8) }, '#vr = :vr AND #mra = :mra'],
+    [{ maintenance_requested_at: daysAgo(30) }, 'attribute_not_exists(#vr) AND #mra = :mra'],
+  ]) {
+    const { ctx } = maintenance({ dryRun: true });
+    const ddb = fakeDdb([[repoItem(fields)]]);
+    await decayTable(ddb, 'concerns', FULL, NOW, ctx);
+    const claim = ddb.writes[0].input;
+    assert.equal(claim.ConditionExpression, condition);
+    if (fields.verified_release) assert.equal(claim.ExpressionAttributeValues[':vr'], fields.verified_release);
+    if (fields.maintenance_requested_at) assert.equal(claim.ExpressionAttributeValues[':mra'], fields.maintenance_requested_at);
+    assert.deepEqual(Object.keys(claim.ExpressionAttributeNames).sort(), ['#mid', '#mr', '#mra', '#vr']);
+    const [body] = bodies(ctx.sqs);
+    assert.equal(body.reason, 'repo_check');
+    assert.equal(body.dry_run, true);
+  }
+});
+
+test('the repo skill is checked once per release, and not while a request is in flight', async (t) => {
+  quietLogs(t);
+  const cases = [
+    ['current release', repoItem({ verified_release: '9.1.2' }), {}, false],
+    ['current release, recheck_all', repoItem({ verified_release: '9.1.2' }), { recheckAll: true }, true],
+    ['in flight', repoItem({ verified_release: '9.1.1', maintenance_requested_at: daysAgo(2) }), { recheckAll: true }, false],
+    ['release unknown', repoItem({ verified_release: '9.1.1' }), { releaseTag: null, recheckAll: true }, false],
+    ['release unknown, never checked', undefined, { releaseTag: null }, false],
+  ];
+  for (const [label, item, fields, due] of cases) {
+    const { ctx } = maintenance(fields);
+    const ddb = fakeDdb([item ? [item] : []]);
+    const stats = await decayTable(ddb, 'concerns', FULL, NOW, ctx);
+    assert.equal(ctx.sqs.sent.length, due ? 1 : 0, label);
+    assert.equal(ddb.writes.length, due ? 1 : 0, label);
+    assert.equal(stats.errors, 0, label);
+    assert.equal(stats.decayed + stats.deleted, 0, `${label}: the item is never scored or deleted`);
+  }
+});
+
+test('the repo skill check takes a slot of checksPerDay', async (t) => {
+  quietLogs(t);
+  const { ctx } = maintenance();
+  const ddb = fakeDdb([[repoItem({ verified_release: '9.1.1' }), live('r1', { verified_at: undefined })]]);
+  const stats = await decayTable(ddb, 'concerns', { ...FULL, checksPerDay: 1 }, NOW, ctx);
+  assert.deepEqual(bodies(ctx.sqs).map((b) => b.reason), ['repo_check']);
+  assert.equal(stats.deferred, 1);
+});
+
+test('no repo skill check without an upstream or with checks off, and the item is left alone', async (t) => {
+  quietLogs(t);
+  for (const config of [{ ...FULL, upstreamRepos: {} }, { ...FULL, checksPerDay: 0 }]) {
+    const { ctx } = maintenance();
+    const ddb = fakeDdb([[repoItem({ verified_release: '9.0.0' })]]);
+    const stats = await decayTable(ddb, 'concerns', config, NOW, ctx);
+    assert.equal(ctx.sqs.sent.length, 0);
+    assert.equal(ddb.writes.length, 0);
+    assert.equal(stats.scanned, 1);
+    assert.equal(stats.errors, 0);
+  }
+});
+
+test('a failed repo skill send releases its claim', async (t) => {
+  quietLogs(t);
+  t.mock.method(console, 'warn', () => {});
+  const ctx = {
+    reviewerId: 'valkey-review', releaseTag: '9.1.2', recheckAll: false, dryRun: false,
+    sqs: fakeSqs([], () => { throw new Error('queue unavailable'); }),
+  };
+  const ddb = fakeDdb([[]]);
+  const stats = await decayTable(ddb, 'concerns', FULL, NOW, ctx);
+  assert.equal(stats.errors, 1);
+  assert.equal(stats.checksRequested, 0);
+  const [claim, release] = ddb.writes.map((w) => w.input);
+  assert.deepEqual(release.Key, REPO_SKILL);
+  assert.equal(release.UpdateExpression, 'REMOVE #mid, #mra, #mr');
+  assert.equal(release.ExpressionAttributeValues[':mid'], claim.ExpressionAttributeValues[':mid']);
 });

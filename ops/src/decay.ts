@@ -36,6 +36,11 @@ import { isRepoName, latestReleaseTag, RELEASE_TAG_RE } from './releases.js';
  * curator never finished is retried after that window. Per-pass caps
  * bound what lands on the queue, which also carries maintainer feedback.
  *
+ * Once per reviewer and GA release the pass also queues a "repo_check"
+ * of the reviewer's skill.md in this repository. The item at
+ * REPO_SKILL_KEY in the reviewer's concerns table holds that claim and
+ * the release the file was last checked at.
+ *
  * Writes are conditioned on the updated_at, decayed_at and decay_score
  * the scan saw, so a record reinforced, or re-scored by the curator,
  * while the pass runs is skipped rather than decayed or deleted.
@@ -212,7 +217,34 @@ export interface RetireMessage {
   readonly dry_run: boolean;
 }
 
-export type MaintenanceMessage = CheckMessage | RetireMessage;
+/**
+ * Key of the item that tracks the reviewer's repo skill.md check in its
+ * concerns table. Concern records have random UUID ids, so it cannot
+ * collide with one, and the decay pass never scores or deletes it.
+ */
+export const REPO_SKILL_KEY = { area_bucket: '#maintenance', record_id: 'repo-skill' } as const;
+
+/**
+ * A check of the reviewer's skill.md in this repository
+ * (agents/<reviewer_id>/config/skill.md). The curator reports stale facts
+ * or proposes a pull request; it never edits the file in place. Queued
+ * once per GA release: area_bucket and record_id name the REPO_SKILL_KEY
+ * item, which holds the claim and, once the curator is done, the
+ * verified_release it checked.
+ */
+export interface RepoCheckMessage {
+  /** "repo_check#<reviewer_id>#repo-skill#<ISO time of the pass>". */
+  readonly maintenance_id: string;
+  readonly reason: 'repo_check';
+  readonly reviewer_id: string;
+  readonly area_bucket: typeof REPO_SKILL_KEY.area_bucket;
+  readonly record_id: typeof REPO_SKILL_KEY.record_id;
+  /** Highest GA release of the upstream (RELEASE_TAG_RE); never empty. */
+  readonly release_tag: string;
+  readonly dry_run: boolean;
+}
+
+export type MaintenanceMessage = CheckMessage | RetireMessage | RepoCheckMessage;
 
 /** The curator's limits on message fields; a record outside them is never queued. */
 const RECORD_NAME_RE = /^[a-z0-9][a-z0-9-]{0,99}$/;
@@ -378,6 +410,14 @@ function checkDue(
   return due ? { rank: 2, sinceMs: verifiedMs } : null;
 }
 
+/** Whether the repo skill.md is due for a check at `releaseTag`. */
+function repoCheckDue(item: Readonly<Record<string, unknown>> | undefined, releaseTag: string, recheckAll: boolean, nowMs: number): boolean {
+  if (!item) return true;
+  const requestedMs = Date.parse(stringOrEmpty(item.maintenance_requested_at));
+  if (Number.isFinite(requestedMs) && nowMs - requestedMs < MAINTENANCE_RETRY_DAYS * DAY_SECONDS * 1000) return false;
+  return recheckAll || stringOrEmpty(item.verified_release) !== releaseTag;
+}
+
 export async function decayTable(
   ddb: SendClient,
   tableName: string,
@@ -404,6 +444,7 @@ export async function decayTable(
   const retireOn = sqs !== undefined && config.retireSkills && !ctx.dryRun;
   const retirements: RetireCandidate[] = [];
   const checks: CheckCandidate[] = [];
+  let repoSkill: Readonly<Record<string, unknown>> | undefined;
 
   /** Whether the curator would accept a message for the record; logs and counts an error when not. */
   function queueable(r: Scanned, name: string): boolean {
@@ -459,8 +500,39 @@ export async function decayTable(
     return ok;
   }
 
+  /**
+   * Claims the repo skill check on the REPO_SKILL_KEY item, creating it
+   * on the first check, in the state the scan read.
+   */
+  async function claimRepoSkill(item: Readonly<Record<string, unknown>> | undefined, id: string): Promise<boolean> {
+    const names: Record<string, string> = { '#mid': 'maintenance_id', '#mra': 'maintenance_requested_at', '#mr': 'maintenance_reason' };
+    const values: Record<string, unknown> = { ':mid': id, ':now': nowIso, ':mr': 'repo_check' };
+    let condition: string;
+    if (!item) {
+      names['#rid'] = 'record_id';
+      condition = 'attribute_not_exists(#rid)';
+    } else {
+      names['#vr'] = 'verified_release';
+      const { verified_release: verified, maintenance_requested_at: requested } = item;
+      condition = [
+        verified === undefined ? 'attribute_not_exists(#vr)' : '#vr = :vr',
+        requested === undefined ? 'attribute_not_exists(#mra)' : '#mra = :mra',
+      ].join(' AND ');
+      if (verified !== undefined) values[':vr'] = verified;
+      if (requested !== undefined) values[':mra'] = requested;
+    }
+    return write(new UpdateCommand({
+      TableName: tableName,
+      Key: REPO_SKILL_KEY,
+      UpdateExpression: 'SET #mid = :mid, #mra = :now, #mr = :mr',
+      ConditionExpression: condition,
+      ExpressionAttributeNames: names,
+      ExpressionAttributeValues: values,
+    }), 'claim', REPO_SKILL_KEY);
+  }
+
   /** Sends a claimed request; on failure releases the claim so the next pass can retry. */
-  async function send(r: Scanned, message: MaintenanceMessage, delaySeconds: number): Promise<boolean> {
+  async function send(key: Scanned['key'], message: MaintenanceMessage, delaySeconds: number): Promise<boolean> {
     try {
       await sqs!.send(new SendMessageCommand({
         QueueUrl: config.curatorQueueUrl,
@@ -475,13 +547,13 @@ export async function decayTable(
       return true;
     } catch (err) {
       errors += 1;
-      console.warn(`[decay] send failed for ${tableName} ${r.key.area_bucket} ${r.key.record_id} maintenance=${message.maintenance_id}: ${errorText(err)}`);
+      console.warn(`[decay] send failed for ${tableName} ${key.area_bucket} ${key.record_id} maintenance=${message.maintenance_id}: ${errorText(err)}`);
     }
     // Best effort: a claim left behind only delays the retry by MAINTENANCE_RETRY_DAYS.
     try {
       await ddb.send(new UpdateCommand({
         TableName: tableName,
-        Key: r.key,
+        Key: key,
         UpdateExpression: 'REMOVE #mid, #mra, #mr',
         ConditionExpression: '#mid = :mid',
         ExpressionAttributeNames: { '#mid': 'maintenance_id', '#mra': 'maintenance_requested_at', '#mr': 'maintenance_reason' },
@@ -509,6 +581,10 @@ export async function decayTable(
       scanned += 1;
       const areaBucket = item.area_bucket;
       const recordId = item.record_id;
+      if (areaBucket === REPO_SKILL_KEY.area_bucket && recordId === REPO_SKILL_KEY.record_id) {
+        repoSkill = item;
+        continue;
+      }
       const updatedAt = stringOrEmpty(item.updated_at);
       const decayedAt = stringOrEmpty(item.decayed_at);
       const updatedMs = Date.parse(updatedAt);
@@ -592,7 +668,7 @@ export async function decayTable(
     const id = maintenanceId('retire', ctx.reviewerId, r.key.record_id, nowIso);
     if (!(await claim(r, 'retire', id))) continue;
     retireClaims += 1;
-    const sent = await send(r, {
+    const sent = await send(r.key, {
       maintenance_id: id,
       reason: 'retire',
       reviewer_id: ctx.reviewerId,
@@ -609,9 +685,31 @@ export async function decayTable(
     }
   }
 
+  let checkClaims = 0;
+
+  // The repo skill.md: once per release, ahead of the records.
+  if (checksOn && releaseTag !== null && repoCheckDue(repoSkill, releaseTag, ctx.recheckAll, nowMs)) {
+    const id = maintenanceId('repo_check', ctx.reviewerId, REPO_SKILL_KEY.record_id, nowIso);
+    if (await claimRepoSkill(repoSkill, id)) {
+      checkClaims += 1;
+      const sent = await send(REPO_SKILL_KEY, {
+        maintenance_id: id,
+        reason: 'repo_check',
+        reviewer_id: ctx.reviewerId,
+        area_bucket: REPO_SKILL_KEY.area_bucket,
+        record_id: REPO_SKILL_KEY.record_id,
+        release_tag: releaseTag,
+        dry_run: ctx.dryRun,
+      }, 0);
+      if (sent) {
+        checksRequested += 1;
+        console.log(`[decay] repo-check-requested ${tableName} release=${releaseTag} dry_run=${ctx.dryRun} maintenance=${id}`);
+      }
+    }
+  }
+
   // Checks: never checked, then re-published, then the oldest check.
   checks.sort((a, b) => a.rank - b.rank || a.sinceMs - b.sinceMs || byKey(a, b));
-  let checkClaims = 0;
   for (const c of checks) {
     if (checkClaims >= config.checksPerDay) {
       deferred += 1;
@@ -622,7 +720,7 @@ export async function decayTable(
     if (!(await claim(c, 'check', id))) continue;
     const delaySeconds = Math.min(MAX_DELAY_SECONDS, CHECK_STAGGER_SECONDS * checkClaims);
     checkClaims += 1;
-    const sent = await send(c, {
+    const sent = await send(c.key, {
       maintenance_id: id,
       reason: 'check',
       reviewer_id: ctx.reviewerId,
