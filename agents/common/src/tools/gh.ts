@@ -228,7 +228,7 @@ Supply:
 
 \`body\` and each comment body may be at most ${MAX_GITHUB_TEXT_CHARS} characters.
 
-The review is posted as event="COMMENT". REQUEST_CHANGES and APPROVE are not available to the reviewer: block/approve decisions belong to humans. If you have no inline comments, call \`skip_review\` instead.
+The review is posted as event="COMMENT". REQUEST_CHANGES and APPROVE are not available to the reviewer: block/approve decisions belong to humans. If you have no inline comments, call \`skip_review\` instead. Exception: on a mention-triggered run with a reply for the requester, call this tool with \`comments: []\` and the reply in \`body\`.
 
 The review is anchored at the PR head SHA already loaded in the workspace context (${deps.ctx.headSha}). You do not pass it.`,
     inputSchema: z.object({

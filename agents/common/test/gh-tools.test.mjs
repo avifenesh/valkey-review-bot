@@ -188,6 +188,11 @@ test('on mention runs the reply replaces the status comment and the review body 
   assert.deepEqual(finished, ['Fixed in the latest push, one nit left.\n\nCurrent review state: https://github.com/state']);
 });
 
+test('the post_review description allows a reply-only call on mention runs, as the prompts do', () => {
+  const { description } = harness().post.toolSpec;
+  assert.match(description, /If you have no inline comments, call `skip_review` instead\. Exception: on a mention-triggered run with a reply for the requester, call this tool with `comments: \[\]` and the reply in `body`\./);
+});
+
 test('on mention runs an empty reply falls back to a line that fits what was posted', async () => {
   const finished = [];
   const statusComment = { finish: async (body) => { finished.push(body); } };
