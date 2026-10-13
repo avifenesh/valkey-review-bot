@@ -728,6 +728,47 @@ test('an obsolete finding a reinforcement overtook is recorded, logged and retur
   assert.match(line, /why="reinforced since the check"/);
 });
 
+/** A hook that hands the record's claim to another message just before the check's outcome is written. */
+const claimTakenBeforeOutcome = (key) => ({
+  beforeUpdate: (input, table) => {
+    const row = table.item(key);
+    if (input.UpdateExpression.includes('#checkoutcome') && row.maintenance_id !== 'check#other') table.put({ ...row, maintenance_id: 'check#other' });
+  },
+});
+
+test('a check whose outcome write loses its claim records nothing and says so', async () => {
+  const md = '---\nname: db-flush\ndescription: Use when.\n---\n\n- `serverCron` is never `old_placeholder_name`.\n';
+  const cases = [
+    ['clean', { item: record({ audit_names: new Set(['serverCron', 'src/server.c']) }), skill: { name: NAME, skillMd: CLEAN_MD } }],
+    ['suspect', { item: record({ audit_names: new Set(['serverCron', 'src/server.c']), verified_sha: MISSING_BASE }), skill: { name: NAME, skillMd: CLEAN_MD }, checkout: claimingBase }],
+    ['accurate', { item: record({ audit_names: new Set(['serverCron']) }), skill: { name: NAME, skillMd: md }, turns: [report('accurate')] }],
+    ['obsolete', { item: record({ area: ['src/gone/**'] }), turns: [report('obsolete')] }],
+    ['suspect', { turns: [report('unsure')] }],
+  ];
+  for (const [outcome, opts] of cases) {
+    const s = setup({ ...opts, hooks: claimTakenBeforeOutcome(KEY) });
+    const { result, lines } = await run(checkMessage(), s.deps);
+    assert.deepEqual(result, { status: 'skipped', decision: 'changed' }, outcome);
+    const item = s.table.item(KEY);
+    assert.equal(item.check_outcome, undefined, outcome);
+    assert.equal(item.maintenance_id, 'check#other', outcome);
+    const line = lines.find((l) => l.startsWith('[maintenance] check '));
+    assert.ok(line.includes(`outcome="${outcome}"`) && line.includes('recorded=false'), `${outcome}: ${line}`);
+  }
+
+  // A tombstone that loses its claim the same way.
+  const retired = setup({
+    skill: { name: NAME, skillMd: SKILL_MD, status: 'DEPRECATED' },
+    hooks: { beforeUpdate: (input, table) => { if (input.UpdateExpression.includes('#retiredat')) table.put({ ...table.item(KEY), maintenance_id: 'check#other' }); } },
+  });
+  assert.deepEqual((await run(checkMessage(), retired.deps)).result, { status: 'skipped', decision: 'changed' });
+  assert.equal(retired.table.item(KEY).retired_at, undefined);
+
+  const done = setup({ item: record({ audit_names: new Set(['serverCron', 'src/server.c']) }), skill: { name: NAME, skillMd: CLEAN_MD } });
+  const { lines } = await run(checkMessage(), done.deps);
+  assert.ok(lines.some((l) => l.startsWith('[maintenance] check ') && l.includes('recorded=true')), lines.join('\n'));
+});
+
 test('the penalty is conditioned on the score as read and dropped after a reinforcement', async () => {
   let bumped = false;
   const s = setup({
@@ -893,6 +934,17 @@ test('a name a repo check lost stays lost at the next one, so accurate is refuse
   assert.equal(item.ignored_names, undefined);
   assert.deepEqual(set(item.lost_names), ['emptyDB']);
   assert.equal(item.verified_sha, BASE_SHA);
+});
+
+test('a repo check whose outcome write loses its claim records nothing and says so', async () => {
+  const r = repoApi();
+  const s = setup({ item: repoItem(), turns: [report('revise', [EDIT])], settings: { skillsRepo: SKILLS_REPO }, repoSkills: async () => r.api, hooks: claimTakenBeforeOutcome(REPO_SKILL_KEY) });
+  const { result, lines } = await run(repoMessage(), s.deps);
+  assert.deepEqual(result, { status: 'skipped', decision: 'changed' });
+  const item = s.table.item(REPO_SKILL_KEY);
+  assert.equal(item.check_outcome, undefined);
+  assert.equal(item.pending_revision, undefined);
+  assert.ok(lines.some((l) => l.startsWith('[maintenance] repo_check ') && l.includes('outcome="suspect"') && l.includes('recorded=false')), lines.join('\n'));
 });
 
 test('a repo check with pull requests on proposes code-generated text only', async () => {

@@ -462,7 +462,7 @@ class Run {
     return this.send(w);
   }
 
-  log(kind: string, fields: Readonly<Record<string, string | number | boolean | undefined>>): void {
+  log(kind: string, fields: LogFields): void {
     console.log(reportLine(kind, {
       reviewer: this.req.reviewer_id,
       ...(this.req.reason === 'repo_check' ? {} : { bucket: this.req.area_bucket, id: this.req.record_id, name: this.name }),
@@ -485,6 +485,14 @@ export async function* handleMaintenance(req: MaintenanceRequest, deps: Maintena
 
 const skipped = (decision: string): MaintenanceResult => ({ status: 'skipped', decision });
 const completed = (decision: string): MaintenanceResult => ({ status: 'completed', decision });
+
+type LogFields = Readonly<Record<string, string | number | boolean | undefined>>;
+
+/** A check's report line, and its result: skipped when its write lost to another writer and nothing was recorded. */
+function ended(run: Run, outcome: string, recorded: boolean, fields: LogFields): MaintenanceResult {
+  run.log(run.req.reason, { outcome, ...fields, recorded });
+  return recorded ? completed(outcome) : skipped('changed');
+}
 
 /** The message's claim is not on the record: stale or a duplicate. Nothing is written. */
 function notClaimed(run: Run): MaintenanceResult {
@@ -537,7 +545,7 @@ async function retirement(run: Run, reason: string, fromStatus: string | undefin
     run.log(run.req.reason, { outcome: 'would-record-retirement', retired_reason: reason, registry_status: fromStatus ?? 'none', mode: 'report' });
     return completed('would-record-retirement');
   }
-  return completed(await tombstone(run, reason, fromStatus, markerRead) ? 'retired' : 'skipped');
+  return await tombstone(run, reason, fromStatus, markerRead) ? completed('retired') : skipped('changed');
 }
 
 /** A retirement the registry refused: back off (decay waits RETIRE_REFUSED_BACKOFF_SECONDS) and release the claim. */
@@ -596,8 +604,8 @@ async function* retire(run: Run, req: RetireRequest): AsyncGenerator<StreamFrame
     // and the redelivered message finds out what happened.
     if ((err as { name?: string } | null)?.name !== 'ValidationException') throw err;
     const fresh = await run.deps.registry.get(req.record_name);
-    if (!fresh) return completed(await tombstone(run, req.retire_reason, skill.status, null) ? 'retired' : 'skipped');
-    if (fresh.status === 'REJECTED') return completed(await tombstone(run, 'operator', 'REJECTED', null) ? 'retired' : 'skipped');
+    if (!fresh) return await tombstone(run, req.retire_reason, skill.status, null) ? completed('retired') : skipped('changed');
+    if (fresh.status === 'REJECTED') return await tombstone(run, 'operator', 'REJECTED', null) ? completed('retired') : skipped('changed');
     if (BUSY_STATUSES.has(fresh.status)) {
       run.log('retire', { outcome: 'pending', registry_status: fresh.status, why: 'the deprecation was refused while the record is being written; the claim is kept' });
       return completed('pending');
@@ -605,7 +613,7 @@ async function* retire(run: Run, req: RetireRequest): AsyncGenerator<StreamFrame
     if (fresh.status !== 'DEPRECATED') return refused(run, fresh.status);
     // DEPRECATED after all: a duplicate of this message got there first.
   }
-  return completed(await tombstone(run, req.retire_reason, skill.status, true) ? 'retired' : 'skipped');
+  return await tombstone(run, req.retire_reason, skill.status, true) ? completed('retired') : skipped('changed');
 }
 
 // --- Check -----------------------------------------------------------------
@@ -1006,35 +1014,38 @@ async function* checkBody(run: Run, req: CheckRequest, c: Checked, skill: SkillR
 
   if (r.clean) {
     const v: Outcome = { outcome: 'clean', note: note(`${r.present.length} cited names present at ${c.ref}${r.compared ? ', no rare name touched since the last check' : ''}`) };
-    if (req.dry_run) await run.release();
-    else {
-      await finishCheck(run, () => {
-        const w = outcomeWrite(run, v).remove('pending_revision');
-        confirm(w, c, r.present, item, []);
-        stale(w, item, [], run.nowIso);
-        lostNames(w, []);
-        return w;
-      });
+    if (req.dry_run) {
+      await run.release();
+      run.log('check', { outcome: 'clean', ...fields, mode: 'report', note: v.note });
+      return completed('clean');
     }
-    run.log('check', { outcome: 'clean', ...fields, mode: req.dry_run ? 'report' : 'apply', note: v.note });
-    return completed('clean');
+    const recorded = await finishCheck(run, (it) => {
+      const w = outcomeWrite(run, v).remove('pending_revision');
+      confirm(w, c, r.present, it, []);
+      stale(w, it, [], run.nowIso);
+      lostNames(w, []);
+      return w;
+    });
+    return ended(run, 'clean', recorded, { ...fields, mode: 'apply', note: v.note });
   }
 
   const flagged = flaggedNames(r);
   if (flagged.length === 0) {
     // Nothing flagged, but part of the diff went unexamined: no audit can confirm it.
     const v: Outcome = { outcome: 'suspect', note: note(`the diff since the last check was not examined in full at ${c.ref} (${r.incomplete.length} reason(s)); the skill was not confirmed`) };
-    if (req.dry_run) await run.release();
-    else {
-      await finishCheck(run, () => {
-        const w = outcomeWrite(run, v);
-        confirm(w, c, r.present, item, []);
-        lostNames(w, []);
-        return w;
-      });
+    const logged = { ...fields, incomplete: r.incomplete.join('; '), note: v.note };
+    if (req.dry_run) {
+      await run.release();
+      run.log('check', { outcome: 'suspect', ...logged, mode: 'report' });
+      return completed('suspect');
     }
-    run.log('check', { outcome: 'suspect', ...fields, incomplete: r.incomplete.join('; '), note: v.note });
-    return completed('suspect');
+    const recorded = await finishCheck(run, (it) => {
+      const w = outcomeWrite(run, v);
+      confirm(w, c, r.present, it, []);
+      lostNames(w, []);
+      return w;
+    });
+    return ended(run, 'suspect', recorded, logged);
   }
 
   if (!run.deps.audit.systemPrompt) return inconclusive(run, `${counts} at ${c.ref}; no audit prompt is configured`);
@@ -1056,26 +1067,25 @@ async function* checkBody(run: Run, req: CheckRequest, c: Checked, skill: SkillR
 
   if (report.verdict === 'accurate' && valid) {
     const v: Outcome = { outcome: 'accurate', note: flaggedNote(`${flagged.length} flagged name(s) judged accurate`) };
-    await finishCheck(run, () => {
+    const recorded = await finishCheck(run, (it) => {
       const w = outcomeWrite(run, v).remove('pending_revision');
-      confirm(w, c, r.present, item, []);
-      stale(w, item, [], run.nowIso);
+      confirm(w, c, r.present, it, []);
+      stale(w, it, [], run.nowIso);
       lostNames(w, []);
       // Never a name that was in the baseline: those are lost, not accurate.
-      const audited = new Set([...names(item.audit_names), ...names(item.lost_names)]);
-      const ignored = new Set([...names(item.ignored_names), ...r.newAbsent.filter((n) => !audited.has(n))]);
+      const audited = new Set([...names(it.audit_names), ...names(it.lost_names)]);
+      const ignored = new Set([...names(it.ignored_names), ...r.newAbsent.filter((n) => !audited.has(n))]);
       w.setNames('ignored_names', storedNames(ignored, IGNORED_NAMES_MAX));
       return w;
     });
-    run.log('check', { outcome: 'accurate', ...fields, note: v.note, summary: report.summary });
-    return completed('accurate');
+    return ended(run, 'accurate', recorded, { ...fields, note: v.note, summary: report.summary });
   }
 
   if (report.verdict === 'obsolete' && valid && await obsoleteCorroborated(c, areaGlobs(item))) {
     const v: Outcome = { outcome: 'obsolete', note: flaggedNote(`the skill's subject is gone (${r.lost.length} of ${c.baseline.length + c.carried.length} names lost)`) };
     // What was written: a reinforcement since the read turns the finding into a suspect one.
     const written: { outcome: 'obsolete' | 'suspect' } = { outcome: 'obsolete' };
-    await finishCheck(run, (it, notReinforced) => {
+    const recorded = await finishCheck(run, (it, notReinforced) => {
       written.outcome = notReinforced ? 'obsolete' : 'suspect';
       if (!notReinforced) {
         // The record stays live and unverified; the finding waits for the operator.
@@ -1091,14 +1101,12 @@ async function* checkBody(run: Run, req: CheckRequest, c: Checked, skill: SkillR
       lostNames(w, r.lost);
       return w.set('obsolete_release', c.label).set('decay_score', 0).is('updated_at', it.updated_at);
     });
-    run.log('check', {
-      outcome: written.outcome,
+    return ended(run, written.outcome, recorded, {
       ...fields,
       ...(written.outcome === 'suspect' ? { why: REINFORCED_SINCE } : {}),
       note: v.note,
       summary: report.summary,
     });
-    return completed(written.outcome);
   }
 
   if (report.verdict === 'revise' && valid && report.skillMd !== null && run.deps.settings.checkApplyEdits) {
@@ -1112,7 +1120,7 @@ async function* checkBody(run: Run, req: CheckRequest, c: Checked, skill: SkillR
         : report.verdict === 'accurate' ? 'accurate while names are missing'
           : 'the audit was unsure';
   const v: Outcome = { outcome: 'suspect', note: flaggedNote(`${counts}`) };
-  await finishCheck(run, (it, penalty) => {
+  const recorded = await finishCheck(run, (it, penalty) => {
     const w = outcomeWrite(run, v).set('pending_revision', pendingRevision(run.nowIso, c, report, reason));
     // The verification does not move.
     keepBaseline(w, it, c.result.lost);
@@ -1122,8 +1130,7 @@ async function* checkBody(run: Run, req: CheckRequest, c: Checked, skill: SkillR
     return w;
   });
   logEdits(run, c, report, false);
-  run.log('check', { outcome: 'suspect', ...fields, why: reason, note: v.note, summary: report.summary });
-  return completed('suspect');
+  return ended(run, 'suspect', recorded, { ...fields, why: reason, note: v.note, summary: report.summary });
 }
 
 /**
@@ -1237,18 +1244,20 @@ async function* repoCheck(run: Run, req: RepoCheckRequest): AsyncGenerator<Strea
   const { settings } = run.deps;
 
   /** Record a repo check's end on the item (not in a dry run) and log it. */
-  const finish = async (v: Outcome, extra: (w: Write) => void = () => {}, fields: Record<string, string | number | boolean> = {}): Promise<MaintenanceResult> => {
+  const finish = async (v: Outcome, extra: (w: Write, it: Item) => void = () => {}, fields: LogFields = {}): Promise<MaintenanceResult> => {
     if (req.dry_run) {
       const w = new Write().remove(...CLAIM);
-      extra(w);
+      extra(w, item!);
       await run.state(w);
-    } else {
-      const w = outcomeWrite(run, v);
-      extra(w);
-      await run.state(w);
+      run.log('repo_check', { file: filePath, outcome: v.outcome, ...fields, note: v.note });
+      return completed(v.outcome);
     }
-    run.log('repo_check', { file: filePath, outcome: v.outcome, ...fields, note: v.note });
-    return completed(v.outcome);
+    const recorded = await finishCheck(run, (it) => {
+      const w = outcomeWrite(run, v);
+      extra(w, it);
+      return w;
+    });
+    return ended(run, v.outcome, recorded, { file: filePath, ...fields, note: v.note });
   };
   const keep = async (why: string): Promise<MaintenanceResult> => {
     if (req.dry_run) await run.release();
@@ -1282,15 +1291,15 @@ async function* repoCheck(run: Run, req: RepoCheckRequest): AsyncGenerator<Strea
     const unresolved = [...r.lost, ...r.newAbsent];
     const flagged = flaggedNames(r);
     const counts = `${r.lost.length} lost, ${r.newAbsent.length} new and absent, ${r.touched.length} touched`;
-    const confirmed = (w: Write) => {
-      confirm(w, c, r.present, item!, []);
-      stale(w, item!, [], run.nowIso);
+    const confirmed = (w: Write, it: Item) => {
+      confirm(w, c, r.present, it, []);
+      stale(w, it, [], run.nowIso);
       lostNames(w, []);
       w.set('skills_repo_sha', fetched.sha).remove('pending_revision');
     };
-    const notConfirmed = (w: Write, report: CheckReport | null, reason: string) => {
-      keepBaseline(w, item!, c.result.lost);
-      stale(w, item!, unresolved, run.nowIso);
+    const notConfirmed = (w: Write, it: Item, report: CheckReport | null, reason: string) => {
+      keepBaseline(w, it, c.result.lost);
+      stale(w, it, unresolved, run.nowIso);
       lostNames(w, r.lost);
       w.set('skills_repo_sha', fetched.sha);
       if (report) w.set('pending_revision', pendingRevision(run.nowIso, c, report, reason));
@@ -1301,8 +1310,8 @@ async function* repoCheck(run: Run, req: RepoCheckRequest): AsyncGenerator<Strea
     }
     if (flagged.length === 0) {
       return finish({ outcome: 'suspect', note: note(`the diff since the last check was not examined in full at ${c.ref}`) },
-        req.dry_run ? undefined : (w) => {
-          confirm(w, c, r.present, item!, []);
+        req.dry_run ? undefined : (w, it) => {
+          confirm(w, c, r.present, it, []);
           lostNames(w, []);
         }, fields);
     }
@@ -1319,10 +1328,10 @@ async function* repoCheck(run: Run, req: RepoCheckRequest): AsyncGenerator<Strea
         (w) => w.set('pending_revision', pendingRevision(run.nowIso, c, report, 'dry run')), { ...fieldsWith, mode: 'report' });
     }
     if (report.verdict === 'accurate' && valid) {
-      return finish({ outcome: 'accurate', note: note(`${flagged.length} flagged name(s) judged accurate at ${c.ref}`, flagged) }, (w) => {
-        confirmed(w);
-        const audited = new Set([...names(item!.audit_names), ...names(item!.lost_names)]);
-        w.setNames('ignored_names', storedNames(new Set([...names(item!.ignored_names), ...r.newAbsent.filter((n) => !audited.has(n))]), IGNORED_NAMES_MAX));
+      return finish({ outcome: 'accurate', note: note(`${flagged.length} flagged name(s) judged accurate at ${c.ref}`, flagged) }, (w, it) => {
+        confirmed(w, it);
+        const audited = new Set([...names(it.audit_names), ...names(it.lost_names)]);
+        w.setNames('ignored_names', storedNames(new Set([...names(it.ignored_names), ...r.newAbsent.filter((n) => !audited.has(n))]), IGNORED_NAMES_MAX));
       }, fieldsWith);
     }
 
@@ -1332,7 +1341,7 @@ async function* repoCheck(run: Run, req: RepoCheckRequest): AsyncGenerator<Strea
       const reason = report.verdict === 'revise' && valid ? 'pull requests are off (CHECK_OPEN_PULL_REQUESTS or SKILLS_REPO_TOKEN_FUNCTION)'
         : !valid ? 'the report broke the rules and was accepted after refusals' : `the audit reported ${report.verdict}`;
       logEdits(run, c, report, false);
-      return finish({ outcome: 'suspect', note: note(`${counts} at ${c.ref}`, unresolved) }, (w) => notConfirmed(w, report, reason), { ...fieldsWith, why: reason });
+      return finish({ outcome: 'suspect', note: note(`${counts} at ${c.ref}`, unresolved) }, (w, it) => notConfirmed(w, it, report, reason), { ...fieldsWith, why: reason });
     }
 
     const blocks = addedBlocks(fetched.content, report.skillMd!);
@@ -1365,9 +1374,9 @@ async function* repoCheck(run: Run, req: RepoCheckRequest): AsyncGenerator<Strea
     }
     if (pr.action === 'refused') {
       return finish({ outcome: 'error', note: note(`the pull request was refused: ${(pr.reason ?? '').slice(0, 200)}`) },
-        (w) => notConfirmed(w, report, 'the pull request was refused'), prFields);
+        (w, it) => notConfirmed(w, it, report, 'the pull request was refused'), prFields);
     }
     return finish({ outcome: 'proposed', note: note(`pull request ${pr.action} on ${pr.branch}${pr.url ? `: ${pr.url}` : ''}`) },
-      (w) => notConfirmed(w, report, `proposed by pull request on ${pr.branch}`), prFields);
+      (w, it) => notConfirmed(w, it, report, `proposed by pull request on ${pr.branch}`), prFields);
   });
 }
