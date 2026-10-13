@@ -619,6 +619,38 @@ test('an operator retiring a generation whose publish was not recorded is not un
   assert.equal(w.record().retired_reason, 'operator');
 });
 
+test('an operator restore of an unfinished generation takes the next generation', async () => {
+  // The operator removed retired_reason, as infra/README describes.
+  const restored = () => {
+    const item = unfinished({ retired_reason: 'operator' });
+    delete item.retired_reason;
+    return item;
+  };
+  const w = world({ item: restored(), skills: { ...DEPRECATED, [generationName(2)]: { status: 'DEPRECATED', skillMd: 'gen 2 body' } } });
+  const out = parse(await w.submit.invoke(INPUT));
+  assert.equal(out.ok, true, out.error);
+  assert.equal(out.record_name, generationName(3));
+  assert.equal(out.replaces, generationName(2));
+  assert.ok(!('retired_at' in w.record()));
+
+  // The same when the generation is retired between the read and the update.
+  const registry = fakeRegistry({ ...DEPRECATED, [generationName(2)]: { status: 'DRAFT', skillMd: 'gen 2 body' } });
+  const get = registry.get;
+  registry.get = async (name) => {
+    const seen = await get(name);
+    if (name === generationName(2)) registry.skills.set(name, { ...seen, status: 'DEPRECATED' });
+    return seen;
+  };
+  const raced = world({ item: restored(), registry });
+  const first = parse(await raced.submit.invoke(INPUT));
+  assert.equal(first.ok, false);
+  assert.match(first.error, /was retired while this run worked; call submit_skill again to publish it under a new name/);
+  assert.ok(!('retired_reason' in raced.record()), 'no operator retirement is recorded');
+  const second = parse(await raced.submit.invoke(INPUT));
+  assert.equal(second.ok, true, second.error);
+  assert.equal(second.record_name, generationName(3));
+});
+
 test('a published generation the lifecycle retired comes back as the next one', async () => {
   // graduated_at is set: generation 2 was published, then retired as a live skill.
   const item = tombstone({ graduated_record_name: generationName(2), skill_generation: 2, previous_record_name: OLD });

@@ -373,12 +373,17 @@ async function markRetired(deps: SubmitSkillDeps, key: Key, name: string, reinfo
  * The registry record `name` of an unfinished generation is retired.
  * Nothing in the lifecycle retires it, so an operator did: record that,
  * best effort, conditioned on the record as `source` read it, and
- * return the refusal.
+ * return the refusal. Without retired_reason an operator has restored
+ * the record, and the next submit takes a new generation.
  */
 async function markGenerationRetired(deps: SubmitSkillDeps, key: Key, name: string, source: Item): Promise<string> {
+  if (source.retired_reason === undefined) {
+    return `skill "${name}" was retired while this run worked; call submit_skill again to publish it under a new name`;
+  }
   const conditions = ['#grn = :name', 'attribute_exists(#ret)', 'attribute_not_exists(#ga)'];
   const values: Record<string, unknown> = { ':name': name, ':now': new Date().toISOString(), ':reason': 'operator' };
-  asRead(conditions, values, '#rr', ':readReason', source.retired_reason);
+  values[':readReason'] = source.retired_reason;
+  conditions.push('#rr = :readReason');
   try {
     await deps.ddb.send(updateCommand(deps.table, key, 'SET #ret = :now, #rr = :reason', conditions, values));
   } catch (err) {
@@ -455,7 +460,8 @@ async function chooseTarget(
     const before = typeof source.previous_record_name === 'string' ? await deps.registry.get(source.previous_record_name) : null;
     return keep(true, before?.skillMd ?? null);
   }
-  if (unfinishedGeneration(source)) {
+  // A restored record (no retired_reason) takes the next generation.
+  if (reason !== undefined && unfinishedGeneration(source)) {
     return markGenerationRetired(deps, { area_bucket: input.area_bucket, record_id: input.source_record_id }, current, source);
   }
 
