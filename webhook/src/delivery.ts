@@ -186,16 +186,17 @@ export function createDeliveryHandler(
       for (let undo = taken.pop(); undo; undo = taken.pop()) await undo();
     };
 
-    // A skipped delivery relies on the marker's owner queuing its review,
-    // but the owner takes the marker before its cap and budget checks and
-    // gives it back when it does not queue (a store error or a failed
-    // send, as well as the cap and the budget). So the skipped delivery's
-    // key is released, and a redelivery of it is processed instead of
-    // being dropped as a duplicate. What remains: GitHub does not
-    // redeliver on its own, so in that case this head is reviewed only
-    // after a manual redelivery or the next push; and a redelivery that
-    // comes after the waiting review has started queues another review of
-    // this head.
+    // A skipped delivery relies on the marker's owner, the waiting review,
+    // to cover its head. The owner takes the marker before its cap and
+    // budget checks and gives it back when it does not queue (a store
+    // error or a failed send, as well as the cap and the budget). So the
+    // skipped delivery's key is released, and a redelivery of it is
+    // processed instead of being dropped as a duplicate. What remains:
+    // GitHub does not redeliver on its own, so in that case this head is
+    // reviewed only after a manual redelivery or the next push, as it is
+    // when the worker drops the waiting review (still waiting for another
+    // review past its run budget); and a redelivery that comes after the
+    // waiting review has started queues another review of this head.
     const joinWaitingReview = async (): Promise<Outcome> => {
       await giveBack();
       log(`[auto-review] route=${route.routeId} repo=${repo} pr=${prNumber} head=${headSha} joins the waiting review; skipped`);
@@ -242,7 +243,11 @@ export function createDeliveryHandler(
       }
 
       // A failed send below still uses its budget slot. Failures are rare
-      // and the count only has to bound spend.
+      // and the count only has to bound spend. A send that errors after
+      // SQS accepted the message (a timeout, say) gives back the round and
+      // the marker of a review that will still run: the pull request can
+      // then get one automatic review more than the cap, and the worker,
+      // finding no marker, runs that review like any other.
       const envelope: ReviewEnvelope = {
         repo,
         pr_number: prNumber,
