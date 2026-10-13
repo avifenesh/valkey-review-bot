@@ -21,8 +21,8 @@ import { renderTemplate } from './config.js';
  * with read-only tools and ends the run with one report_skill_check.
  *
  * The report is structured and checked here, not trusted: an "accurate"
- * verdict is refused while names of the last check's baseline are
- * missing, "revise" needs edits, and edits must pass the edit contract
+ * verdict is refused while names an earlier check found in the code
+ * are missing, "revise" needs edits, and edits must pass the edit contract
  * (agents/common/src/skill-check/edits.ts) against the cited upstream
  * lines. The model can never put text of its own into a skill: an edit
  * only swaps code names or numbers a cited line supports, and the
@@ -71,7 +71,7 @@ export interface CheckReport {
 }
 
 export interface CheckRunOpts {
-  /** Baseline names now absent. */
+  /** Names an earlier check found in the code that are absent now: the baseline's, and those lost before. */
   readonly lost: readonly string[];
   /** Whether "obsolete" is a verdict here; it is not for a reviewer's repo skill file. */
   readonly allowObsolete: boolean;
@@ -96,7 +96,7 @@ export class CheckRun {
   async problems(verdict: Verdict, edits: readonly SuppressEdit[]): Promise<{ problems: string[]; skillMd: string | null }> {
     const problems: string[] = [];
     if (verdict === 'accurate' && this.opts.lost.length > 0) {
-      problems.push(`accurate is refused while names of the last check are missing at the tip: ${this.opts.lost.map((n) => `\`${n}\``).join(', ')}`);
+      problems.push(`accurate is refused while names an earlier check found in the code are missing at the tip: ${this.opts.lost.map((n) => `\`${n}\``).join(', ')}`);
     }
     if (verdict === 'obsolete' && !this.opts.allowObsolete) problems.push('obsolete is not a verdict for this file; report revise or unsure');
     if (verdict === 'revise' && edits.length === 0) problems.push('revise needs at least one edit');
@@ -126,7 +126,7 @@ export function buildReportSkillCheckTool(run: CheckRun) {
 `End the audit with your verdict on the skill. Call it once; the run ends when a report is accepted.
 
 - \`verdict\`:
-  - "accurate": every flagged name is fine as written (a placeholder, prose in backticks, a name the skill says is gone). Refused while a name of the last check is missing.
+  - "accurate": every flagged name is fine as written (a placeholder, prose in backticks, a name the skill says is gone). Refused while a lost name is missing.
   - "revise": some names or numbers changed upstream; give \`edits\`.
   - "obsolete": the code the skill is about is gone from the default branch.
   - "unsure": you could not tell.
@@ -214,6 +214,7 @@ export interface CheckMessageInput {
   /** How edits name the release: the tag, or "<branch>@<sha12>". */
   readonly releaseLabel: string;
   readonly skillMd: string;
+  /** The check's result, with the names earlier checks lost and still absent in `lost`. */
   readonly result: CheckResult;
   /** Random per run, so data inside a block cannot close it. */
   readonly marker: string;
@@ -223,7 +224,7 @@ export interface CheckMessageInput {
 function flaggedLines(result: CheckResult): string[] {
   const count = (name: string) => result.counts.get(name) ?? 0;
   const lines: string[] = [];
-  for (const name of result.lost) lines.push(`- \`${name}\`: lost. Present at the last check, absent at the tip.`);
+  for (const name of result.lost) lines.push(`- \`${name}\`: lost. In the code at an earlier check, absent at the tip.`);
   for (const name of result.newAbsent) lines.push(`- \`${name}\`: new_absent. Cited by the skill and not found at the tip.`);
   for (const name of result.touched) {
     lines.push(`- \`${name}\`: touched. ${count(name)} occurrence(s) at the tip; the diff since the last check changes lines that mention it.`);
@@ -258,7 +259,7 @@ export function renderCheckMessage(m: CheckMessageInput): string {
     ...flaggedLines(r),
     ...(r.incomplete.length > 0 ? ['', 'The diff was not examined in full:', ...r.incomplete.map((s) => `- ${s}`)] : []),
     '',
-    `Names of the last check now missing: ${r.lost.length}. Cited names present at the tip: ${r.present.length}.`,
+    `Lost names, found at an earlier check and missing now: ${r.lost.length}. Cited names present at the tip: ${r.present.length}.`,
     '',
     '## The skill',
     '',

@@ -77,6 +77,15 @@ import type { SkillPublisher } from './tools/submit-skill.js';
  * this run read the registry record as DRAFT, PENDING_APPROVAL or
  * APPROVED.
  *
+ * Lost names. A name of the baseline (audit_names) that a check finds
+ * absent is lost. It leaves audit_names, so its loss costs standing
+ * once, and goes into lost_names, where it stays while the skill cites
+ * it and the code lacks it: each later check reports it to the audit as
+ * lost again, so an "accurate" verdict is refused while it is missing,
+ * and it never goes into ignored_names. A check that finds it present
+ * again, or a skill that no longer cites it (an applied revision
+ * suppresses the piece that did), drops it.
+ *
  * Report mode. A dry_run message, or a switch that is off
  * (CHECK_APPLY_EDITS, RETIRE_SKILLS, CHECK_OPEN_PULL_REQUESTS), never
  * writes the registry or opens a pull request. Every run logs one
@@ -599,8 +608,19 @@ interface Checked {
   readonly dir: string;
   readonly co: UpstreamCheckout;
   readonly upstream: string;
+  /** The library's result, against the baseline: its lost names are this check's new losses. */
   readonly result: CheckResult;
+  /**
+   * The result as the audit and the record see it: `lost` also holds the
+   * names of lost_names still cited and absent (`carried`), and
+   * `newAbsent` no longer does.
+   */
+  readonly view: CheckResult;
   readonly baseline: readonly string[];
+  /** Names lost at an earlier check that are still cited and absent. */
+  readonly carried: readonly string[];
+  /** ignored_names as the check used them: never a lost name. */
+  readonly ignored: readonly string[];
   readonly ref: string;
   readonly label: string;
   readonly skillMd: string;
@@ -727,6 +747,11 @@ function storedAudit(list: Iterable<string>): string[] {
   return [...new Set(list)].filter((n) => n.length <= 120).slice(0, AUDIT_NAMES_MAX);
 }
 
+/** lost_names: the lost names a check found that the skill still cites (see the module comment). */
+function lostNames(w: Write, list: Iterable<string>): void {
+  w.setNames('lost_names', storedAudit(list));
+}
+
 /** stale_names and stale_since: since stays at the first check that found them. */
 function stale(w: Write, item: Item, list: readonly string[], nowIso: string): void {
   const kept = storedNames(list, STALE_NAMES_MAX);
@@ -809,15 +834,24 @@ async function* withCheckout<T>(
       const cited = extractNames(skillMd);
       const citedSet = new Set(cited.map((n) => n.token));
       const baseline = names(baselineFrom.audit_names).filter((n) => citedSet.has(n));
+      const lostBefore = new Set(names(baselineFrom.lost_names));
+      const ignored = names(baselineFrom.ignored_names).filter((n) => !lostBefore.has(n));
       const result = await checkSkill(co.git, {
         names: cited,
         baseline,
-        ignored: names(baselineFrom.ignored_names),
+        ignored,
         ...(co.baseAvailable ? { baseSha: str(baselineFrom.verified_sha) } : {}),
       });
+      // A name lost before is outside the baseline, so the library calls it new and absent.
+      const carried = result.newAbsent.filter((n) => lostBefore.has(n));
+      const view: CheckResult = {
+        ...result,
+        lost: [...result.lost, ...carried],
+        newAbsent: result.newAbsent.filter((n) => !lostBefore.has(n)),
+      };
       const tag = run.req.reason === 'retire' ? '' : run.req.release_tag;
       checked = {
-        dir, co, upstream, result, baseline, skillMd,
+        dir, co, upstream, result, view, baseline, carried, ignored, skillMd,
         ref: `${co.defaultBranch}@${co.tipSha.slice(0, 12)}`,
         label: releaseLabel(tag, co.defaultBranch, co.tipSha),
       };
@@ -843,7 +877,7 @@ async function* audit(
   startMs: number,
 ): AsyncGenerator<StreamFrame, { report: CheckReport | null; why: string }> {
   const { deps } = run;
-  const r = c.result;
+  const r = c.view;
   const ctx: EditContext = {
     flagged: flaggedNames(r),
     release: c.label,
@@ -896,9 +930,15 @@ async function* audit(
   }
 }
 
-/** Whether the skill's subject is gone on deterministic evidence: most of the baseline lost, or no file left in its area. */
+/**
+ * Whether the skill's subject is gone on deterministic evidence: most of
+ * the baseline lost, counting the names earlier checks lost, or no file
+ * left in its area.
+ */
 async function obsoleteCorroborated(c: Checked, area: readonly string[]): Promise<boolean> {
-  if (c.baseline.length >= 3 && c.result.keptFraction < 0.5) return true;
+  const baseline = c.baseline.length + c.carried.length;
+  const kept = c.baseline.length - c.result.lost.length;
+  if (baseline >= 3 && kept / baseline < 0.5) return true;
   if (area.length === 0) return false;
   const counts = await areaFileCounts(c.co.git, area);
   return counts.every((n) => n === 0);
@@ -940,7 +980,8 @@ async function* check(run: Run, req: CheckRequest): AsyncGenerator<StreamFrame, 
 }
 
 async function* checkBody(run: Run, req: CheckRequest, c: Checked, skill: SkillRecord, startMs: number): AsyncGenerator<StreamFrame, MaintenanceResult> {
-  const r = c.result;
+  // Lost names include those of earlier checks; the penalty counts this check's new losses only (c.result).
+  const r = c.view;
   const item = run.item!;
   const counts = `${r.lost.length} lost, ${r.newAbsent.length} new and absent, ${r.touched.length} touched`;
   const fields = { release: c.label, ref: c.ref, lost: r.lost.length, new_absent: r.newAbsent.length, touched: r.touched.length };
@@ -953,6 +994,7 @@ async function* checkBody(run: Run, req: CheckRequest, c: Checked, skill: SkillR
         const w = outcomeWrite(run, v).remove('pending_revision');
         confirm(w, c, r.present, item, []);
         stale(w, item, [], run.nowIso);
+        lostNames(w, []);
         return w;
       });
     }
@@ -969,6 +1011,7 @@ async function* checkBody(run: Run, req: CheckRequest, c: Checked, skill: SkillR
       await finishCheck(run, () => {
         const w = outcomeWrite(run, v);
         confirm(w, c, r.present, item, []);
+        lostNames(w, []);
         return w;
       });
     }
@@ -999,7 +1042,10 @@ async function* checkBody(run: Run, req: CheckRequest, c: Checked, skill: SkillR
       const w = outcomeWrite(run, v).remove('pending_revision');
       confirm(w, c, r.present, item, []);
       stale(w, item, [], run.nowIso);
-      const ignored = new Set([...names(item.ignored_names), ...r.newAbsent]);
+      lostNames(w, []);
+      // Never a name that was in the baseline: those are lost, not accurate.
+      const audited = new Set([...names(item.audit_names), ...names(item.lost_names)]);
+      const ignored = new Set([...names(item.ignored_names), ...r.newAbsent.filter((n) => !audited.has(n))]);
       w.setNames('ignored_names', storedNames(ignored, IGNORED_NAMES_MAX));
       return w;
     });
@@ -1008,11 +1054,12 @@ async function* checkBody(run: Run, req: CheckRequest, c: Checked, skill: SkillR
   }
 
   if (report.verdict === 'obsolete' && valid && await obsoleteCorroborated(c, areaGlobs(item))) {
-    const v: Outcome = { outcome: 'obsolete', note: flaggedNote(`the skill's subject is gone (${r.lost.length} of ${c.baseline.length} names lost)`) };
+    const v: Outcome = { outcome: 'obsolete', note: flaggedNote(`the skill's subject is gone (${r.lost.length} of ${c.baseline.length + c.carried.length} names lost)`) };
     await finishCheck(run, (it, reinforcedNot) => {
       const w = outcomeWrite(run, reinforcedNot ? v : { outcome: 'suspect', note: v.note }).remove('pending_revision');
-      confirm(w, c, r.present, it, r.lost);
+      confirm(w, c, r.present, it, c.result.lost);
       stale(w, it, unresolved, run.nowIso);
+      lostNames(w, r.lost);
       // A reinforcement since the read wins: the record stays live and only the finding is kept.
       if (reinforcedNot) w.set('obsolete_release', c.label).set('decay_score', 0).is('updated_at', it.updated_at);
       return w;
@@ -1035,9 +1082,10 @@ async function* checkBody(run: Run, req: CheckRequest, c: Checked, skill: SkillR
   await finishCheck(run, (it, penalty) => {
     const w = outcomeWrite(run, v).set('pending_revision', pendingRevision(run.nowIso, c, report, reason));
     // The verification does not move.
-    keepBaseline(w, it, r.lost);
+    keepBaseline(w, it, c.result.lost);
     stale(w, it, unresolved, run.nowIso);
-    if (penalty) penalize(w, it, r.keptFraction, r.lost.length);
+    lostNames(w, r.lost);
+    if (penalty) penalize(w, it, c.result.keptFraction, c.result.lost.length);
     return w;
   });
   logEdits(run, c, report, false);
@@ -1086,12 +1134,14 @@ async function* applyRevision(
   const baseline = c.baseline.filter((n) => citedSet.has(n));
   let after: CheckResult;
   try {
-    after = await checkSkill(c.co.git, { names: cited, baseline, ignored: names(item.ignored_names) });
+    after = await checkSkill(c.co.git, { names: cited, baseline, ignored: c.ignored });
   } catch (err) {
     console.warn(`[maintenance] re-check of ${quoted(run.name)} failed: ${errorText(err)}`);
     after = { ...c.result, lost: [], newAbsent: [], keptFraction: 1 };
   }
   const remaining = [...after.lost, ...after.newAbsent];
+  // A lost name the edits suppressed is no longer cited, and stops being lost.
+  const stillLost = c.view.lost.filter((n) => citedSet.has(n));
   const v: Outcome = {
     outcome: 'revised',
     note: remaining.length
@@ -1102,6 +1152,7 @@ async function* applyRevision(
     const w = outcomeWrite(run, v).remove('pending_revision');
     confirm(w, c, after.present, it, after.lost);
     stale(w, it, remaining, run.nowIso);
+    lostNames(w, stillLost);
     if (run.liveRead) w.remove(MARKER);
     if (penalty) penalize(w, it, after.keptFraction, after.lost.length);
     return w;
@@ -1193,7 +1244,7 @@ async function* repoCheck(run: Run, req: RepoCheckRequest): AsyncGenerator<Strea
   const fetched = file;
 
   return yield* withCheckout(run, upstream, fetched.content, item!, keep, async function* (c) {
-    const r = c.result;
+    const r = c.view;
     const fields = { release: c.label, ref: c.ref, lost: r.lost.length, new_absent: r.newAbsent.length, touched: r.touched.length, file_sha: fetched.sha.slice(0, 12) };
     const unresolved = [...r.lost, ...r.newAbsent];
     const flagged = flaggedNames(r);
@@ -1201,11 +1252,13 @@ async function* repoCheck(run: Run, req: RepoCheckRequest): AsyncGenerator<Strea
     const confirmed = (w: Write) => {
       confirm(w, c, r.present, item!, []);
       stale(w, item!, [], run.nowIso);
+      lostNames(w, []);
       w.set('skills_repo_sha', fetched.sha).remove('pending_revision');
     };
     const notConfirmed = (w: Write, report: CheckReport | null, reason: string) => {
-      keepBaseline(w, item!, r.lost);
+      keepBaseline(w, item!, c.result.lost);
       stale(w, item!, unresolved, run.nowIso);
+      lostNames(w, r.lost);
       w.set('skills_repo_sha', fetched.sha);
       if (report) w.set('pending_revision', pendingRevision(run.nowIso, c, report, reason));
     };
@@ -1215,7 +1268,10 @@ async function* repoCheck(run: Run, req: RepoCheckRequest): AsyncGenerator<Strea
     }
     if (flagged.length === 0) {
       return finish({ outcome: 'suspect', note: note(`the diff since the last check was not examined in full at ${c.ref}`) },
-        req.dry_run ? undefined : (w) => confirm(w, c, r.present, item!, []), fields);
+        req.dry_run ? undefined : (w) => {
+          confirm(w, c, r.present, item!, []);
+          lostNames(w, []);
+        }, fields);
     }
     if (!run.deps.audit.systemPrompt) return keep(`${counts} at ${c.ref}; no audit prompt is configured`);
 
@@ -1232,7 +1288,8 @@ async function* repoCheck(run: Run, req: RepoCheckRequest): AsyncGenerator<Strea
     if (report.verdict === 'accurate' && valid) {
       return finish({ outcome: 'accurate', note: note(`${flagged.length} flagged name(s) judged accurate at ${c.ref}`, flagged) }, (w) => {
         confirmed(w);
-        w.setNames('ignored_names', storedNames(new Set([...names(item!.ignored_names), ...r.newAbsent]), IGNORED_NAMES_MAX));
+        const audited = new Set([...names(item!.audit_names), ...names(item!.lost_names)]);
+        w.setNames('ignored_names', storedNames(new Set([...names(item!.ignored_names), ...r.newAbsent.filter((n) => !audited.has(n))]), IGNORED_NAMES_MAX));
       }, fieldsWith);
     }
 

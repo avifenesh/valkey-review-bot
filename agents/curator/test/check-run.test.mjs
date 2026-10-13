@@ -60,7 +60,7 @@ test('accurate is refused while names are lost, and the third report is accepted
   for (let i = 1; i <= MAX_REFUSALS; i++) {
     const out = await call(tool, { verdict: 'accurate', summary: 'fine' });
     assert.equal(out.ok, false);
-    assert.match(out.problems[0], /accurate is refused while names of the last check are missing at the tip: `emptyDB`/);
+    assert.match(out.problems[0], /accurate is refused while names an earlier check found in the code are missing at the tip: `emptyDB`/);
     assert.equal(out.refusals_left, MAX_REFUSALS - i);
     assert.equal(run.done, null);
   }

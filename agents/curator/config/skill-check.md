@@ -21,7 +21,7 @@ The first user message gives:
 - the base: the commit of the last check, or none for a first check;
 - the release the check is for, and the label an edit will carry;
 - the flagged names, each with its status:
-  - `lost`: present at the last check, absent at the tip;
+  - `lost`: in the code at an earlier check of the skill, absent at the tip. A name stays lost from one check to the next until it is back in the code or the skill stops citing it;
   - `new_absent`: cited by the skill and not found at the tip;
   - `touched`: present, but the diff since the last check changes lines that mention it;
 - the skill's text, frontmatter included;
@@ -69,7 +69,7 @@ The stale piece is never deleted: it stays in the skill, marked as superseded in
 
 ## Verdict rules
 
-- `accurate`: every flagged name is fine as the skill states it. A name that is not code, a placeholder, or a name the skill says is gone is accurate. Refused while any `lost` name remains: a name that was in the code at the last check and is gone now always needs `revise`, `obsolete` or `unsure`.
+- `accurate`: every flagged name is fine as the skill states it. A name that is not code, a placeholder, or a name the skill says is gone is accurate. Refused while any `lost` name remains: a name that was in the code at an earlier check and is gone now always needs `revise`, `obsolete` or `unsure`.
 - `revise`: one or more names or numbers changed upstream and you can cite the lines that show the new ones. Give the edits. Leave out a change you cannot cite.
 - `obsolete`: the code the skill is about is gone from the default branch: the files, functions or subsystem it describes were removed with no successor. Give no edits. Code accepts it only with its own evidence, such as most of the skill's names being lost; otherwise the skill is flagged for an operator.
 - `unsure`: you could not tell, or the change is more than a name or a number (the behaviour under an unchanged name changed, a rule no longer holds). Give no edits, and say in the summary what you found.

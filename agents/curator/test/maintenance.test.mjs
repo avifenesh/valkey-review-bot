@@ -573,6 +573,84 @@ test('accurate on new names records them as ignored and confirms the skill', asy
   assert.equal(item.pending_revision, undefined);
 });
 
+/** Put a new message's claim on the record, as the decay job does for the next check. */
+function reclaim(table, key, id, reason = 'check') {
+  table.put({ ...table.item(key), maintenance_id: id, maintenance_requested_at: '2026-10-20T00:00:00.000Z', maintenance_reason: reason });
+}
+const MID2 = 'check#valkey-review#rec-1#2026-10-20T00:00:00.000Z';
+
+/** A model that records the first user message of each audit. */
+function watchedModel(turns) {
+  const model = new ScriptedModel(turns);
+  model.firstMessages = [];
+  const stream = model.stream.bind(model);
+  model.stream = (messages, options) => {
+    if (messages.length === 1) model.firstMessages.push(JSON.stringify(messages));
+    return stream(messages, options);
+  };
+  return model;
+}
+
+test('a lost name stays lost at the next check, so accurate is refused while it is missing', async () => {
+  const s = setup({ turns: [report('unsure')] });
+  assert.equal((await run(checkMessage(), s.deps)).result.decision, 'suspect');
+  let item = s.table.item(KEY);
+  assert.deepEqual(set(item.lost_names), ['emptyDB']);
+  assert.equal(item.audit_names.has('emptyDB'), false);
+  assert.equal(item.decay_score, 0.8 * 0.75);
+
+  // The next release's check: the audit insists the skill is accurate.
+  reclaim(s.table, KEY, MID2);
+  const model = watchedModel([report('accurate'), report('accurate'), report('accurate')]);
+  s.deps.audit = { model: () => model, systemPrompt: 'audit' };
+  const { result } = await run(checkMessage({ maintenance_id: MID2, release_tag: '9.1.3' }), s.deps);
+  assert.equal(result.decision, 'suspect');
+  assert.equal(model.calls, 3);
+  assert.match(model.firstMessages[0], /`emptyDB`: lost\./);
+  item = s.table.item(KEY);
+  assert.match(item.pending_revision.problems[0], /accurate is refused .*`emptyDB`/);
+  assert.equal(item.ignored_names, undefined);
+  assert.deepEqual(set(item.lost_names), ['emptyDB']);
+  assert.deepEqual(set(item.stale_names), ['emptyDB']);
+  assert.equal(item.verified_sha, BASE_SHA);
+  // Lost once, penalised once.
+  assert.equal(item.decay_score, 0.8 * 0.75);
+});
+
+test('a lost name back in the code stops being lost', async () => {
+  const s = setup({
+    item: record({ audit_names: new Set(['src/server.c']), lost_names: new Set(['serverCron']) }),
+    skill: { name: NAME, skillMd: CLEAN_MD },
+  });
+  assert.equal((await run(checkMessage(), s.deps)).result.decision, 'clean');
+  const item = s.table.item(KEY);
+  assert.equal(item.lost_names, undefined);
+  assert.deepEqual(set(item.audit_names), ['serverCron', 'src/server.c']);
+});
+
+test('an applied revision that suppresses the piece citing a lost name stops it being lost', async () => {
+  const s = setup({
+    item: record({ audit_names: new Set(['src/db.c', 'signalFlushedDb', 'serverCron']), lost_names: new Set(['emptyDB']), stale_names: new Set(['emptyDB']) }),
+    turns: [report('revise', [EDIT])],
+    settings: { checkApplyEdits: true },
+  });
+  assert.equal((await run(checkMessage(), s.deps)).result.decision, 'revised');
+  const item = s.table.item(KEY);
+  assert.equal(item.lost_names, undefined);
+  assert.equal(item.stale_names, undefined);
+});
+
+test('names lost at earlier checks count toward an obsolete verdict\'s evidence', async () => {
+  const md = '---\nname: db-flush\ndescription: Use when.\n---\n\n- `serverCron` runs before `emptyDB` and `flushAllGone`.\n';
+  const s = setup({
+    item: record({ audit_names: new Set(['serverCron']), lost_names: new Set(['emptyDB', 'flushAllGone']) }),
+    skill: { name: NAME, skillMd: md },
+    turns: [report('obsolete')],
+  });
+  assert.equal((await run(checkMessage(), s.deps)).result.decision, 'obsolete');
+  assert.equal(s.table.item(KEY).decay_score, 0);
+});
+
 test('obsolete without deterministic evidence is handled as suspect', async () => {
   const s = setup({ turns: [report('obsolete')] });
   const { result } = await run(checkMessage(), s.deps);
@@ -738,6 +816,26 @@ test('a repo check in report mode records the edits and opens no pull request', 
   assert.match(item.pending_revision.reason, /pull requests are off/);
   assert.equal(item.verified_release, '9.1.2');
   assert.ok(claimGone(item));
+});
+
+test('a name a repo check lost stays lost at the next one, so accurate is refused while it is missing', async () => {
+  const r = repoApi();
+  const s = setup({ item: repoItem(), turns: [report('revise', [EDIT])], settings: { skillsRepo: SKILLS_REPO }, repoSkills: async () => r.api });
+  await run(repoMessage(), s.deps);
+  assert.deepEqual(set(s.table.item(REPO_SKILL_KEY).lost_names), ['emptyDB']);
+
+  const next = 'repo_check#valkey-review#repo-skill#2026-10-20T00:00:00.000Z';
+  reclaim(s.table, REPO_SKILL_KEY, next, 'repo_check');
+  const model = watchedModel([report('accurate'), report('accurate'), report('accurate')]);
+  s.deps.audit = { model: () => model, systemPrompt: 'audit' };
+  const { result } = await run(repoMessage({ maintenance_id: next, release_tag: '9.1.3' }), s.deps);
+  assert.equal(result.decision, 'suspect');
+  assert.equal(model.calls, 3);
+  assert.match(model.firstMessages[0], /`emptyDB`: lost\./);
+  const item = s.table.item(REPO_SKILL_KEY);
+  assert.equal(item.ignored_names, undefined);
+  assert.deepEqual(set(item.lost_names), ['emptyDB']);
+  assert.equal(item.verified_sha, BASE_SHA);
 });
 
 test('a repo check with pull requests on proposes code-generated text only', async () => {
