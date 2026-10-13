@@ -85,6 +85,10 @@ Prompt and skill changes (`agents/*/config/*.md`) change what the reviewer says 
 real pull requests. Describe the behavior you expect to change, and, if you can,
 link a review that shows the problem.
 
+To add a reviewer for another project, follow
+[docs/landing-a-new-project.md](docs/landing-a-new-project.md). It lists every file and
+setting a new reviewer touches, and starts with the issue step 1 asks for.
+
 ## Building and testing
 
 The repository has one npm package per component. Node.js 24 or later is required.

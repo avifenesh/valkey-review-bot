@@ -140,6 +140,17 @@ Skill checks start in report mode. [infra/README.md](infra/README.md#skill-lifec
 describes how to review their reports, how to turn on edits, retirements and pull
 requests, and the optional second GitHub App those pull requests need.
 
+## Landing a new project
+
+The reviewer can serve another project, for example valkey-search. A fork or mirror of
+a project it already reviews needs only a route in the deployment configuration and the
+GitHub App installed on it. A new project needs a reviewer of its own: an agent package
+with its container image, prompt and skill file, its reviewer id added in five places in
+`infra/lib`, a skills registry, and the GitHub App installed on the repository. Its
+concerns table, token broker, decay, release checks and retirement then follow from the
+id with no more code. [docs/landing-a-new-project.md](docs/landing-a-new-project.md)
+walks through every step, with valkey-search as the worked example.
+
 ## Contributing
 
 See [CONTRIBUTING.md](CONTRIBUTING.md). Every commit needs a DCO sign-off
