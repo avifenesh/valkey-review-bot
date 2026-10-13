@@ -6,7 +6,7 @@ The Lambda functions between GitHub and the AgentCore runtimes.
 | --- | --- |
 | `src/receiver.ts` | Behind the HTTP API. Verifies each GitHub App delivery and turns it into a queue message: a review on the route's queue, or maintainer feedback on the curator queue. |
 | `src/invoker.ts` | One worker per queue. Forwards each message to its AgentCore runtime and, for reviews, uses SQS redelivery to watch over long runs. |
-| `src/token-broker.ts` | Gives a reviewer runtime a short-lived installation token for the one repository it reviews. |
+| `src/token-broker.ts` | Gives a reviewer runtime a short-lived installation token for the one repository it reviews. The checks are in `src/broker.ts`. |
 
 `infra/lib/webhook-stack.ts` and `infra/lib/substrate-stack.ts` deploy them
 and set the environment below.
@@ -72,6 +72,14 @@ on every receive and are deleted without running after more than three.
 | `HEARTBEAT_STALE_MINUTES` | `12` | A running review whose last heartbeat is older than this is treated as dead. It must exceed the longest quiet stretch of a live run, such as a long build. |
 
 ## Token broker
+
+A request is `{ installation_id, repo }`. The broker refuses it unless
+`repo` is in `ALLOWED_REPOS_JSON` and GitHub, asked as the App
+(`GET /repos/{owner}/{name}/installation`), reports `installation_id` as
+the App's installation on that repository, owned by `owner`. It then
+returns a token for that one repository with `pull_requests: write` and
+`metadata: read`. The checks are in `src/broker.ts`; `src/token-broker.ts`
+wires them to the App key.
 
 | Variable | Meaning |
 | --- | --- |

@@ -9,7 +9,7 @@ secret names.
 
 | Stack | Contents |
 | --- | --- |
-| `ValkeyReviewerSubstrate` | KMS key, prompt and skill bucket, reference to the GitHub App secret, token broker Lambda, run heartbeat table |
+| `ValkeyReviewerSubstrate` | KMS key, prompt and skill bucket, reference to the GitHub App secret, one token broker Lambda per reviewer, run heartbeat table |
 | `ValkeyReviewAgent`, `ValkeyGlideReviewAgent` | One reviewer each: AgentCore runtime, its execution role, its concerns table, prompt and skill upload |
 | `ValkeyReviewerCurator` | Curator runtime and its execution role |
 | `ValkeyReviewWebhook` | HTTP API, receiver Lambda, idempotency table, one queue and worker per route, the curator queue and worker, dead-letter queues |
@@ -17,15 +17,37 @@ secret names.
 
 Each runtime has its own role:
 
-- A reviewer runs code from the pull request it reviews. Its role can call
-  its models, read its own prefix in the assets bucket, update the heartbeat
-  table, read its own skills registry and invoke the token broker. It has
-  no Secrets Manager access, no concerns table access and no registry
-  writes. GitHub tokens come from the token broker, which issues a
-  short-lived token for one routed repository.
-- The curator role can call its models, read its assets, read and write the
-  concerns tables, write records in the reviewer registries and read its
-  own registry.
+- A reviewer runs code from the pull request it reviews, and that code can
+  use the reviewer's role. The role can:
+  - call its models;
+  - get objects under its own prefix in the assets bucket (no listing),
+    with `kms:Decrypt` on the substrate key. The key also encrypts the
+    concerns tables, but the role has no DynamoDB access to them;
+  - read its own skills registry;
+  - get, put and update any item in the shared heartbeat table;
+  - invoke its own token broker;
+  - write its own runtime log groups
+    (`/aws/bedrock-agentcore/runtimes/<runtime name>-*`, for example
+    `valkey_review_runtime-*`);
+  - pull from the CDK bootstrap container-assets repository
+    (`ecr:BatchGetImage`, `ecr:GetDownloadUrlForLayer` and
+    `ecr:BatchCheckLayerAvailability`, plus `ecr:GetAuthorizationToken`
+    on `*`). ECR cannot grant less than a whole repository, and that
+    repository holds the images of every CDK app in the account and
+    region that uses the same bootstrap qualifier.
+
+  It has no Secrets Manager access, no concerns table access and no
+  registry writes. GitHub tokens come from its token broker, which
+  issues a short-lived token for one routed repository.
+- The curator role can call its models, read its own prefix in the
+  assets bucket (and list the bucket), read and write the concerns
+  tables, write records in the reviewer registries, read its own
+  registry, write its own runtime log groups and pull from the same
+  container-assets repository.
+
+Deploy into an AWS account used for nothing else, or at least give this
+app a bootstrap qualifier of its own (`aws.bootstrapQualifier`), so that
+the container-assets repository holds only this app's images.
 
 Model permissions are derived from the `models` settings. Mantle
 permissions are granted only when an `openai.*` model is configured.
@@ -37,7 +59,8 @@ permissions are granted only when an `openai.*` model is configured.
    Docker needs arm64 emulation (buildx with QEMU; Docker Desktop
    includes it), or deploy from an arm64 machine. The AWS CLI is used by
    the scripts' `--stack` option.
-2. Bootstrap CDK in the target account and region:
+2. Bootstrap CDK in the target account and region, preferably an account
+   used for nothing else (see [Stacks](#stacks)):
    `npx cdk bootstrap aws://ACCOUNT/REGION`. If you use a custom qualifier,
    pass `--qualifier` and set `aws.bootstrapQualifier` to the same value.
 3. Create a GitHub App. Give it at least Pull requests (read and write),

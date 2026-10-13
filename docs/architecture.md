@@ -12,7 +12,7 @@ security model in [SECURITY.md](../SECURITY.md).
 | --- | --- | --- |
 | Receiver | `webhook/src/receiver.ts`, logic in `webhook/src/delivery.ts` | Lambda behind an API Gateway HTTP API (`POST /webhook`) |
 | Invoker | `webhook/src/invoker.ts`, `webhook/src/watchdog.ts` | One Lambda per review route and one for the curator, each fed by its own SQS queue |
-| Token broker | `webhook/src/token-broker.ts` | Lambda that the reviewer runtimes invoke |
+| Token broker | `webhook/src/token-broker.ts`, checks in `webhook/src/broker.ts` | One Lambda per reviewer, invoked by that reviewer's runtime |
 | Reviewers | `agents/common`, plus `agents/valkey-review` or `agents/valkey-glide-review` | One Bedrock AgentCore runtime and container image per reviewer |
 | Curator | `agents/curator` | Its own AgentCore runtime |
 | Decay job | `ops/src/decay.ts` | Lambda on a daily EventBridge schedule |
@@ -493,12 +493,19 @@ never see the secret. Each reviewer has its own broker (one instance of
 `infra/lib/substrate-stack.ts`), and each runtime role may invoke only its
 own. The runtime calls it with `{ installation_id, repo }`.
 
-A broker refuses a malformed request and any repository that is not one of
-its reviewer's review routes (`ALLOWED_REPOS_JSON`, built by
-`tokenBrokerRepos(config, reviewerId)` in `infra/lib/deployment-config.ts`;
-curator-only repositories are excluded). It
-returns an installation token for that one repository with
-`pull_requests: write` and `metadata: read`, and its expiry.
+`createTokenBroker` in `webhook/src/broker.ts` refuses a malformed request
+and any repository that is not one of its reviewer's review routes
+(`ALLOWED_REPOS_JSON`, built by `tokenBrokerRepos(config, reviewerId)` in
+`infra/lib/deployment-config.ts`; curator-only repositories are excluded).
+It then asks GitHub, as the App, for the App's installation on the
+repository (`GET /repos/{owner}/{name}/installation`), and refuses the
+request when there is none, when it is not the caller's `installation_id`,
+or when its account is not the repository's owner. GitHub resolves repository names inside the
+installation a token is requested from, so without this check another
+installation of the App could give a token for a same-named repository of
+another owner. The broker then returns an installation token for that one
+repository with `pull_requests: write` and `metadata: read`, and its
+expiry. The installation check adds one GitHub call per token.
 
 ### Token scope and refresh
 
@@ -529,13 +536,20 @@ argument list, never through a shell.
 ### Runtime roles
 
 Each runtime has its own role (`infra/lib/valkey-review-agent-stack.ts`,
-`infra/lib/curator-agent-stack.ts`). A reviewer can call its models, read its
-own prefix in the assets bucket, update the heartbeat table, read its own
-skills registry and invoke its own token broker. It has no Secrets Manager access,
-no concerns table access and no registry writes. The curator can call its
-models, read its assets, read and write the concerns tables, write the
-reviewer registries and read its own registry. It holds no GitHub
-credentials and makes no GitHub calls.
+`infra/lib/curator-agent-stack.ts`, both built on `createRuntimeRole` in
+`infra/lib/grants.ts`). A reviewer can call its models, get objects under
+its own prefix in the assets bucket (no listing) and decrypt them with the
+substrate key, read its own skills registry, get, put and update any item
+in the shared heartbeat table, invoke its own token broker, write its own
+runtime log groups, and pull from the CDK bootstrap container-assets
+repository, which holds the images of every CDK app in the account and
+region that uses the same bootstrap qualifier. It has no Secrets Manager access, no concerns
+table access and no registry writes. The curator can call its models, read
+its own prefix in the assets bucket, read and write the concerns tables,
+write the reviewer registries, read its own registry, write its own runtime
+log groups and pull from the same repository. It holds no GitHub
+credentials and makes no GitHub calls. [infra/README.md](../infra/README.md#stacks)
+lists the actions.
 
 ## 6. The curator
 

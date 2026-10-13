@@ -82,7 +82,8 @@ Registry, Lambda, SQS and DynamoDB. [infra/README.md](infra/README.md) lists the
 prerequisites (Docker that can build linux/arm64 images, a GitHub App, a Secrets Manager
 secret, three registries, model access), every configuration key, and the deploy
 commands. All deployment-specific values live in `infra/deploy.config.json`, which is not
-committed.
+committed. Use an AWS account that runs nothing else: code from the pull requests under
+review can use the reviewer runtime's AWS role, as [SECURITY.md](SECURITY.md) describes.
 
 ## Contributing
 
