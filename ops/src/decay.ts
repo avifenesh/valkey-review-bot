@@ -32,9 +32,10 @@ import { isRepoName, latestReleaseTag, RELEASE_TAG_RE } from './releases.js';
  *   the last check is older than SKILL_RECHECK_SECONDS.
  * The request is claimed on the record (maintenance_*) in the same write
  * that stores the decayed score, then sent. A record with a request
- * younger than MAINTENANCE_RETRY_DAYS gets no new one, so a request the
- * curator never finished is retried after that window. Per-pass caps
- * bound what lands on the queue, which also carries maintainer feedback.
+ * younger than MAINTENANCE_RETRY_DAYS gets no new one. The curator
+ * removes the claim when it is done, so the next pass can act at once; a
+ * claim it leaves behind only expires by age. Per-pass caps bound what
+ * lands on the queue, which also carries maintainer feedback.
  *
  * Once per reviewer and GA release the pass also queues a "repo_check"
  * of the reviewer's skill.md in this repository. The item at
@@ -180,10 +181,26 @@ export function decayedScore(score: number, elapsedSeconds: number, halfLifeSeco
  * the curator queue. Only identifiers and a GA tag: no skill text, no
  * repository and no URL. The curator maps reviewer_id to its upstream.
  *
- * maintenance_id is also stored on the record (with
- * maintenance_requested_at and maintenance_reason) before the send. The
- * curator acts only while the record's maintenance_id equals the
- * message's, and removes the three attributes when it is done.
+ * The claim. Before the send, the pass SETs maintenance_id (unique per
+ * claim), maintenance_requested_at (the time of the pass) and
+ * maintenance_reason on the record. It never removes or changes any other
+ * maintenance_* attribute, so the curator can keep its own markers there
+ * across claims. While maintenance_requested_at is younger than
+ * MAINTENANCE_RETRY_DAYS the record gets no new request, whatever else is
+ * set or missing; once it is older, or absent, the pass may claim again.
+ *
+ * The curator acts only while the record's maintenance_id equals the
+ * message's, and conditions each of its writes on that. On every terminal
+ * outcome (checked, edited, obsolete, retired, dry run, refused, failed
+ * for good) it REMOVEs maintenance_id, maintenance_requested_at and every
+ * other maintenance_* attribute, so the next pass can act at once. An
+ * outcome it wants retried later keeps the claim, and the request is
+ * repeated once the claim has aged out.
+ *
+ * SQS can deliver a message more than once, and two copies can run at
+ * the same time. The curator's writes conditioned on maintenance_id make
+ * the later copy a no-op; it treats a deprecation that its own claim
+ * started as its own, and records only a retirement reason it caused.
  *
  * dry_run: report only. The curator runs the check and records and logs
  * the outcome, but makes no registry change and opens no pull request,
@@ -199,7 +216,11 @@ export interface CheckMessage {
   readonly record_id: string;
   /** graduated_record_name: the registry record to check. */
   readonly record_name: string;
-  /** Highest GA release of the upstream (RELEASE_TAG_RE), or '' when unknown. */
+  /**
+   * Highest GA release of the upstream (RELEASE_TAG_RE), or '' when
+   * unknown. With '' the curator labels its edits with the checked
+   * commit, "<branch>@<12-char sha>", in place of a release tag.
+   */
   readonly release_tag: string;
   /** updated_at as the pass read it. */
   readonly seen_updated_at: string;

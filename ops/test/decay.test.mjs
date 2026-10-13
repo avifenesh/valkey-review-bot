@@ -846,3 +846,43 @@ test('a failed repo skill send releases its claim', async (t) => {
   assert.equal(release.UpdateExpression, 'REMOVE #mid, #mra, #mr');
   assert.equal(release.ExpressionAttributeValues[':mid'], claim.ExpressionAttributeValues[':mid']);
 });
+
+test('a claim left on a record expires by age alone, and a new claim leaves the curator\'s own markers', async (t) => {
+  quietLogs(t);
+  const old = {
+    maintenance_id: `check#valkey-review#r#${daysAgo(8)}`,
+    maintenance_reason: 'check',
+    maintenance_requested_at: daysAgo(8),
+    maintenance_deprecating: 'skill-r',
+  };
+  const cases = [
+    ['every maintenance attribute left, 8 days old', old, true],
+    ['id and reason left, request time removed', { maintenance_id: old.maintenance_id, maintenance_reason: 'check' }, true],
+    ['request time left, id removed', { maintenance_requested_at: daysAgo(3) }, false],
+    ['every maintenance attribute left, 3 days old', { ...old, maintenance_requested_at: daysAgo(3) }, false],
+  ];
+  for (const [label, fields, due] of cases) {
+    for (const record of [live('r', { verified_at: undefined, ...fields }), faded('r', fields)]) {
+      const { ctx } = maintenance();
+      const ddb = table([record]);
+      await decayTable(ddb, 'concerns', FULL, NOW, ctx);
+      assert.equal(ctx.sqs.sent.length, due ? 1 : 0, label);
+      if (!due) continue;
+      const [claim] = claims(ddb).map((w) => w.input);
+      assert.ok(claim.ExpressionAttributeValues[':mid'].endsWith(`#r#${NOW_ISO}`), `${label}: a new id`);
+      // The claim only SETs; any other maintenance_* attribute stays for the curator.
+      assert.ok(!/\bREMOVE\b/.test(claim.UpdateExpression), label);
+      assert.deepEqual(
+        Object.values(claim.ExpressionAttributeNames).filter((n) => n.startsWith('maintenance_')).sort(),
+        ['maintenance_id', 'maintenance_reason', 'maintenance_requested_at'],
+        label,
+      );
+    }
+  }
+  // The same holds for the repo skill item.
+  for (const [fields, due] of [[{ maintenance_id: 'x', maintenance_reason: 'repo_check' }, true], [{ maintenance_requested_at: daysAgo(3) }, false]]) {
+    const { ctx } = maintenance();
+    await decayTable(fakeDdb([[repoItem({ verified_release: '9.1.1', ...fields })]]), 'concerns', FULL, NOW, ctx);
+    assert.equal(ctx.sqs.sent.length, due ? 1 : 0, JSON.stringify(fields));
+  }
+});
