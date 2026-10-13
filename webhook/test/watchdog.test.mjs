@@ -3,7 +3,7 @@ import * as fs from 'node:fs';
 import test from 'node:test';
 import './support/ts-resolve.mjs';
 
-const { heartbeatRunKey, pendingMarkerOf } = await import('../src/review-envelope.ts');
+const { heartbeatRunKey, isPushReview, pendingMarkerOf } = await import('../src/review-envelope.ts');
 const { CURATOR_MAX_RECEIVES, decide, isCuratorMessage, messageTag } = await import('../src/watchdog.ts');
 
 const MIN = 60_000;
@@ -165,6 +165,13 @@ test('a review of new commits names the pending marker the worker clears', () =>
   assert.equal(pendingMarkerOf({ ...review, pending_marker: 5 }), undefined);
   assert.equal(pendingMarkerOf({ ...review, pr_number: '7', pending_marker: 'm-1' }), undefined);
   assert.equal(pendingMarkerOf({ pr_number: 7, pending_marker: 'm-1' }), undefined);
+});
+
+test('only trigger "push" marks a review of new commits', () => {
+  assert.equal(isPushReview({ ...review, trigger: 'push', skip_drafts: false }), true);
+  assert.equal(isPushReview(review), false);
+  assert.equal(isPushReview({ ...review, pending_marker: 'm-1' }), false);
+  assert.equal(isPushReview({ ...review, trigger: 'opened' }), false);
 });
 
 test('heartbeatRunKey matches the runtime formula', () => {

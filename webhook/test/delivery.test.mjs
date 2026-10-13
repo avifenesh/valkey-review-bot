@@ -225,7 +225,9 @@ test('new commits start a delayed review that holds the pull request\'s pending 
   assert.equal(body(resp).enqueued, `${REPO}#7#bbb`);
   assert.deepEqual(sent[1], {
     queueUrl: 'q-valkey',
-    body: { repo: REPO, pr_number: 7, installation_id: 42, head_sha: 'bbb', pending_marker: 'pending-1' },
+    body: {
+      repo: REPO, pr_number: 7, installation_id: 42, head_sha: 'bbb', pending_marker: 'pending-1', trigger: 'push', skip_drafts: false,
+    },
     attributes: { repo: REPO, pr_number: 7, action: 'synchronize' },
     options: { delaySeconds: 300 },
   });
@@ -330,6 +332,8 @@ test('a push to a pull request that is not a draft reviews on a skipDrafts route
   assert.equal(sent.length, 1);
   assert.equal(sent[0].queueUrl, 'q-glide');
   assert.deepEqual(sent[0].options, { delaySeconds: 300 });
+  assert.equal(sent[0].body.trigger, 'push');
+  assert.equal(sent[0].body.skip_drafts, true, 'the runtime skips the run if the pull request is a draft by then');
 });
 
 test('over budget, a review of new commits gives back its marker, its round and its key', async () => {
@@ -417,6 +421,8 @@ test('reviews that are not from new commits are sent without a delay or a marker
   for (const i of [0, 2]) {
     assert.equal(sent[i].options, undefined);
     assert.equal(sent[i].body.pending_marker, undefined);
+    assert.equal(sent[i].body.trigger, undefined);
+    assert.equal(sent[i].body.skip_drafts, undefined);
   }
   assert.equal(store.pending.size, 0, 'a reopen takes no marker');
 });

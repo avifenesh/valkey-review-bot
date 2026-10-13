@@ -29,6 +29,20 @@ export interface ReviewEnvelope {
    * runtime ignores it.
    */
   readonly pending_marker?: string;
+  /**
+   * "push" on reviews of new commits, which wait in the queue. The pull
+   * request may have changed meanwhile, so the runtime skips such a run
+   * when the pull request is closed or merged, or is a draft and
+   * skip_drafts is true.
+   */
+  readonly trigger?: 'push';
+  /** Reviews of new commits: the route's skipDrafts setting. */
+  readonly skip_drafts?: boolean;
+}
+
+/** A review of new commits, which src/delivery.ts marks with trigger "push". */
+export function isPushReview(envelope: Readonly<Record<string, unknown>>): boolean {
+  return envelope.trigger === 'push';
 }
 
 export interface PendingMarker {

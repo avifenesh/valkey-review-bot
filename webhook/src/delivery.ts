@@ -248,6 +248,7 @@ export function createDeliveryHandler(
         head_sha: headSha,
         ...(ready ? { run_nonce: 'ready' } : {}),
         ...(pendingMarker ? { pending_marker: pendingMarker } : {}),
+        ...(pushed ? { trigger: 'push', skip_drafts: route.skipDrafts } : {}),
       };
       const delay = pushed ? { delaySeconds: config.pushReviewDelaySeconds } : undefined;
       await deps.sendMessage(route.queueUrl, envelope, { repo, pr_number: prNumber, action }, delay);
