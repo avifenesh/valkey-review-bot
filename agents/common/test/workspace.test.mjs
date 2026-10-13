@@ -1,8 +1,12 @@
 import assert from 'node:assert/strict';
+import { spawnSync } from 'node:child_process';
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import test from 'node:test';
 import './support/ts-resolve.mjs';
 
-const { findStateComment, maintainedReleaseLines, parseReleaseBranches, renderPrOverview, MAINTAINED_WINDOW_DAYS } = await import('../src/workspace.ts');
+const { findStateComment, gitProcessEnv, maintainedReleaseLines, parseReleaseBranches, renderPrOverview, MAINTAINED_WINDOW_DAYS } = await import('../src/workspace.ts');
 const { STATE_MARKER } = await import('../src/review-state.ts');
 
 test('release branches are picked out of ls-remote output', () => {
@@ -41,6 +45,30 @@ test('maintained lines are the current branches with a recent commit, highest ve
   ]);
   assert.deepEqual(maintainedReleaseLines(`release-2.1 ${t(1)}\nrelease-1.3 ${t(2)}`, ['release-1.3', 'release-2.1'], now)
     .map((l) => l.branch), ['release-2.1', 'release-1.3']);
+});
+
+test('workspace git ignores a config planted in the home directory', () => {
+  const home = mkdtempSync(join(tmpdir(), 'ws-home-'));
+  try {
+    writeFileSync(join(home, '.gitconfig'), '[alias]\n  planted = !echo home\n');
+    mkdirSync(join(home, '.config', 'git'), { recursive: true });
+    writeFileSync(join(home, '.config', 'git', 'config'), '[alias]\n  planted2 = !echo xdg\n');
+    const read = (env, key) => spawnSync('git', ['config', '--get', key], { cwd: home, env, encoding: 'utf8' }).stdout.trim();
+    const where = { HOME: home, XDG_CONFIG_HOME: join(home, '.config') };
+
+    // Without the override git reads both files, so the check below means something.
+    const plain = { ...process.env, ...where };
+    delete plain.GIT_CONFIG_GLOBAL;
+    assert.equal(read(plain, 'alias.planted'), '!echo home');
+    assert.equal(read(plain, 'alias.planted2'), '!echo xdg');
+
+    const env = gitProcessEnv(where);
+    assert.equal(env.GIT_CONFIG_GLOBAL, '/dev/null');
+    assert.equal(read(env, 'alias.planted'), '');
+    assert.equal(read(env, 'alias.planted2'), '');
+  } finally {
+    rmSync(home, { recursive: true, force: true });
+  }
 });
 
 test('the state comment is only taken from this app', () => {

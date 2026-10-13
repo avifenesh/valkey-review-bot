@@ -14,6 +14,11 @@ const GIT_TIMEOUT_MS = 10 * 60_000;
 
 const GIT_ENV: NodeJS.ProcessEnv = {
   GIT_TERMINAL_PROMPT: '0',
+  // Ignore ~/.gitconfig and ~/.config/git/config. An earlier run in a
+  // warm container (PR build code, or a write tool) can leave files in
+  // the agent's home, and a config planted there (core.fsmonitor, for
+  // example) would run commands in a process that holds the token.
+  GIT_CONFIG_GLOBAL: '/dev/null',
   // Abort a transfer that stays under 1 KB/s for 60 seconds.
   GIT_HTTP_LOW_SPEED_LIMIT: '1000',
   GIT_HTTP_LOW_SPEED_TIME: '60',
@@ -103,10 +108,15 @@ export interface PrContext {
   readonly diffRefSpec: string; // "<mergeBaseSha>..<headSha>"
 }
 
+/** Environment for one workspace git process: the runtime's own, then GIT_ENV, then `extra`. */
+export function gitProcessEnv(extra?: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
+  return { ...process.env, ...GIT_ENV, ...extra };
+}
+
 function run(cmd: string, args: readonly string[], opts: { cwd: string; env?: NodeJS.ProcessEnv; timeoutMs?: number }): Promise<string> {
   const timeoutMs = opts.timeoutMs ?? GIT_TIMEOUT_MS;
   return new Promise((resolve, reject) => {
-    const child = spawn(cmd, args as string[], { cwd: opts.cwd, env: { ...process.env, ...GIT_ENV, ...opts.env } });
+    const child = spawn(cmd, args as string[], { cwd: opts.cwd, env: gitProcessEnv(opts.env) });
     let stdout = '';
     let stderr = '';
     let timedOut = false;
