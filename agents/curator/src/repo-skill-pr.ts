@@ -411,10 +411,13 @@ function skillsRepo(api: Api, repo: string, baseBranch: string) {
       const author = typeof c.author?.name === 'string' && typeof c.author.email === 'string' ? `${c.author.name} <${c.author.email}>` : '';
       return { sha: field(c.sha, 'commit sha', isSha), author };
     },
-    async createBranch(branch: string, sha: string): Promise<void> {
+    /** Null once created; GitHub's 422 refusal when the branch exists, as when another attempt created it first. */
+    async createBranch(branch: string, sha: string): Promise<ApiResponse | null> {
       writable(branch);
       const r = await api('POST', `repos/${repo}/git/refs`, { ref: `refs/heads/${branch}`, sha });
+      if (r.status === 422) return r;
       if (r.status !== 201) throw apiError(`POST git/refs heads/${branch}`, r);
+      return null;
     },
     async moveBranch(branch: string, sha: string): Promise<void> {
       writable(branch);
@@ -504,6 +507,38 @@ async function foreignWork(gh: SkillsRepo, tip: string, head: string, branch: st
   return ours ? null : `branch ${branch} has commits the release check did not make; leaving it to the maintainers`;
 }
 
+/**
+ * Point the branch at one commit on the base tip holding newContent:
+ * whether it moved, or why it may not. A branch another attempt created
+ * between the read and the create is read again and handled the same
+ * way, so a duplicate delivery converges instead of failing.
+ */
+async function pointBranch(
+  gh: SkillsRepo,
+  tip: string,
+  p: RepoSkillProposal,
+  branch: string,
+  title: string,
+  signOff: string | undefined,
+): Promise<{ moved: boolean } | { refused: string }> {
+  const want = gitBlobSha(p.newContent);
+  let head = await gh.branchSha(branch);
+  let commit: string | null = null;
+  if (head === null) {
+    commit = await buildCommit(gh, tip, p, title, signOff);
+    const refusal = await gh.createBranch(branch, commit);
+    if (refusal === null) return { moved: true };
+    head = await gh.branchSha(branch);
+    if (head === null) throw apiError(`POST git/refs heads/${branch}`, refusal);
+  }
+  if (await gh.fileBlob(p.path, head) === want) return { moved: false };
+  const foreign = await foreignWork(gh, tip, head, branch, title, p.path);
+  if (foreign) return { refused: foreign };
+  commit ??= await buildCommit(gh, tip, p, title, signOff);
+  await gh.moveBranch(branch, commit);
+  return { moved: true };
+}
+
 async function buildCommit(gh: SkillsRepo, tip: string, p: RepoSkillProposal, title: string, signOff: string | undefined): Promise<string> {
   const tree = await gh.createTree(await gh.treeOf(tip), p.path, p.newContent);
   let line = signOff;
@@ -540,18 +575,9 @@ export async function proposeRepoSkillChange(p: RepoSkillProposal, deps: RepoSki
   }
 
   const title = titleFor(p);
-  const head = await gh.branchSha(branch);
-  let rebuilt = false;
-  if (head === null || await gh.fileBlob(p.path, head) !== gitBlobSha(p.newContent)) {
-    if (head !== null) {
-      const foreign = await foreignWork(gh, tip, head, branch, title, p.path);
-      if (foreign) return { action: 'refused', branch, reason: foreign };
-    }
-    const commit = await buildCommit(gh, tip, p, title, deps.signOff);
-    if (head === null) await gh.createBranch(branch, commit);
-    else await gh.moveBranch(branch, commit);
-    rebuilt = true;
-  }
+  const pointed = await pointBranch(gh, tip, p, branch, title, deps.signOff);
+  if ('refused' in pointed) return { action: 'refused', branch, reason: pointed.refused };
+  const rebuilt = pointed.moved;
 
   const body = prBody(p, checked.date);
   let open = await gh.openPull(branch);

@@ -98,6 +98,7 @@ function fakeGitHub(files = { [PATH]: BASE, 'README.md': '# bot\n' }) {
     pulls,
     filesAt,
     beforeCreatePull: null,
+    beforeCreateRef: null,
     tip: (branch = 'main') => refs.get(`heads/${branch}`),
     /** Commit `changes` on `branch` and move the branch. */
     commitOn(branch, changes, { message = 'Change something' } = {}) {
@@ -158,6 +159,7 @@ function fakeGitHub(files = { [PATH]: BASE, 'README.md': '# bot\n' }) {
         return json(201, { sha, message: body.message, author: { ...BOT, date: '2026-10-13T00:00:00Z' } });
       }
       if (method === 'POST' && rest === 'git/refs') {
+        gh.beforeCreateRef?.();
         const ref = body.ref.replace(/^refs\//, '');
         if (refs.has(ref)) return json(422, { message: 'Reference already exists' });
         refs.set(ref, body.sha);
@@ -324,6 +326,37 @@ test('a pull request another attempt opened meanwhile is reused', async () => {
   assert.deepEqual(result, { action: 'updated', branch: BRANCH, url: `https://github.com/${REPO}/pull/7` });
   assert.equal(gh.pulls.length, 1);
   assert.equal(gh.pulls[0].title, 'Supersede stale facts in the valkey-review skill for 9.1.2');
+});
+
+test('a duplicate attempt that created the branch first is joined, not failed', async () => {
+  const title = 'Supersede stale facts in the valkey-review skill for 9.1.2';
+  const older = edited(BASE, '`rdbLoad*` caller', '`rdbLoadAll*` caller', { ...CTX, flagged: ['rdbLoad*'] });
+  for (const [name, content] of [['the same content', NEW], ['an earlier proposal', older]]) {
+    const gh = fakeGitHub();
+    const tip = gh.tip();
+    let theirs;
+    // The other attempt read no branch either, and creates it just before this one does.
+    gh.beforeCreateRef = () => {
+      gh.beforeCreateRef = null;
+      gh.refs.set(`heads/${BRANCH}`, tip);
+      theirs = gh.commitOn(BRANCH, { [PATH]: content }, { message: title });
+    };
+    const result = await proposeRepoSkillChange(proposal({ baseSha: tip }), deps(gh));
+    assert.deepEqual(result, { action: 'opened', branch: BRANCH, url: `https://github.com/${REPO}/pull/1` }, name);
+    assert.equal(gh.filesAt(gh.tip(BRANCH))[PATH], NEW, name);
+    assert.equal(gh.tip(BRANCH) === theirs, content === NEW, name);
+    assert.deepEqual(gh.commits.get(gh.tip(BRANCH)).parents, [tip], name);
+    assert.equal(gh.pulls.length, 1, name);
+  }
+});
+
+test('two identical deliveries at once leave one branch and one pull request', async () => {
+  const gh = fakeGitHub();
+  const p = proposal({ baseSha: gh.tip() });
+  const results = await Promise.all([proposeRepoSkillChange(p, deps(gh)), proposeRepoSkillChange(p, deps(gh))]);
+  assert.deepEqual(results.map((r) => r.action).sort(), ['opened', 'unchanged']);
+  assert.equal(gh.filesAt(gh.tip(BRANCH))[PATH], NEW);
+  assert.equal(gh.pulls.length, 1);
 });
 
 test('new edits for the same release rebuild the branch and update the open pull request', async () => {
