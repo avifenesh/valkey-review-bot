@@ -169,7 +169,7 @@ test('at the cap an automatic review is skipped, logged, and gives back what it 
   assert.equal(body(resp).skipped, 'auto-review-cap');
   assert.equal(sent.length, 0);
   assert.equal(store.autoReviews.get(`${REPO}#7`), 2);
-  assert.deepEqual(store.released, [`${REPO}#7#abc123`]);
+  assert.deepEqual(store.released, [`${REPO}#7#abc123#reopened`]);
   assert.equal(store.slotsTaken, 0, 'a capped review uses no budget');
   assert.equal(store.pending.size, 0, 'it gives back the marker');
   assert.deepEqual(logs, [
@@ -219,6 +219,30 @@ test('ready_for_review gets its own key and heartbeat nonce', async () => {
   assert.ok(store.keys.has(`${GLIDE}#7#abc123#ready`));
 });
 
+test('a reopen has its own key and heartbeat nonce, so it reviews a head whose opened review was skipped', async () => {
+  // The opened review started once the pull request was closed, so the
+  // runtime skipped it and recorded its run completed; the pull request
+  // is then reopened at the same head. The receiver cannot tell that
+  // from a review that ran: a reopen at a head that was already reviewed
+  // is reviewed again too, and uses a round.
+  const { handler, sent, store } = setup();
+  await handler(delivery('pull_request', prEvent('opened')));
+  await store.clearReviewPending(REPO, 7, 'pending-1');
+  const resp = await handler(delivery('pull_request', prEvent('reopened')));
+  assert.equal(body(resp).enqueued, `${REPO}#7#abc123#reopened`, 'not a duplicate of the opened review');
+  assert.equal(sent.length, 2);
+  assert.equal(sent[0].body.run_nonce, undefined);
+  assert.equal(sent[1].body.run_nonce, 'reopened');
+  assert.equal(sent[1].body.trigger, 'reopened');
+  assert.notEqual(heartbeatRunKey(sent[1].body), heartbeatRunKey(sent[0].body), 'the worker reads its own heartbeat');
+  assert.equal(store.autoReviews.get(`${REPO}#7`), 2, 'it uses a round');
+
+  await store.clearReviewPending(REPO, 7, 'pending-2');
+  assert.equal(body(await handler(delivery('pull_request', prEvent('reopened')))).skipped, 'duplicate', 'a reopen is still reviewed once per head');
+  assert.equal(body(await handler(delivery('pull_request', prEvent('opened')))).skipped, 'duplicate');
+  assert.equal(sent.length, 2);
+});
+
 const push = (sha, pr = {}, repo = REPO) => prEvent('synchronize', { head: { sha }, ...pr }, repo);
 
 test('new commits start a delayed review that holds the pull request\'s pending marker', async () => {
@@ -249,10 +273,10 @@ test('a review of new commits has its own key and heartbeat nonce, so a reopen a
   await handler(delivery('pull_request', push('bbb')));
   await store.clearReviewPending(REPO, 7, 'pending-1');
   const resp = await handler(delivery('pull_request', prEvent('reopened', { head: { sha: 'bbb' } })));
-  assert.equal(body(resp).enqueued, `${REPO}#7#bbb`, 'not a duplicate of the review of new commits');
+  assert.equal(body(resp).enqueued, `${REPO}#7#bbb#reopened`, 'not a duplicate of the review of new commits');
   assert.equal(sent.length, 2);
   assert.equal(sent[0].body.run_nonce, 'push');
-  assert.equal(sent[1].body.run_nonce, undefined);
+  assert.equal(sent[1].body.run_nonce, 'reopened');
   assert.notEqual(heartbeatRunKey(sent[1].body), heartbeatRunKey(sent[0].body), 'the worker reads its own heartbeat');
   assert.equal(body(await handler(delivery('pull_request', prEvent('reopened', { head: { sha: 'bbb' } })))).skipped, 'duplicate');
 });
@@ -423,7 +447,7 @@ test('a reopen or a draft marked ready joins a waiting review of new commits', a
   assert.equal(store.autoReviews.get(`${REPO}#7`), 1, 'no round used');
   assert.equal(store.autoReviews.get(`${GLIDE}#7`), 1);
   assert.equal(store.slotsTaken, 2, 'no budget used');
-  assert.deepEqual(store.released, [`${REPO}#7#ccc`, `${GLIDE}#7#ccc#ready`]);
+  assert.deepEqual(store.released, [`${REPO}#7#ccc#reopened`, `${GLIDE}#7#ccc#ready`]);
   assert.equal(store.pending.get(`${REPO}#7`), 'pending-1', 'the marker stays with the waiting review');
 });
 
@@ -450,7 +474,7 @@ test('a push or a reopen while a reopened pull request\'s review waits joins it'
   assert.equal(sent.length, 1);
   assert.equal(store.autoReviews.get(`${REPO}#7`), 1, 'no round used');
   assert.equal(store.slotsTaken, 1, 'no budget used');
-  assert.deepEqual(store.released, [`${REPO}#7#bbb#push`, `${REPO}#7#ccc`]);
+  assert.deepEqual(store.released, [`${REPO}#7#bbb#push`, `${REPO}#7#ccc#reopened`]);
 
   await store.clearReviewPending(REPO, 7, 'pending-1');
   await handler(delivery('pull_request', push('bbb')));

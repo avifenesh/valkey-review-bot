@@ -17,9 +17,10 @@ export interface ReviewEnvelope {
   readonly status_comment_id?: number;
   /**
    * Separates this run's heartbeat from an earlier run on the same head
-   * SHA: "m<comment id>" for @mention runs, "ready" for the review that a
-   * draft PR gets when it is marked ready, "push" for reviews of new
-   * commits.
+   * SHA: "m<comment id>" for @mention runs, "reopened" for the review a
+   * reopened PR gets, "ready" for the review that a draft PR gets when it
+   * is marked ready, "push" for reviews of new commits. An opened PR's
+   * review has none.
    */
   readonly run_nonce?: string;
   readonly trigger_path?: string;

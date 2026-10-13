@@ -14,13 +14,13 @@ import { releaseQuietly, type DeliveryStore } from './store.js';
  *      the secret again once in case it was rotated.
  *   2. pull_request opened, reopened, ready_for_review or synchronize (new
  *      commits) on a review route: route gates, idempotency key
- *      repo#pr#head_sha (#ready or #push appended for ready_for_review
- *      and new commits), the pull request's pending marker, the pull
- *      request's cap on automatic reviews, the route's daily review
- *      budget, then the route's queue. The review holds the marker until
- *      its run starts and covers every push, reopen or ready_for_review
- *      that comes before then. A review of new commits first waits in
- *      the queue for pushReviewDelaySeconds.
+ *      repo#pr#head_sha (#reopened, #ready or #push appended for a
+ *      reopen, ready_for_review and new commits), the pull request's
+ *      pending marker, the pull request's cap on automatic reviews, the
+ *      route's daily review budget, then the route's queue. The review
+ *      holds the marker until its run starts and covers every push,
+ *      reopen or ready_for_review that comes before then. A review of new
+ *      commits first waits in the queue for pushReviewDelaySeconds.
  *   3. issue_comment, pull_request_review_comment, pull_request_review:
  *      an @mention of the bot is a review request (src/mention.ts).
  *      Everything else, and a thread reply even when it also starts a
@@ -78,6 +78,16 @@ const REVIEW_TRIGGERS: ReadonlyMap<string, AutomaticTrigger> = new Map([
   ['reopened', 'reopened'],
   ['ready_for_review', 'ready_for_review'],
   ['synchronize', 'push'],
+]);
+/**
+ * What each trigger appends to its review's idempotency key and run
+ * nonce, and so to the run's heartbeat key. An opened pull request's
+ * review appends nothing.
+ */
+const TRIGGER_NONCES: ReadonlyMap<AutomaticTrigger, string> = new Map([
+  ['reopened', 'reopened'],
+  ['ready_for_review', 'ready'],
+  ['push', 'push'],
 ]);
 
 const skip = (reason: string): Outcome => ({ status: 200, body: { ok: true, skipped: reason } });
@@ -178,18 +188,22 @@ export function createDeliveryHandler(
       if (!route.authorAllowlist.includes(author)) return skip(`author-not-allowed=${token(author)}`);
     }
 
-    // ready_for_review and new commits have their own key and heartbeat
-    // nonce. A draft's head may already have been reviewed while the PR
-    // was briefly open as non-draft, and that completed run must not
-    // stand in for the review it gets when marked ready. A review of new
-    // commits is skipped, and recorded completed, when the PR is closed
-    // by the time it runs; a reopen at that head must not then be dropped
-    // as its duplicate, or its run be taken for done by the worker. The
-    // cost: a reopen at a head that a review of new commits did cover is
-    // reviewed again, using a round.
-    const ready = trigger === 'ready_for_review';
+    // Each trigger has its own key and heartbeat nonce (TRIGGER_NONCES),
+    // except that opened has none. The key is kept for 24 hours, so one
+    // review must not stand in for the review another trigger asks for:
+    //   - A draft's head may already have been reviewed while the PR was
+    //     briefly open as non-draft, and that review must not stand in
+    //     for the one it gets when marked ready.
+    //   - The runtime skips an automatic review, and records its run
+    //     completed, when by the time the run starts the PR is closed, or
+    //     a draft on a skipDrafts route. A reopen at that head must not
+    //     then be dropped as the duplicate of a skipped review (opened,
+    //     or new commits), nor its run be taken for done by the worker.
+    // The cost: a reopen at a head that was already reviewed is reviewed
+    // again, and uses a round. Only the first reopen at a head does: a
+    // later one is a duplicate of it.
     const pushed = trigger === 'push';
-    const nonce = ready ? 'ready' : pushed ? 'push' : undefined;
+    const nonce = TRIGGER_NONCES.get(trigger);
     const key = `${repo}#${prNumber}#${headSha}${nonce ? `#${nonce}` : ''}`;
     if (!(await deps.store.claim(key, { action }))) return skip('duplicate');
 
