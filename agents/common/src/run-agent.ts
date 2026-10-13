@@ -375,8 +375,14 @@ export function createReviewHandler(opts: ReviewHandlerOpts): (payload: Payload)
       } finally {
         try {
           let r = await review.next();
-          if (!r.done) console.warn('[stream] stream closed during the review; finishing it without relaying frames');
+          const closed = !r.done;
+          if (closed) console.warn('[stream] stream closed during the review; finishing it without relaying frames');
           while (!r.done) r = await review.next();
+          // The error after this finally never runs once the stream is
+          // closed, so log what it would have said.
+          if (closed && terminal.tool === null) {
+            console.error(`[stream] review ended without a terminal tool; model_calls=${callLimit.used} final_text_preview=${finalText.slice(0, 400)}`);
+          }
         } catch {
           // turns() has logged the error, and the finally below records
           // the run as failed.
