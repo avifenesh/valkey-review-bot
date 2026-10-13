@@ -34,8 +34,9 @@ HTTP API -> receiver -+-> route queue -> route worker -> reviewer runtime -> Git
 
 ### Automatic pull request review
 
-1. A pull request on a review route is opened, reopened or marked ready for
-   review. GitHub sends a `pull_request` delivery to the HTTP API.
+1. A pull request on a review route is opened or reopened, or, on a
+   `skipDrafts` route, marked ready for review. GitHub sends a
+   `pull_request` delivery to the HTTP API.
 2. The receiver checks the signature, applies the route's gates, claims the
    idempotency key and takes a slot from the route's daily budget
    (`pullRequest` in `webhook/src/delivery.ts`). It sends a review envelope
@@ -256,9 +257,9 @@ back after the visibility timeout. For a review message, `decide` in
 `webhook/src/watchdog.ts` returns:
 
 - first receive: invoke on the primary model;
+- heartbeat `completed`: delete, at any age;
 - message older than the run budget (from `SentTimestamp`): delete it and log
   `[abandoned]`;
-- heartbeat `completed`: delete;
 - no heartbeat, status `failed`, or last activity older than
   `HEARTBEAT_STALE_MINUTES` (default 12): invoke again on the fallback model;
 - otherwise the run is alive: report the message as failed without invoking,
@@ -328,31 +329,43 @@ loads graduated skills, assembles the tools and starts the loop.
   days, highest version first (`maintainedReleaseLines`). This fetch is
   authenticated only when the upstream is the pull request's repository. A
   failure leaves the list unknown.
-- Finds the previous review state: the newest issue comment that contains the
-  state marker and was written by this App (`performed_via_github_app.id`
-  equal to `GITHUB_APP_ID`), in `findStateComment`. The marker alone is not
-  trusted.
+- Finds the previous review state: the newest issue comment written by this
+  App (`performed_via_github_app.id` equal to `GITHUB_APP_ID`) whose body
+  starts with the state marker, in `findStateComment`. The marker alone is
+  not trusted. The App also posts model-written text in status comments, so
+  the terminal tools remove the marker from the `post_review` body and the
+  `skip_review` reason before they go there (`stripStateMarker`).
 
 Each git process has a 10 minute limit and aborts a transfer that stays below
-1 KB/s for 60 seconds.
+1 KB/s for 60 seconds. It runs with `GIT_CONFIG_GLOBAL=/dev/null`, so
+`~/.gitconfig` and `~/.config/git/config` are ignored: in a warm container an
+earlier run's build code or write tool could have left one there, and the
+fetches carry the token.
 
 ### The PR overview and untrusted text
 
-`renderPrOverview` builds the first user message: refs and SHAs, the diff
-range, the workspace path and the change size, then the title, description,
-changed paths, existing reviews, inline comments and PR comments. Each of
-those is wrapped in an `<untrusted-pr-content source="...">` block, and any
-opening or closing tag of that name inside the text is defused (`<` becomes
-`&lt;`) so the content cannot end its block. The overview states that text in
-these blocks is data and never an instruction. Lists show the newest 100
-entries as 240 character excerpts. Then come the maintained release lines (or
-a note to use the `unclear` or `not_needed` verdict) and the previous review
-state in full.
+`renderPrOverview` builds the first user message: the author, the head SHA,
+the base branch and SHA, the merge base, the diff range, the workspace path
+and the change size, then the head branch name, title, description, changed
+paths, existing reviews, inline comments and PR comments. Each of those is
+wrapped in an `<untrusted-pr-content source="...">` block, and any opening or
+closing tag of that name inside the text is defused (`<` becomes `&lt;`) so
+the content cannot end its block. The overview states that text in these
+blocks is data and never an instruction. Lists show the newest 100 entries as
+240 character excerpts. Then come the maintained release lines, each by its
+bare name with its `upstream/` ref (or a note to use the `unclear` or
+`not_needed` verdict), and the previous review state in full.
 
 On @mention runs `mentionBlock` adds a "Review request" section that makes the
 instruction the main directive and names the file and line of an inline tag.
 The last line tells the model to start at Phase 1 and finish with a terminal
 tool.
+
+File paths outside the fenced blocks are written as JSON strings, so a file
+name cannot close the sentence around it: the inline tag's path in
+`mentionBlock`, and the path in the re-review instruction that
+`webhook/src/mention.ts` builds. The base branch stays unfenced, because only
+maintainers create branches in the base repository.
 
 ### Loop limits
 
@@ -373,12 +386,26 @@ tool.
   watchdog does not post a second review. A run that ends without one fails:
   the heartbeat says `failed` and the next receive retries on the fallback
   model.
-- A review outlives the 15-minute worker that started it, so a closed stream
-  does not stop it. If the stream is closed, Strands drains the rest of the
-  loop without relaying events; the heartbeat also beats from agent hooks
-  (before each model call and after each tool call), so the watchdog still
-  sees a live run. When the handler exits, the run is recorded as `completed`
-  if a terminal tool succeeded and `failed` otherwise.
+- A review outlives the 15-minute worker that started it, so once the model
+  turns have started a closed stream does not stop it. `createReviewHandler`
+  relays the model's frames by hand, so closing the handler does not close
+  the agent stream under it. When the stream is closed, at any frame, the
+  handler runs the remaining model turns to the end itself, including the
+  terminal-retry turn, without relaying events. A close before that, during
+  the token request, workspace preparation, skill loading or tool assembly,
+  ends the run as `failed`.
+  The heartbeat also beats from agent hooks (before each model call and
+  after each tool call), so the watchdog still sees a live run. When the
+  handler exits, the run is recorded as `completed` if a terminal tool
+  succeeded and `failed` otherwise. A run that ends without one after its
+  stream closed logs its model call count and final text.
+- While a run is in progress, `asBusyTask` keeps it registered as an async
+  task of the `BedrockAgentCoreApp`, so the runtime's `/ping` reports
+  `HealthyBusy` and AgentCore does not stop the session at its 15-minute
+  idle timeout after the worker has gone. The reviewer runtimes end a
+  session two hours after it starts at the latest (`lifecycleConfiguration`
+  in `infra/lib/valkey-review-agent-stack.ts`), above the watchdog's
+  90-minute run budget. The curator has neither (section 6).
 
 ### Tools
 
@@ -389,17 +416,24 @@ no language server.
 
 | Tool | Code | What it is limited to |
 | --- | --- | --- |
-| `read`, `grep`, `glob` | `tools/harness.ts` | Files under the workspace root. Paths matching `.env*`, `.aws/`, `id_rsa*`, `*.pem`, `*.key`, `node_modules/` and `.git/` are refused. |
-| `lsp` (Valkey) | `tools/harness.ts` | clangd for `.c` and `.h`, from a fixed manifest. A `.lsp.json` in the checkout is ignored. |
-| `write`, `edit`, `multi_edit` | `tools/harness.ts` | Only when `ALLOW_WRITE` is true; workspace files only. For testing assumptions; nothing is committed or pushed, and the next run resets the tree. |
-| `git` | `tools/git.ts` | Read-only subcommands (`log`, `show`, `blame`, `diff`, `status`, `rev-parse`, `rev-list`, `cat-file`, `ls-tree`, `ls-files`, `grep`, `shortlog`, `describe`, `branch`, `tag`, `reflog`, `merge-base`, `name-rev`). `checkGitArgs` rejects options that write files, run helpers or pagers, read files outside the repository, or override config (`-c`); `branch` and `tag` only list and `reflog` only reads. `--no-ext-diff` and `--no-textconv` are added. No credentials, no system gitconfig, 60 seconds, 500 KB. |
+| `read`, `grep`, `glob` | `tools/harness.ts` | Files under the workspace root. Paths matching `.env*`, `.aws/`, `id_rsa*`, `*.pem`, `*.key`, `node_modules/` and `.git/` are refused as a `read` target or a search root, and `grep` drops matches in such files. `glob` checks only its search root, so it can still list the names of matching files. |
+| `lsp` (Valkey) | `tools/harness.ts` | clangd for `.c` and `.h`, from a fixed manifest. A `.lsp.json` in the checkout is ignored. There is no compilation database, so `references` and `workspaceSymbol` cover only the files clangd has opened and the headers they include; the prompt finds callers with `git grep`. |
+| `write`, `edit`, `multi_edit` | `tools/harness.ts` | Only when `ALLOW_WRITE` is true; workspace files only. A target whose real location (the realpath of its nearest existing ancestor) is outside the workspace or matches the refused patterns, for example `.git/` reached through a symlink, is refused. For testing assumptions; nothing is committed or pushed, and the next run resets the tree. |
+| `git` | `tools/git.ts` | Read-only subcommands (`log`, `show`, `blame`, `diff`, `status`, `rev-parse`, `rev-list`, `cat-file`, `ls-tree`, `ls-files`, `grep`, `shortlog`, `describe`, `branch`, `tag`, `reflog`, `merge-base`, `name-rev`). `checkGitArgs` rejects options that write files, run helpers or pagers, read files outside the repository, or override config (`-c`); `git diff` refuses absolute paths and paths that climb out with `..`; `branch` and `tag` only list and `reflog` only reads. `--no-ext-diff` and `--no-textconv` are added. No credentials, no system or global gitconfig (`GIT_CONFIG_NOSYSTEM`, `GIT_CONFIG_GLOBAL=/dev/null`), 60 seconds, 500 KB. |
 | `gh_api_read` | `tools/gh.ts` | `GET` through `gh api`, only under `repos/<PR repository or upstream>/`, only for allowlisted pull request, review, comment, commit, contents and check-run endpoints (`checkGhApiPath`). Paths with `..`, `%`, backslashes, whitespace or `#` are refused. 30 seconds, 2 MB. |
 | `post_review`, `skip_review` | `tools/gh.ts` | Terminal tools, described below. |
-| `make` (Valkey) | `agents/valkey-review/src/tools/make.ts` | Targets `all`, `valkey-server`, `valkey-cli`, `valkey-benchmark`, `valkey-sentinel`, `test-unit`, `clean`, `Makefile.dep`; an allowlist of variables with a restricted character set; `-j` 1 to 16; run from the repository root or `src/`. 8 minutes, 1 MB. |
-| `build` (GLIDE) | `agents/valkey-glide-review/src/tools/build.ts` | `cargo`, `gradle` (`./gradlew`), `go`, `npm` and `npx`, each with allowed actions and blocked tokens (`checkBuildArgs` in `build-policy.ts`): no publish, install or login, exact Gradle task names only, `go mod` limited to `graph`, `verify` and `why`, no `npm run` script that rewrites sources or deletes lock files, and no `npx` option that writes files. Working directory inside the checkout. 8 minutes, 1 MB. |
+| `make` (Valkey) | `agents/valkey-review/src/tools/make.ts` | Targets `all`, `valkey-server`, `valkey-cli`, `valkey-benchmark`, `valkey-sentinel`, `test-unit`, `clean`, `Makefile.dep`; an allowlist of variables with a restricted character set; `-j` 1 to 16; run from the repository root or `src/`. 8 minutes, 1 MB (see below). |
+| `build` (GLIDE) | `agents/valkey-glide-review/src/tools/build.ts` | `cargo`, `gradle` (`./gradlew`), `go`, `npm` and `npx`, each with allowed actions and blocked tokens (`checkBuildArgs` in `build-policy.ts`): no publish, install or login, exact Gradle task names only, `go mod` limited to `graph`, `verify` and `why`, no `npm run` script that rewrites sources or deletes lock files, and no `npx` option that writes files. Working directory inside the checkout. 8 minutes, 1 MB (see below). |
 
 Paths under `tools/` are in `agents/common/src/tools/`. The tool tables in
 each `config/prompt.md` describe the same set to the model.
+
+`git`, `gh_api_read`, `make` and `build` run their command through
+`runBounded` (`tools/spawn.ts`), in a process group of its own. The time and
+output limits apply to everything the command started, such as sub-makes and
+test binaries: at either limit the whole group gets SIGTERM, then SIGKILL
+after a grace period (3 seconds for `make` and `build`, 2 seconds
+otherwise).
 
 ### Review phases
 
@@ -586,6 +620,11 @@ an unknown id is an error.
 - Loop (`curate` in `agents/curator/src/curate.ts`): tools run one at a time.
   The loop ends after the tool round that calls `curator_done`, or after
   `MAX_ITERATIONS` rounds (default 40).
+- Stream: the curator runtime has none of the reviewers' closed-stream
+  handling, does not report `HealthyBusy` and keeps AgentCore's default
+  session lifecycle. If its stream closes before the `done` frame, the
+  worker reports the message as failed and SQS delivers it again, up to
+  three receives.
 - Limits (`CuratorRun` in `agents/curator/src/tools/run.ts`): one change to
   the concerns store per run, one skill submission per run, nothing after
   `curator_done`. A call that fails or changes nothing frees its slot.
@@ -630,7 +669,9 @@ graduate. The curator accepts values from 2 to 100.
 
 `submit_skill` (`agents/curator/src/tools/submit-skill.ts`) accepts only the
 record this run bumped or merged into, and only when its stored count meets
-the threshold. The record name is the record's existing
+the threshold. It accepts at most 40,000 characters of `skill_md`
+(`GRADUATED_SKILL_MAX_CHARS`), half the reviewers' load budget, so every
+published skill can be loaded. The record name is the record's existing
 `graduated_record_name`. A first graduation uses a slug of the subject (at
 most 60 characters), or, when another skill already holds that name, the
 slug with a suffix derived from the record id; if both are taken the call
@@ -639,9 +680,10 @@ with a conditional write, sets the frontmatter `name` to it
 (`withRecordName`), then calls `upsertSkill`
 (`agents/common/src/skills-registry.ts`), which updates the `SKILL` record
 with that name or creates one. The markdown goes in
-`descriptors.agentSkillsDefinition.additionalData.skillMd.data`, gets minimal
-frontmatter if it has none, and may be at most 102,400 characters. The
-description notes the source `record_id`. Finally `graduated_at` is set.
+`descriptors.agentSkillsDefinition.additionalData.skillMd.data` and gets
+minimal frontmatter if it has none; `upsertSkill` refuses markdown over the
+registry's limit of 102,400 characters. The description notes the source
+`record_id`. Finally `graduated_at` is set.
 
 `list_skill_authoring` returns up to 10 skills from the curator's own registry
 (sources in `agents/curator/skills/`, published with
@@ -651,8 +693,11 @@ follows the prompt's inline rules.
 On the reviewer side, `loadGraduatedSkills`
 (`agents/common/src/graduated-skills.ts`) runs after workspace preparation.
 It skips records in status `CREATING`, `CREATE_FAILED`, `UPDATE_FAILED`,
-`DEPRECATED` or `REJECTED`, takes the 30 most recently updated, and gives all
-registry calls one 10 second deadline. Any failure means no graduated skills
+`DEPRECATED` or `REJECTED`, takes the 30 most recently updated, and caps their
+combined markdown at 80,000 characters (`GRADUATED_SKILLS_MAX_CHARS`). Newest
+skills come first; a skill that does not fit is skipped and later ones are
+still tried, and the number of skills left out is logged. All registry calls
+share one 10 second deadline. Any failure means no graduated skills
 for that run. `renderGraduatedSkills` appends them to the system prompt.
 Concerns below the threshold never reach a reviewer. `scripts/registry-skills.mjs`
 lists skills and deprecates one to retire it.
