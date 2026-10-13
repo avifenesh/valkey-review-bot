@@ -89,14 +89,23 @@ export class ValkeyReviewAgentStack extends cdk.Stack {
     });
 
     // The reviewer runs code from the pull request, so its role holds no
-    // secrets and cannot write anywhere that outlives the review: no
-    // Secrets Manager, no concerns tables, no registry writes. GitHub
-    // access goes through the token broker.
+    // secrets and has no Secrets Manager, concerns-table or registry-write
+    // access. Its only writes are its own logs, the heartbeat table and,
+    // through the token broker, the pull request.
+    const runtimeName = props.agentId.replace(/-/g, '_') + '_runtime';
     this.role = createRuntimeRole(this, 'RuntimeRole', {
       description: `Execution role for the ${props.agentId} runtime.`,
       image,
+      runtimeName,
     });
-    props.assetsBucket.grantRead(this.role, `${props.agentId}/*`);
+    // Its prompt and skill: objects under its own prefix, no bucket
+    // listing. The bucket is encrypted with the substrate key.
+    this.role.addToPrincipalPolicy(new iam.PolicyStatement({
+      sid: 'ReadAgentAssets',
+      actions: ['s3:GetObject'],
+      resources: [props.assetsBucket.arnForObjects(`${props.agentId}/*`)],
+    }));
+    props.substrateKey.grantDecrypt(this.role);
     props.heartbeatTable.grant(this.role, 'dynamodb:GetItem', 'dynamodb:PutItem', 'dynamodb:UpdateItem');
     props.tokenBroker.grantInvoke(this.role);
     const m = props.models;
@@ -114,7 +123,7 @@ export class ValkeyReviewAgentStack extends cdk.Stack {
     }));
 
     this.runtime = new agentcore.CfnRuntime(this, 'Runtime', {
-      agentRuntimeName: props.agentId.replace(/-/g, '_') + '_runtime',
+      agentRuntimeName: runtimeName,
       description: props.description,
       agentRuntimeArtifact: {
         containerConfiguration: {

@@ -87,11 +87,28 @@ describe('reviewer role', () => {
     expect(resourceStrings(bySid(valkey, 'ReadSkillsRegistry')))
       .toEqual([registryArn('valkeyRegistry1'), `${registryArn('valkeyRegistry1')}/record/*`]);
     expect(JSON.stringify(valkey)).not.toContain('glideRegistry1');
-    const s3Read = valkey.find((st) => actionsOf(st).includes('s3:GetObject*'))!;
-    expect(JSON.stringify(s3Read.Resource)).toContain('/valkey-review/*');
+    const s3 = valkey.filter((st) => actionsOf(st).some((a) => a.startsWith('s3:')));
+    expect(s3.map((st) => st.Sid)).toEqual(['ReadAgentAssets']);
+    expect(actionsOf(s3[0]!)).toEqual(['s3:GetObject']);
+    expect(JSON.stringify(s3[0]!.Resource)).toContain('/valkey-review/*');
+    const kms = valkey.filter((st) => actionsOf(st).some((a) => a.startsWith('kms:')));
+    expect(kms.flatMap(actionsOf)).toEqual(['kms:Decrypt']);
+    expect(JSON.stringify(kms[0]!.Resource)).toContain('SubstrateKey');
     const invoke = valkey.filter((st) => actionsOf(st).includes('lambda:InvokeFunction'));
     expect(JSON.stringify(invoke)).toContain('TokenBrokerValkeyReviewFn');
     expect(JSON.stringify(invoke)).not.toContain('TokenBrokerValkeyGlideReviewFn');
+  });
+
+  test.each([
+    ['valkey-review', 'valkey_review_runtime'],
+    ['valkey-glide-review', 'valkey_glide_review_runtime'],
+  ] as const)('%s writes only its own runtime log groups', (id, runtimeName) => {
+    const group = `arn:aws:logs:us-west-2:${ACCOUNT}:log-group:/aws/bedrock-agentcore/runtimes/${runtimeName}-*`;
+    expect(resourceStrings(bySid(reviewerStatements(id), 'RuntimeLogs'))).toEqual([group, `${group}:*`]);
+    expect(Object.values<any>(reviewerTemplate(id).findResources('AWS::BedrockAgentCore::Runtime'))[0].Properties.AgentRuntimeName)
+      .toBe(runtimeName);
+    const logs = reviewerStatements(id).filter((st) => actionsOf(st).some((a) => a.startsWith('logs:')));
+    expect(logs.map((st) => st.Sid)).toEqual(['RuntimeLogs']);
   });
 
   test('pulls images from the repository of the configured bootstrap qualifier', () => {

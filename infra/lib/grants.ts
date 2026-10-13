@@ -12,6 +12,11 @@ import * as dynamodb from 'aws-cdk-lib/aws-dynamodb';
 export function createRuntimeRole(scope: Construct, id: string, props: {
   readonly description: string;
   readonly image: ecr_assets.DockerImageAsset;
+  /**
+   * The runtime's agentRuntimeName. When set, log writes are limited to
+   * that runtime's log groups instead of every AgentCore log group.
+   */
+  readonly runtimeName?: string;
 }): iam.Role {
   const stack = cdk.Stack.of(scope);
   const role = new iam.Role(scope, id, {
@@ -20,14 +25,20 @@ export function createRuntimeRole(scope: Construct, id: string, props: {
   });
 
   // The runtime service pulls the image when the runtime is created and on
-  // every cold start.
+  // every cold start. The image is in the CDK bootstrap repository, which
+  // holds the images of every CDK app in the account and region; ECR
+  // permissions cannot be limited to one image.
   props.image.repository.grantPull(role);
 
-  // AgentCore writes runtime logs under /aws/bedrock-agentcore/.
+  // AgentCore writes a runtime's logs to
+  // /aws/bedrock-agentcore/runtimes/<runtime id>-<endpoint>, and a runtime
+  // id is its name, a hyphen and a suffix. Names cannot contain hyphens,
+  // so "<name>-*" matches no other runtime.
+  const logGroups = props.runtimeName ? `/aws/bedrock-agentcore/runtimes/${props.runtimeName}-*` : '/aws/bedrock-agentcore/*';
   role.addToPrincipalPolicy(new iam.PolicyStatement({
     sid: 'RuntimeLogs',
     actions: ['logs:CreateLogGroup', 'logs:CreateLogStream', 'logs:PutLogEvents', 'logs:DescribeLogStreams'],
-    resources: ['/aws/bedrock-agentcore/*', '/aws/bedrock-agentcore/*:*'].map((resourceName) =>
+    resources: [logGroups, `${logGroups}:*`].map((resourceName) =>
       stack.formatArn({ service: 'logs', resource: 'log-group', resourceName, arnFormat: cdk.ArnFormat.COLON_RESOURCE_NAME })),
   }));
   return role;
