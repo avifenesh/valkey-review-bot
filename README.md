@@ -138,7 +138,7 @@ committed. Use an AWS account that runs nothing else: code from the pull request
 review can use the reviewer runtime's AWS role, as [SECURITY.md](SECURITY.md) describes.
 Skill checks start in report mode. [infra/README.md](infra/README.md#skill-lifecycle-operations)
 describes how to review their reports, how to turn on edits, retirements and pull
-requests, and the optional second GitHub App those pull requests need.
+requests, and the GitHub App permissions those pull requests need.
 
 ## Landing a new project
 

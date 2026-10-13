@@ -90,8 +90,9 @@ permissions are granted only when an `openai.*` model is configured.
    `issue_comment`. Subscribe it to the `pull_request`,
    `pull_request_review`, `pull_request_review_comment` and
    `issue_comment` events, and install it on the repositories you route.
-   It needs no Contents permission. The pull requests that propose edits
-   to the reviewers' skill files are opened by a second App; see
+   Reviews need no Contents permission. The pull requests that propose
+   edits to the reviewers' skill files need an App with Contents on the
+   bot's repository: this App by default, or a dedicated one; see
    [The skills-repo App](#the-skills-repo-app).
 4. Store the App credentials in Secrets Manager, in the target account and
    region, under the name you set in `github.appSecretName`. The secret is a
@@ -451,8 +452,10 @@ so the next real pass checks the same skills again.
     --payload '{"recheck_all":true,"dry_run":true}' decay-result.json
   ```
   `recheck_all` makes every live graduated skill due, still within
-  `checksPerDay` and `maxRetirementsPerDay` per reviewer, and it also
-  queues the repo skill check of each reviewer. The pass otherwise does
+  `checksPerDay` and `maxRetirementsPerDay` per reviewer. It also queues
+  the repo skill check of each reviewer whose upstream GA release it
+  resolved in that pass (none when checks are off, the release lookup
+  fails, or the upstream has no GA release). The pass otherwise does
   what the next scheduled pass would do: it writes the decayed scores and
   deletes ungraduated records below the floor. Retirement candidates are
   only logged. The read timeout covers the function's 5-minute limit, so
@@ -589,9 +592,10 @@ directory and prints the cited names and the ones that are absent. Exit
 status: 0 when clean, 2 when not, 1 on error. `--ref BRANCH` checks another
 branch, `--checkout DIR --rev REV` a clone you already have (not a partial
 clone), `--names` lists every name with its kind and count, and `--json`
-prints the whole result. `--name SKILL --stack ValkeyReviewAgent` instead
-reproduces the curator's deterministic check of a registry skill, with the
-record's baseline, ignored names and last checked commit.
+prints the whole result. `--repo valkey-io/valkey --name SKILL --stack ValkeyReviewAgent`
+instead reproduces the curator's deterministic check of a registry skill, with
+the record's baseline, ignored names and last checked commit (one of `--repo`,
+`--url` or `--checkout` is always required).
 
 ### Restoring a retired skill
 

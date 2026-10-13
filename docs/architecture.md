@@ -398,8 +398,8 @@ policy). The webhook stack outputs every dead-letter queue name for alarms.
 When the container starts, `bootstrap` reads its settings (`loadEnv` in
 `agents/common/src/config.ts`) and loads `prompt.md` and `skill.md` from the
 assets bucket once. The base system prompt is the prompt, then a "Skill:
-institutional memory" section with the skill file, whose suppressed pieces
-are labelled as graduated skills' are (`baseSystemPrompt`; see
+institutional memory" section with the skill file. Suppressed pieces in it
+are labelled the same way as in graduated skills (`baseSystemPrompt`; see
 [Publishing skills](#publishing-skills-to-aws-agent-registry)).
 
 Each invocation validates the payload against `requestSchema` and picks the

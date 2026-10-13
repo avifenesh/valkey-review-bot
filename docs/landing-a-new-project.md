@@ -193,8 +193,9 @@ These steps are for the operator of each deployment.
    not change. The token broker refuses a token unless the installation's account owns
    the repository, so install it from the account that owns `valkey-io/valkey-search`.
 3. Add a route in `infra/deploy.config.json`. Start narrow: `mentionOnly` or an
-   `authorAllowlist`. Set `threadReplyReview` (default `false`) when maintainers should
-   be able to answer the bot in its review threads.
+   `authorAllowlist`. `threadReplyReview` (default `false`) can be on from the start:
+   it only lets maintainers answer the bot in threads it started, and those runs do not
+   use the daily budget. The example below turns it on.
 
    ```json
    {
@@ -259,7 +260,10 @@ are deployment-wide, so a new reviewer gets whatever the deployment has. See
 ## 8. The repo skill file and release-check pull requests
 
 `agents/valkey-search-review/config/skill.md` ships with the code. It changes by pull
-request only, never in place:
+request only, never in place. Merge it to `skillsRepo.baseBranch` before the first
+deploy of the new reviewer: the first decay pass after a known GA release queues a check
+of the file, and if the file is not on that branch yet the check finds nothing to read,
+is recorded as an error, and runs again at each daily pass until the file is there.
 
 - The decay job queues one check of the file per GA release of the upstream. The
   curator reads the file from `skillsRepo.repo` at `skillsRepo.baseBranch` without

@@ -62,9 +62,10 @@ node scripts/registry-skills.mjs deprecate --registry-id <registry-id> --name <n
 ```
 
 The reason is cut to 256 characters. `DEPRECATED` is final: the record
-can never be updated or set back, and the publish script then fails for
-that name. To bring the skill back, publish it under a new name (rename
-the file and its frontmatter `name`).
+can never be updated or set back. The publish script then stops at that
+name, and the skills after it are not published either. To bring the
+skill back, publish it under a new name (rename the file and its
+frontmatter `name`).
 
 The same script lists and deprecates the skills the curator graduated
 into a reviewer's registry; pass that reviewer's registry id, or
