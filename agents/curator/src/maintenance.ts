@@ -834,14 +834,14 @@ async function inconclusive(run: Run, why: string): Promise<MaintenanceResult> {
   return completed('inconclusive');
 }
 
-/** A check that cannot succeed by retrying: recorded, with the release and time, so it is due only at the next trigger. */
+/**
+ * A check that cannot succeed by retrying: recorded, with the release
+ * and time, so it is due only at the next trigger. It comes before any
+ * live read of the registry record, so the marker stays.
+ */
 async function failedForGood(run: Run, why: string): Promise<MaintenanceResult> {
   if (run.req.dry_run) await run.release();
-  else {
-    const w = outcomeWrite(run, { outcome: 'error', note: note(why) });
-    if (run.liveRead) w.remove(MARKER);
-    await run.state(w);
-  }
+  else await run.state(outcomeWrite(run, { outcome: 'error', note: note(why) }));
   run.log(run.req.reason, { outcome: 'error', note: why });
   return completed('error');
 }
@@ -1206,7 +1206,8 @@ async function* applyRevision(
   } catch (err) {
     console.warn(`[maintenance] registry update of ${quoted(run.name)} failed: ${errorText(err)}`);
     const v: Outcome = { outcome: 'error', note: note(`the edited skill could not be written to the registry at ${c.ref}`) };
-    await run.afterEdit(outcomeWrite(run, v).set('pending_revision', pendingRevision(run.nowIso, c, report, 'the registry update failed')), revisedAt);
+    // The record was read live, so a leftover marker goes, as in every terminal write after a live read.
+    await run.afterEdit(outcomeWrite(run, v).set('pending_revision', pendingRevision(run.nowIso, c, report, 'the registry update failed')).remove(MARKER), revisedAt);
     run.log('check', { outcome: 'error', ...fields, note: v.note });
     return completed('error');
   }

@@ -568,6 +568,103 @@ test('valid edits with applyEdits on are claimed, written update-only, then veri
   assert.ok(lines.some((l) => l.startsWith('[maintenance] edit ') && l.includes('applied=true')), lines.join('\n'));
 });
 
+// --- Check: races between the read and a write -----------------------------
+
+/** A hook that changes the record once, just before the first update whose expression uses `placeholder`. */
+function changeBefore(placeholder, change) {
+  let done = false;
+  return {
+    beforeUpdate: (input, table) => {
+      if (done || !input.UpdateExpression.includes(placeholder)) return;
+      done = true;
+      const row = { ...table.item(KEY), ...change };
+      for (const [k, v] of Object.entries(change)) if (v === undefined) delete row[k];
+      table.put(row);
+    },
+  };
+}
+
+test('a record tombstoned or renamed after the read keeps its state, and the check only releases the claim', async () => {
+  for (const [label, change] of [
+    ['tombstoned', { retired_at: '2026-10-13T00:30:00.000Z', retired_reason: 'operator' }],
+    ['renamed', { graduated_record_name: 'db-flush-g2' }],
+  ]) {
+    const s = setup({
+      item: record({ audit_names: new Set(['serverCron', 'src/server.c']) }),
+      skill: { name: NAME, skillMd: CLEAN_MD },
+      hooks: changeBefore('#checkoutcome', change),
+    });
+    const { result } = await run(checkMessage(), s.deps);
+    assert.deepEqual(result, { status: 'skipped', decision: 'changed' }, label);
+    const item = s.table.item(KEY);
+    assert.equal(item.check_outcome, undefined, label);
+    assert.equal(item.verified_sha, BASE_SHA, label);
+    assert.ok(claimGone(item), label);
+    for (const [k, v] of Object.entries(change)) assert.equal(item[k], v, label);
+  }
+});
+
+test('a tombstone loses when the marker it decided from changes before the write', async () => {
+  for (const [label, item, change] of [
+    // Read with the marker: the lifecycle's reason, which needs the marker still there.
+    ['marker gone', record({ maintenance_deprecating: NAME }), { maintenance_deprecating: undefined }],
+    // Read without it: an operator's retirement, which needs it still absent.
+    ['marker set', record(), { maintenance_deprecating: NAME }],
+  ]) {
+    const s = setup({ item, skill: { name: NAME, skillMd: SKILL_MD, status: 'DEPRECATED' }, hooks: changeBefore('#retiredat', change) });
+    const { result } = await run(checkMessage(), s.deps);
+    assert.deepEqual(result, { status: 'skipped', decision: 'changed' }, label);
+    const after = s.table.item(KEY);
+    assert.equal(after.retired_at, undefined, label);
+    assert.equal(after.retired_reason, undefined, label);
+    assert.ok(claimGone(after), label);
+  }
+});
+
+test('an applied revision records nothing once another edit has replaced its revised_at', async () => {
+  let edited = false;
+  const s = setup({
+    turns: [report('revise', [EDIT])],
+    settings: { checkApplyEdits: true },
+    hooks: {
+      beforeUpdate: (input, table) => {
+        const row = table.item(KEY);
+        if (!edited && input.UpdateExpression.includes('#checkoutcome') && row.revised_at === NOW) {
+          edited = true;
+          table.put({ ...row, revised_at: '2026-10-13T01:00:30.000Z' });
+        }
+      },
+    },
+  });
+  const { result, lines } = await run(checkMessage(), s.deps);
+  assert.equal(result.decision, 'revised');
+  assert.ok(edited);
+  const item = s.table.item(KEY);
+  assert.equal(item.check_outcome, undefined);
+  assert.equal(item.verified_sha, BASE_SHA);
+  assert.equal(item.revised_at, '2026-10-13T01:00:30.000Z');
+  assert.ok(lines.some((l) => l.startsWith('[maintenance] check ') && l.includes('outcome="revised"') && l.includes('recorded=false')), lines.join('\n'));
+});
+
+test('an applied revision clears a leftover retirement marker, also when the registry update fails', async () => {
+  const s = setup({ item: record({ maintenance_deprecating: NAME }), turns: [report('revise', [EDIT])], settings: { checkApplyEdits: true } });
+  assert.equal((await run(checkMessage(), s.deps)).result.decision, 'revised');
+  assert.equal(s.table.item(KEY).maintenance_deprecating, undefined);
+
+  const failed = setup({
+    item: record({ maintenance_deprecating: NAME }),
+    turns: [report('revise', [EDIT])],
+    settings: { checkApplyEdits: true },
+    registryOpts: { update: () => { throw new Error('registry unavailable'); } },
+  });
+  assert.equal((await run(checkMessage(), failed.deps)).result.decision, 'error');
+  const item = failed.table.item(KEY);
+  assert.equal(item.check_outcome, 'error');
+  assert.equal(item.previous_skill_md, SKILL_MD);
+  assert.equal(item.pending_revision.reason, 'the registry update failed');
+  assert.equal(item.maintenance_deprecating, undefined);
+});
+
 test('a duplicate run loses the edit claim and never writes the registry', async () => {
   const s = setup({
     turns: [report('revise', [EDIT])],
@@ -1078,6 +1175,20 @@ test('a repo check without a skills repository records why, once per release', a
   const item = s.table.item(REPO_SKILL_KEY);
   assert.match(item.check_note, /no skills repository/);
   assert.equal(item.verified_release, '9.1.2');
+});
+
+test('a repo check with pull requests on but no token broker never proposes', async () => {
+  const r = repoApi();
+  const s = setup({
+    item: repoItem(),
+    turns: [report('revise', [EDIT])],
+    settings: { skillsRepo: { ...SKILLS_REPO, tokenFunction: '' }, checkOpenPullRequests: true },
+    repoSkills: async () => r.api,
+  });
+  const { result } = await run(repoMessage(), s.deps);
+  assert.equal(result.decision, 'suspect');
+  assert.equal(r.calls.some((c) => c[0] === 'propose'), false);
+  assert.match(s.table.item(REPO_SKILL_KEY).pending_revision.reason, /pull requests are off/);
 });
 
 test('a proposal whose base moved is checked again at the next pass', async () => {
