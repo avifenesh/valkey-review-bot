@@ -15,6 +15,43 @@ import { printable, quoted } from './text.mjs';
 const SHA_RE = /^(?:[0-9a-f]{40}|[0-9a-f]{64})$/;
 
 /**
+ * What git prints on stderr about an object it could not read: one the
+ * repository lacks, a corrupt one, or one it could not or may not fetch.
+ */
+const OBJECT_ERROR_RE = /unable to read|could not read|cannot read|failed to read|missing (?:blob |tree |commit |tag )?object|bad object|could not fetch|lazy fetching disabled|promisor remote|is corrupt|corrupt (?:loose )?object|unable to unpack|inflate:/i;
+
+/** Git could not read an object the check reads; the result would be incomplete. */
+export class ObjectReadError extends Error {}
+
+/** The git subcommand in an argv: the first argument that is not an option or the value of -c or -C. */
+function subcommand(args) {
+  for (let i = 0; i < args.length; i++) {
+    if (args[i] === '-c' || args[i] === '-C') i++;
+    else if (!args[i].startsWith('-')) return args[i];
+  }
+  return args[0] ?? '';
+}
+
+/**
+ * A runner that throws ObjectReadError when git reports on stderr an
+ * object it could not read, whatever its exit status. git grep reports a
+ * blob it cannot read ("error: '<rev>:<path>': unable to read <sha>") and
+ * goes on, exiting 0 or 1, which check.ts accepts: the names in that blob
+ * would count as absent. `context` says where git ran.
+ */
+export function failOnObjectErrors(git, context) {
+  return async (args, opts) => {
+    const r = await git(args, opts);
+    const line = r.stderr.split('\n').find((l) => OBJECT_ERROR_RE.test(l));
+    if (line !== undefined) {
+      throw new ObjectReadError(`git ${subcommand(args)} could not read an object the check needs (${line.trim().slice(0, 300)}),`
+        + ` so no result is given. ${context}`);
+    }
+    return r;
+  };
+}
+
+/**
  * Environment for git on a clone the operator already has. As for a fresh
  * checkout: no credentials, no inherited GIT_* settings and no system or
  * global config. Also GIT_NO_LAZY_FETCH, so that git 2.44 and later never
@@ -48,7 +85,8 @@ async function cloneRunner(dir) {
   const env = cloneGitEnv();
   const top = await mustGit(createGitRunner(dir, env), ['rev-parse', '--show-toplevel']);
   // Check from the top of the work tree, as check.ts expects.
-  const git = createGitRunner(top, env);
+  const git = failOnObjectErrors(createGitRunner(top, env), `${top} lacks an object at the commits checked, or holds a corrupt`
+    + ' one (git fsck there shows which). Use an intact full clone, or --repo or --url.');
   if (await isPartialClone(git)) {
     throw new Error(`${top} is a partial clone (it has a promisor remote), so it can lack objects the check reads,`
       + ' and skill-facts does not read one. Use a full clone (git clone without --filter), or --repo or --url,'
@@ -81,7 +119,8 @@ async function commitOf(git, rev) {
  * branch tip (the default branch unless given) in a temporary directory,
  * deleted afterwards, as the curator makes it; or { checkout, rev? }: the
  * committed tree at `rev` (default HEAD) of an existing clone, which is
- * only read. A partial clone is refused (see cloneRunner).
+ * only read. A partial clone is refused (see cloneRunner). In both, an
+ * object git cannot read is an ObjectReadError, never a smaller count.
  *
  * record, when given, is the graduated concern record's check state, as
  * the curator uses it: audit_names is the baseline, ignored_names are not
@@ -104,7 +143,7 @@ export async function skillFacts({ skillMd, upstream, record = null, base }) {
       if (baseSha !== undefined && !SHA_RE.test(baseSha)) throw new Error(`the base must be a full commit SHA for a fresh checkout, got ${JSON.stringify(baseSha)}`);
       dir = realpathSync(mkdtempSync(path.join(tmpdir(), 'skill-facts-')));
       const co = await prepareUpstreamCheckout({ dir, url: upstream.url, branch: upstream.branch, verifiedSha: baseSha });
-      git = co.git;
+      git = failOnObjectErrors(co.git, 'The fresh checkout lacks an object the check reads; run the script again.');
       commit = co.tipSha;
       baseAvailable = co.baseAvailable;
       where = { url: upstream.url, branch: co.defaultBranch, commit };
@@ -133,7 +172,8 @@ export async function skillFacts({ skillMd, upstream, record = null, base }) {
         baseline = (await checkSkill(git, { names, rev: baseSha })).present;
         baselineFrom = 'base';
       } catch (err) {
-        // A fresh checkout holds the base's trees and changed blobs; if git still misses an object, go on without a baseline.
+        // An object git cannot read stops the check, as at the commit; any other failure here (a timeout, too much output) leaves no baseline.
+        if (err instanceof ObjectReadError) throw err;
         baselineError = err instanceof Error ? err.message : String(err);
       }
     }

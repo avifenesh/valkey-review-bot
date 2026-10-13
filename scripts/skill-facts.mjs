@@ -32,6 +32,8 @@
 //                --filter makes) is refused, with any git version: it can
 //                lack objects the check reads. Use a full clone there, or
 //                --repo or --url.
+// With any upstream, an object git cannot read (a missing or corrupt one)
+// stops the script with an error; it never counts as an absent name.
 // Comparison:
 //   --base       the commit of the last check (default: the record's
 //                verified_sha). Without a record the baseline is the cited

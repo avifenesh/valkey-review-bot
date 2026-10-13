@@ -1,10 +1,10 @@
 import assert from 'node:assert/strict';
 import { execFileSync } from 'node:child_process';
-import { mkdirSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
+import { cpSync, existsSync, mkdirSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import test from 'node:test';
-import { factsJson, factsReport, skillFacts } from '../lib/skill-facts.mjs';
+import { factsJson, factsReport, failOnObjectErrors, ObjectReadError, skillFacts } from '../lib/skill-facts.mjs';
 import { fakeAwsCli, flag, runScript, tempDir, typed } from './support/aws.mjs';
 import { fakeRegistry, registryEnv } from './support/registry.mjs';
 
@@ -190,6 +190,65 @@ test('skill-facts.mjs refuses a partial clone and prints no result', async () =>
   assert.deepEqual(objects(dir), before);
   const full = await runScript('skill-facts.mjs', ['--file', file, '--checkout', up.work]);
   assert.equal(full.code, 2, `a full clone is read: ${full.stderr}`);
+});
+
+let brokenClones = 0;
+/** A copy of the full clone `work` without the loose object of `rev:file`, as a damaged clone lacks it. */
+function cloneWithout(rev, file) {
+  const dir = path.join(up.root, `broken-${brokenClones++}`);
+  cpSync(up.work, dir, { recursive: true });
+  const sha = gitIn(dir)('rev-parse', `${rev}:${file}`);
+  const loose = path.join(dir, '.git', 'objects', sha.slice(0, 2), sha.slice(2));
+  assert.ok(existsSync(loose), `${rev}:${file} is a loose object`);
+  rmSync(loose);
+  return { dir, sha };
+}
+
+const escapeRe = (text) => text.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+const OBJECT_ERROR = (dir, sha) => new RegExp(`git grep could not read an object the check needs \\(error: '[0-9a-f]+:src/[a-z]+\\.c': unable to read ${sha}\\), so no result is given\\. ${escapeRe(dir)} lacks an object at the commits checked`);
+
+test('a blob a full clone lacks stops the check: its names never count as absent', async () => {
+  // git grep reports the blob, goes on and exits 0 or 1, with every git version.
+  const tip = cloneWithout('HEAD', 'src/db.c');
+  await assert.rejects(skillFacts({ skillMd: SKILL, upstream: { checkout: tip.dir } }), (err) => {
+    assert.ok(err instanceof ObjectReadError);
+    assert.match(err.message, OBJECT_ERROR(tip.dir, tip.sha));
+    return true;
+  });
+  // At the base, where the names present are the baseline.
+  const base = cloneWithout('HEAD~1', 'src/old.c');
+  await assert.rejects(skillFacts({ skillMd: SKILL, upstream: { checkout: base.dir }, base: up.baseSha }), OBJECT_ERROR(base.dir, base.sha));
+
+  const file = path.join(up.root, 'broken-skill.md');
+  writeFileSync(file, SKILL);
+  const cli = await runScript('skill-facts.mjs', ['--file', file, '--checkout', tip.dir]);
+  assert.equal(cli.code, 1);
+  assert.equal(cli.stdout, '', 'no report');
+  assert.match(cli.stderr, /git grep could not read an object the check needs .*unable to read/);
+});
+
+test('failOnObjectErrors fails on any object git could not read, whatever its exit status, and passes the rest through', async () => {
+  const fake = (r) => failOnObjectErrors(async () => ({ stdout: '', truncated: false, ...r }), 'Where.');
+  for (const stderr of [
+    "error: 'HEAD:a.c': unable to read 0123abcd",
+    'warning: lazy fetching disabled; some objects may not be available',
+    'fatal: could not fetch 0123abcd from promisor remote',
+    'error: Could not read 0123abcd',
+    'fatal: missing blob object \'0123abcd\'',
+    'fatal: bad object 0123abcd',
+    'error: inflate: data stream error (incorrect header check)\nfatal: loose object 0123abcd (stored in x) is corrupt',
+  ]) {
+    for (const code of [0, 1, 128]) {
+      await assert.rejects(fake({ code, stderr })(['-c', 'grep.lineNumber=false', 'grep', '-e', 'x']), (err) => {
+        assert.ok(err instanceof ObjectReadError, stderr);
+        assert.match(err.message, /^git grep could not read an object the check needs \(.+\), so no result is given\. Where\.$/);
+        return true;
+      });
+    }
+  }
+  for (const r of [{ code: 1, stderr: '' }, { code: 128, stderr: 'fatal: Not a valid object name f^{commit}' }, { code: 0, stderr: 'warning: refname is ambiguous' }]) {
+    assert.deepEqual(await fake(r)(['cat-file', '-e', 'f']), { stdout: '', truncated: false, ...r });
+  }
 });
 
 test('the report lists every cited name with --names, and the JSON carries the excerpts', async () => {
