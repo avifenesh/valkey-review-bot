@@ -22,9 +22,12 @@ export interface CheckInput {
   /** Names an earlier audit judged accurate although absent (ignored_names). */
   readonly ignored?: readonly string[];
   /**
-   * Commit of the last check. Touched names need it in the repository;
-   * pass it only when prepareUpstreamCheckout reported baseAvailable, as
-   * a partial clone would otherwise try to fetch it.
+   * Commit of the last check, to diff against. Pass it only when
+   * prepareUpstreamCheckout reported baseAvailable. One that is not a
+   * full SHA or not in the repository makes the result incomplete.
+   * Without it (no earlier check, or a base the remote no longer has,
+   * as after a force-push) the result is a presence check only:
+   * `compared` is false and `touched` empty.
    */
   readonly baseSha?: string;
   /** The commit to check: HEAD by default, or any revision that names a commit (a full SHA, a tag). */
@@ -65,8 +68,8 @@ export interface CheckResult {
   readonly keptFraction: number;
   /**
    * Nothing lost, new and absent, or touched, and the diff was read in
-   * full (`incomplete` is empty). A caller may advance the verified
-   * commit only on a clean result.
+   * full (`incomplete` is empty). Only a clean result confirms the skill
+   * without an audit.
    */
   readonly clean: boolean;
   /** The base was available and diffed; without it `touched` is empty. */
@@ -77,8 +80,24 @@ export interface CheckResult {
   readonly diffTruncated: boolean;
   /** More than DIFF_MAX_CANDIDATES changed files held a rare cited name; the rest were not diffed. */
   readonly candidatesCapped: boolean;
-  /** Why `touched` may be incomplete, one line each; empty when the whole diff was examined. */
+  /**
+   * Why `touched` may be incomplete, one line each: a capped candidate
+   * list, a truncated diff, a base that was given but is missing. Empty
+   * when the whole diff was examined, or none was asked for. See
+   * confirmableCommit.
+   */
   readonly incomplete: readonly string[];
+}
+
+/**
+ * The commit a caller may record as verified (verified_sha) after acting
+ * on a check: `result.commit`, or null when the result is incomplete.
+ * On null the verification never moves, whatever an audit concludes,
+ * because the hunks nobody examined would otherwise never be checked:
+ * the next check diffs from the same base again.
+ */
+export function confirmableCommit(result: CheckResult): string | null {
+  return result.incomplete.length === 0 ? result.commit : null;
 }
 
 /**
@@ -442,7 +461,11 @@ export async function checkSkill(git: GitRunner, input: CheckInput): Promise<Che
   const touched: string[] = [];
   const excerpts: DiffExcerpt[] = [];
   const base = input.baseSha;
-  if (base !== undefined && SHA_RE.test(base) && (await git(['cat-file', '-e', `${base}^{commit}`])).code === 0) {
+  if (base !== undefined && !SHA_RE.test(base)) {
+    incomplete.push(`the base ${JSON.stringify(base)} is not a full commit SHA, so no diff was examined`);
+  } else if (base !== undefined && (await git(['cat-file', '-e', `${base}^{commit}`])).code !== 0) {
+    incomplete.push(`the base commit ${base} is not in the repository, so the diff since it was not examined`);
+  } else if (base !== undefined) {
     compared = true;
     const changed = nulList(await run(git, [...DIFF, '--name-only', '--no-renames', '-z', base, commit]));
     const changedSet = new Set(changed);

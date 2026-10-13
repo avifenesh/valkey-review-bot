@@ -6,7 +6,7 @@ import path from 'node:path';
 import test from 'node:test';
 
 // No resolve hook: these modules must load under plain type stripping.
-const { areaFileCounts, checkSkill, DIFF_MAX_BYTES, DIFF_MAX_CANDIDATES, globToRegExp, RARE_MAX } = await import('../src/skill-check/check.ts');
+const { areaFileCounts, checkSkill, confirmableCommit, DIFF_MAX_BYTES, DIFF_MAX_CANDIDATES, globToRegExp, RARE_MAX } = await import('../src/skill-check/check.ts');
 const { extractNames } = await import('../src/skill-check/names.ts');
 const { createGitRunner } = await import('../src/skill-check/upstream.ts');
 
@@ -185,15 +185,42 @@ test('prefixes, qualified names and configs are touched through their words', as
   r.cleanup();
 });
 
-test('without a usable base nothing is touched', async () => {
+test('without a base nothing is touched; a base that is given but unusable makes the result incomplete', async () => {
   const r = repo({ 'a.c': 'int rare_x_name = 1;\n' }, { 'a.c': 'int rare_x_name = 2;\n' });
   const n = names('`rare_x_name`');
-  for (const baseSha of [undefined, 'f'.repeat(40), 'HEAD~1', '--output=/tmp/x']) {
+  const none = await checkSkill(r.git, { names: n, baseline: ['rare_x_name'] });
+  assert.equal(none.compared, false);
+  assert.deepEqual(none.touched, []);
+  assert.deepEqual(none.incomplete, []);
+  assert.equal(none.clean, true);
+  const missing = 'f'.repeat(40);
+  for (const [baseSha, why] of [
+    [missing, `the base commit ${missing} is not in the repository, so the diff since it was not examined`],
+    ['HEAD~1', 'the base "HEAD~1" is not a full commit SHA, so no diff was examined'],
+    ['--output=/tmp/x', 'the base "--output=/tmp/x" is not a full commit SHA, so no diff was examined'],
+  ]) {
     const result = await checkSkill(r.git, { names: n, baseline: ['rare_x_name'], baseSha });
-    assert.equal(result.compared, false, String(baseSha));
+    assert.equal(result.compared, false, baseSha);
     assert.deepEqual(result.touched, []);
-    assert.equal(result.clean, true);
+    assert.deepEqual(result.incomplete, [why]);
+    assert.equal(result.clean, false);
+    assert.equal(confirmableCommit(result), null);
   }
+  r.cleanup();
+});
+
+test('only a complete result gives a commit to record as verified', async () => {
+  const r = repo({ 'a.c': 'int rare_q_name = 1;\n' }, { 'a.c': 'int rare_q_name = 2;\n' });
+  const n = names('`rare_q_name` `absent_q_name`');
+  // Touched and absent names leave it to the audit, which may confirm.
+  const flagged = await checkSkill(r.git, { names: n, baseline: ['rare_q_name'], baseSha: r.baseSha });
+  assert.deepEqual([flagged.touched, flagged.newAbsent, flagged.clean], [['rare_q_name'], ['absent_q_name'], false]);
+  assert.equal(confirmableCommit(flagged), r.tipSha);
+  const clean = await checkSkill(r.git, { names: names('`rare_q_name`'), baseline: ['rare_q_name'], baseSha: r.tipSha });
+  assert.equal(clean.clean, true);
+  assert.equal(confirmableCommit(clean), r.tipSha);
+  // Nothing flagged, but the diff was not read in full.
+  assert.equal(confirmableCommit({ ...clean, incomplete: ['the diff of the candidate files passed 4194304 bytes and was read only that far'] }), null);
   r.cleanup();
 });
 
@@ -211,6 +238,7 @@ test('a capped candidate list is not clean, and says why', async () => {
   assert.equal(result.candidatesCapped, true);
   assert.deepEqual(result.incomplete, [`only ${DIFF_MAX_CANDIDATES} of the ${count} changed files that hold a cited name were diffed`]);
   assert.equal(result.clean, false);
+  assert.equal(confirmableCommit(result), null);
   r.cleanup();
 });
 
@@ -222,6 +250,7 @@ test('a truncated diff is not clean, and says why', async () => {
   assert.equal(result.diffTruncated, true);
   assert.deepEqual(result.incomplete, [`the diff of the candidate files passed ${DIFF_MAX_BYTES} bytes and was read only that far`]);
   assert.equal(result.clean, false);
+  assert.equal(confirmableCommit(result), null);
   r.cleanup();
 });
 
