@@ -47,8 +47,22 @@ describe('defaults', () => {
       curator: { maxIterations: 40, maxTokens: 16384, graduationThreshold: 4 },
     });
     expect(config.upstreamRepos).toEqual({ 'valkey-review': 'valkey-io/valkey', 'valkey-glide-review': 'valkey-io/valkey-glide' });
-    expect(config.decay).toEqual({ halfLifeDays: 30, floor: 0.05 });
+    expect(config.decay).toEqual({ halfLifeDays: 30, floor: 0.05, graduatedHalfLifeDays: 180 });
+    // Report mode: nothing edits, retires or opens a pull request until the operator turns it on.
+    expect(config.skillLifecycle).toEqual({
+      checksPerDay: 10,
+      recheckDays: 90,
+      applyEdits: false,
+      retireSkills: false,
+      openPullRequests: false,
+      maxRetirementsPerDay: 3,
+      maxCheckRounds: 25,
+      retireRefusedBackoffDays: 30,
+    });
+    expect(config).not.toHaveProperty('skillsRepo');
     expect(config.dailyReviewBudget).toBe(40);
+    expect(config.maxAutomaticReviewsPerPr).toBe(3);
+    expect(config.pushReviewDelaySeconds).toBe(300);
     expect(config.github.installationId).toBeUndefined();
     expect(config.github.knownBotLogins).toBeUndefined();
     expect(config.routes[0]).toEqual({
@@ -65,6 +79,21 @@ describe('defaults', () => {
     expect(config.github.botLogin).toBe('your-app-slug[bot]');
     expect(config.routes.length).toBeGreaterThan(0);
     for (const route of config.routes) expect(route.repo.startsWith('your-org/')).toBe(true);
+    // Maintainers can answer the bot in its review threads on every route.
+    for (const route of config.routes) expect({ route: route.id, threadReplyReview: route.threadReplyReview }).toEqual({ route: route.id, threadReplyReview: true });
+    // The example ships in report mode.
+    expect(config.skillLifecycle).toMatchObject({ applyEdits: false, retireSkills: false, openPullRequests: false });
+    expect(config.skillsRepo?.repo.startsWith('your-org/')).toBe(true);
+  });
+
+  test('the committed example spells out every skill lifecycle and review round setting at its default', () => {
+    const file = path.join(__dirname, '..', 'deploy.config.example.json');
+    const raw = JSON.parse(fs.readFileSync(file, 'utf8'));
+    const defaults = parseDeploymentConfig(fixture());
+    expect(raw.skillLifecycle).toEqual(defaults.skillLifecycle);
+    expect(raw.decay).toEqual(defaults.decay);
+    expect(raw.maxAutomaticReviewsPerPr).toBe(defaults.maxAutomaticReviewsPerPr);
+    expect(raw.pushReviewDelaySeconds).toBe(defaults.pushReviewDelaySeconds);
   });
 
   test("each reviewer's token broker covers exactly that reviewer's review routes", () => {
@@ -369,6 +398,156 @@ describe('numbers', () => {
 
   test('a zero budget is allowed and pauses automatic reviews', () => {
     expect(parseDeploymentConfig(withChange((raw) => { raw.dailyReviewBudget = 0; })).dailyReviewBudget).toBe(0);
+  });
+
+  // [path, min, max, integer]. The same ranges the decay job, the curator
+  // and the receiver enforce, or narrower.
+  const ranged: [string, number, number, boolean][] = [
+    ['skillLifecycle.checksPerDay', 0, 100, true],
+    ['skillLifecycle.recheckDays', 7, 3650, true],
+    ['skillLifecycle.maxRetirementsPerDay', 1, 50, true],
+    ['skillLifecycle.maxCheckRounds', 5, 100, true],
+    ['skillLifecycle.retireRefusedBackoffDays', 1, 3650, true],
+    ['maxAutomaticReviewsPerPr', 1, 20, true],
+    ['pushReviewDelaySeconds', 0, 900, true],
+  ];
+  const withSetting = (key: string, value: unknown) => withChange((raw) => {
+    const parts = key.split('.');
+    let at = raw;
+    for (const part of parts.slice(0, -1)) at = at[part] ??= {};
+    at[parts.at(-1)!] = value;
+  });
+  const setting = (config: DeploymentConfig, key: string): unknown => key.split('.').reduce<any>((at, part) => at[part], config);
+
+  test.each(ranged)('%s accepts %d and %d', (key, min, max) => {
+    expect(setting(parseDeploymentConfig(withSetting(key, min)), key)).toBe(min);
+    expect(setting(parseDeploymentConfig(withSetting(key, max)), key)).toBe(max);
+  });
+
+  test.each(ranged)('%s rejects values just outside %d to %d, and fractions', (key, min, max) => {
+    const expected = `${key} must be an integer >= ${min} and <= ${max}`;
+    expect(problems(withSetting(key, min - 1))).toContain(`${expected} (got ${min - 1})`);
+    expect(problems(withSetting(key, max + 1))).toContain(`${expected} (got ${max + 1})`);
+    expect(problems(withSetting(key, min + 0.5))).toContain(`${expected} (got ${min + 0.5})`);
+    expect(problems(withSetting(key, String(min)))).toContain(`${expected} (got "${min}")`);
+  });
+
+  test.each(['applyEdits', 'retireSkills', 'openPullRequests'])('skillLifecycle.%s is a boolean', (key) => {
+    expect(problems(withSetting(`skillLifecycle.${key}`, 'true'))).toContain(`skillLifecycle.${key} must be true or false`);
+    expect(setting(parseDeploymentConfig(withSetting(`skillLifecycle.${key}`, true)), `skillLifecycle.${key}`)).toBe(true);
+  });
+
+  test('skillLifecycle rejects unknown keys', () => {
+    expect(problems(withSetting('skillLifecycle.applyEdit', true))).toContain('skillLifecycle.applyEdit is not a known setting');
+    expect(problems(withChange((raw) => { raw.skillLifecycle = []; }))).toContain('skillLifecycle must be an object');
+  });
+});
+
+describe('decay', () => {
+  test('graduatedHalfLifeDays is a number above 0 and up to 3650', () => {
+    expect(parseDeploymentConfig(withChange((raw) => { raw.decay = { graduatedHalfLifeDays: 3650 }; })).decay.graduatedHalfLifeDays).toBe(3650);
+    expect(parseDeploymentConfig(withChange((raw) => { raw.decay = { halfLifeDays: 0.5, graduatedHalfLifeDays: 0.5 }; })).decay)
+      .toEqual({ halfLifeDays: 0.5, floor: 0.05, graduatedHalfLifeDays: 0.5 });
+    for (const value of [0, -1, 3651, '180']) {
+      expect(problems(withChange((raw) => { raw.decay = { graduatedHalfLifeDays: value }; })))
+        .toContain('decay.graduatedHalfLifeDays must be a number > 0 and <= 3650');
+    }
+  });
+
+  test('a graduated skill decays no faster than the concerns that have not graduated', () => {
+    const message = problems(withChange((raw) => { raw.decay = { halfLifeDays: 60, graduatedHalfLifeDays: 59 }; }));
+    expect(message).toContain('decay.graduatedHalfLifeDays must be at least decay.halfLifeDays (got 59 and 60)');
+    // The default graduated half-life is checked against a raised halfLifeDays too.
+    expect(problems(withChange((raw) => { raw.decay = { halfLifeDays: 200 }; })))
+      .toContain('decay.graduatedHalfLifeDays must be at least decay.halfLifeDays (got 180 and 200)');
+    expect(parseDeploymentConfig(withChange((raw) => { raw.decay = { halfLifeDays: 60, graduatedHalfLifeDays: 60 }; })).decay.graduatedHalfLifeDays)
+      .toBe(60);
+  });
+
+  test('an out-of-range half-life is reported once, not also as a comparison', () => {
+    const message = problems(withChange((raw) => { raw.decay = { halfLifeDays: 5000, graduatedHalfLifeDays: 100 }; }));
+    expect(message).toContain('decay.halfLifeDays must be a number > 0 and <= 3650');
+    expect(message).not.toContain('must be at least decay.halfLifeDays');
+  });
+
+  test('unknown decay keys are rejected', () => {
+    expect(problems(withChange((raw) => { raw.decay = { graduatedHalfLife: 90 }; }))).toContain('decay.graduatedHalfLife is not a known setting');
+  });
+});
+
+describe('skillsRepo', () => {
+  const withSkillsRepo = (value: unknown) => withChange((raw) => { raw.skillsRepo = value; });
+
+  test('only repo is required; the branch is main and the App secret is the main one', () => {
+    expect(parseDeploymentConfig(withSkillsRepo({ repo: 'example-org/valkey-review-bot' })).skillsRepo).toEqual({
+      repo: 'example-org/valkey-review-bot', baseBranch: 'main', appSecretName: 'example/github-app',
+    });
+    expect(parseDeploymentConfig(withSkillsRepo({
+      repo: 'example-org/valkey-review-bot', baseBranch: 'release/1.0', appSecretName: 'example/skills-app', signOff: 'Jane Doe <jane@example.com>',
+    })).skillsRepo).toEqual({
+      repo: 'example-org/valkey-review-bot', baseBranch: 'release/1.0', appSecretName: 'example/skills-app', signOff: 'Jane Doe <jane@example.com>',
+    });
+    expect(problems(withSkillsRepo({}))).toContain('skillsRepo.repo is required');
+    expect(problems(withSkillsRepo('example-org/valkey-review-bot'))).toContain('skillsRepo must be an object');
+    expect(problems(withSkillsRepo({ repo: 'example-org/x', branch: 'main' }))).toContain('skillsRepo.branch is not a known setting');
+  });
+
+  test.each(['just-a-name', 'example-org/..', 'example-org/.', 'example-org/a b'])('repo %j is rejected', (repo) => {
+    expect(problems(withSkillsRepo({ repo }))).toContain('skillsRepo.repo must be owner/name of the bot repository');
+  });
+
+  test.each(['-main', 'a..b', 'a//b', 'a/.b', '.hidden', 'a/', 'a.', 'a.lock', 'a.lock/b', 'with space', 'a~b', 'a'.repeat(101), ''])(
+    'baseBranch %j is rejected', (baseBranch) => {
+      expect(problems(withSkillsRepo({ repo: 'example-org/x', baseBranch }))).toContain('skillsRepo.baseBranch must be a branch name');
+    });
+
+  test.each(['main', 'trunk', 'release/9.0', 'v2.x_maint', 'a'.repeat(100)])('baseBranch %j is accepted', (baseBranch) => {
+    expect(parseDeploymentConfig(withSkillsRepo({ repo: 'example-org/x', baseBranch })).skillsRepo?.baseBranch).toBe(baseBranch);
+  });
+
+  test.each([
+    'jane@example.com',
+    'Jane Doe <jane>',
+    'Jane Doe <jane@example.com',
+    'Jane Doe<jane@example.com>',
+    ' Jane <jane@example.com>',
+    'Jane  <jane@example.com>',
+    'Jane\tDoe <jane@example.com>',
+    'Jane\nDoe <jane@example.com>',
+    'Jane <ja ne@example.com>',
+    'Jane <jane@@example.com>',
+    `${'n'.repeat(101)} <jane@example.com>`,
+    '',
+  ])('signOff %j is rejected', (signOff) => {
+    expect(problems(withSkillsRepo({ repo: 'example-org/x', signOff }))).toContain('skillsRepo.signOff must be one line of the form "Name <email>"');
+  });
+
+  test('appSecretName is a secret name', () => {
+    expect(problems(withSkillsRepo({ repo: 'example-org/x', appSecretName: 'has spaces' })))
+      .toContain('skillsRepo.appSecretName must be a Secrets Manager secret name');
+  });
+
+  // The curator checks the same settings when it boots and before every
+  // pull request; whatever synthesis accepts, both checks must accept.
+  test('every branch and sign-off synthesis accepts, the curator accepts too', () => {
+    const curatorSrc = path.join(__dirname, '..', '..', 'agents', 'curator', 'src');
+    const regexIn = (file: string, name: string): RegExp => {
+      const text = fs.readFileSync(path.join(curatorSrc, file), 'utf8');
+      const m = new RegExp(`const ${name} = /(.+)/([a-z]*);`).exec(text);
+      if (!m) throw new Error(`no ${name} in ${file}`);
+      return new RegExp(m[1]!, m[2]);
+    };
+    const curatorBranch = regexIn('config.ts', 'BRANCH_RE');
+    const signOffs = [regexIn('config.ts', 'SIGN_OFF_RE'), regexIn('repo-skill-pr.ts', 'SIGN_OFF_RE')];
+    const branches = ['main', 'trunk', 'release/9.0', 'v2.x_maint', 'a/b/c', 'a'.repeat(100)];
+    for (const baseBranch of branches) {
+      parseDeploymentConfig(withSkillsRepo({ repo: 'example-org/x', baseBranch }));
+      expect({ baseBranch, ok: curatorBranch.test(baseBranch) }).toEqual({ baseBranch, ok: true });
+    }
+    for (const signOff of ['Jane Doe <jane@example.com>', 'J <j@e>', 'Jane (bot) <ops+bot@mail.example.org>', `${'n'.repeat(100)} <jane@example.com>`]) {
+      parseDeploymentConfig(withSkillsRepo({ repo: 'example-org/x', signOff }));
+      for (const re of signOffs) expect({ signOff, re: re.source, ok: re.test(signOff) }).toEqual({ signOff, re: re.source, ok: true });
+    }
   });
 });
 

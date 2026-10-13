@@ -91,8 +91,46 @@ export type AgentsConfig = Readonly<Record<ReviewerId, ReviewerAgentConfig>> & {
 };
 
 export interface DecayConfig {
+  /** Half-life of concern records that never graduated into a skill. */
   readonly halfLifeDays: number;
   readonly floor: number;
+  /** Half-life of records that graduated into a skill: their skill's standing. */
+  readonly graduatedHalfLifeDays: number;
+}
+
+/**
+ * Skill maintenance: the release checks and retirements the decay job
+ * schedules and the curator runs. Every switch that changes a skill,
+ * retires one or opens a pull request is off by default (report mode).
+ */
+export interface SkillLifecycleConfig {
+  /** Check requests per reviewer per daily pass; 0 turns checks off. */
+  readonly checksPerDay: number;
+  /** A check is also due when the last one is older than this. */
+  readonly recheckDays: number;
+  /** Write validated edits to registry skills. Off: they are kept for the operator. */
+  readonly applyEdits: boolean;
+  /** Deprecate skills that decayed below the floor or whose subject is gone. Off: logged as would-retire. */
+  readonly retireSkills: boolean;
+  /** Propose repo skill edits by pull request against skillsRepo. Off: report only. */
+  readonly openPullRequests: boolean;
+  /** Retire requests per reviewer per daily pass. */
+  readonly maxRetirementsPerDay: number;
+  /** Tool rounds of one audit. */
+  readonly maxCheckRounds: number;
+  /** A record whose retirement the curator refused is not requested again for this long. */
+  readonly retireRefusedBackoffDays: number;
+}
+
+/** The bot's own repository, where the reviewers' repo skill files live. */
+export interface SkillsRepoConfig {
+  /** "owner/name". */
+  readonly repo: string;
+  readonly baseBranch: string;
+  /** Secrets Manager secret of the GitHub App that opens the pull requests; github.appSecretName by default. */
+  readonly appSecretName: string;
+  /** "Name <email>" for the commit's Signed-off-by line; the App's bot identity when unset. */
+  readonly signOff?: string;
 }
 
 export interface DeploymentConfig {
@@ -105,7 +143,14 @@ export interface DeploymentConfig {
   readonly models: ModelsConfig;
   readonly agents: AgentsConfig;
   readonly decay: DecayConfig;
+  readonly skillLifecycle: SkillLifecycleConfig;
+  /** Absent: repo skill findings are only reported. */
+  readonly skillsRepo?: SkillsRepoConfig;
   readonly dailyReviewBudget: number;
+  /** Automatic reviews per pull request, counting the first. Mentions and thread replies are not counted. */
+  readonly maxAutomaticReviewsPerPr: number;
+  /** SQS delay of a review that new commits start, so a burst of pushes becomes one review. */
+  readonly pushReviewDelaySeconds: number;
 }
 
 const DEFAULT_PRIMARY = 'us.anthropic.claude-opus-5-5';
@@ -122,6 +167,17 @@ const REPO = /^[A-Za-z0-9](?:[A-Za-z0-9-]{0,38})\/(?!\.\.?$)[A-Za-z0-9._-]{1,100
 const ROUTE_ID = /^[A-Za-z0-9-]{1,64}$/;
 const SECRET_NAME = /^[A-Za-z0-9/_+=.@-]{1,512}$/;
 const MODEL_ID = /^[a-z0-9-]+\.[A-Za-z0-9][A-Za-z0-9._:-]{0,200}$/;
+/**
+ * A branch name both the curator's config check and its pull request
+ * code accept (agents/curator/src/config.ts and repo-skill-pr.ts).
+ */
+const BRANCH = /^(?!.*\.\.)(?!.*\/\/)(?!.*\/\.)(?!.*\/$)(?!.*\.$)(?!.*\.lock$)(?!.*\.lock\/)[A-Za-z0-9][A-Za-z0-9._/-]{0,99}$/;
+/**
+ * "Name <email>" on one line, as both the curator's config check and its
+ * pull request code accept it: no control characters, a name of at most
+ * 100 characters that neither starts nor ends with a space.
+ */
+const SIGN_OFF = /^(?! )[^<>\x00-\x1f\x7f]{0,99}[^<>\x00-\x1f\x7f ] <[^<>\s@]{1,64}@[^<>\s@]{1,190}>$/;
 
 export interface ProfileGeography {
   /** The regions the group can contain, for error messages. */
@@ -259,7 +315,8 @@ export function parseDeploymentConfig(raw: unknown, env: { readonly CDK_DEFAULT_
   const r = new Reader();
   const top = r.object(raw, 'config', [
     'aws', 'github', 'skillsRegistries', 'routes', 'curatorOnlyRoutes', 'upstreamRepos',
-    'models', 'agents', 'decay', 'dailyReviewBudget',
+    'models', 'agents', 'decay', 'skillLifecycle', 'skillsRepo',
+    'dailyReviewBudget', 'maxAutomaticReviewsPerPr', 'pushReviewDelaySeconds',
   ]);
   if (raw === undefined) r.fail('config', 'is empty');
 
@@ -372,18 +429,77 @@ export function parseDeploymentConfig(raw: unknown, env: { readonly CDK_DEFAULT_
   const models = parseModels(r, top.models, aws.region);
   const agents = parseAgents(r, top.agents);
 
-  const decayRaw = r.object(top.decay, 'decay', ['halfLifeDays', 'floor']);
-  const decay: DecayConfig = {
-    halfLifeDays: r.number(decayRaw.halfLifeDays, 'decay.halfLifeDays', { fallback: 30, min: 0, max: 3650, integer: false, minExclusive: true }),
-    floor: r.number(decayRaw.floor, 'decay.floor', { fallback: 0.05, min: 0, max: 1, integer: false, minExclusive: true, maxExclusive: true }),
-  };
+  const decay = parseDecay(r, top.decay);
+  const skillLifecycle = parseSkillLifecycle(r, top.skillLifecycle);
+  const skillsRepo = top.skillsRepo === undefined ? undefined : parseSkillsRepo(r, top.skillsRepo, github.appSecretName);
 
   const dailyReviewBudget = r.number(top.dailyReviewBudget, 'dailyReviewBudget', { fallback: 40, min: 0, max: 10_000, integer: true });
+  // The receiver enforces the same ranges (webhook/src/config.ts); SQS
+  // allows a per-message delay of at most 900 seconds.
+  const maxAutomaticReviewsPerPr = r.number(top.maxAutomaticReviewsPerPr, 'maxAutomaticReviewsPerPr', { fallback: 3, min: 1, max: 20, integer: true });
+  const pushReviewDelaySeconds = r.number(top.pushReviewDelaySeconds, 'pushReviewDelaySeconds', { fallback: 300, min: 0, max: 900, integer: true });
 
   if (r.problems.length > 0) {
     throw new Error(`Invalid deployment configuration:\n  - ${[...new Set(r.problems)].join('\n  - ')}`);
   }
-  return { aws, github, skillsRegistries, routes, curatorOnlyRoutes, upstreamRepos, models, agents, decay, dailyReviewBudget };
+  return {
+    aws, github, skillsRegistries, routes, curatorOnlyRoutes, upstreamRepos, models, agents, decay, skillLifecycle,
+    ...(skillsRepo ? { skillsRepo } : {}),
+    dailyReviewBudget, maxAutomaticReviewsPerPr, pushReviewDelaySeconds,
+  };
+}
+
+const HALF_LIFE_DAYS = { min: 0, max: 3650, integer: false, minExclusive: true } as const;
+
+function parseDecay(r: Reader, value: unknown): DecayConfig {
+  const o = r.object(value, 'decay', ['halfLifeDays', 'floor', 'graduatedHalfLifeDays']);
+  const decay: DecayConfig = {
+    halfLifeDays: r.number(o.halfLifeDays, 'decay.halfLifeDays', { fallback: 30, ...HALF_LIFE_DAYS }),
+    floor: r.number(o.floor, 'decay.floor', { fallback: 0.05, min: 0, max: 1, integer: false, minExclusive: true, maxExclusive: true }),
+    graduatedHalfLifeDays: r.number(o.graduatedHalfLifeDays, 'decay.graduatedHalfLifeDays', { fallback: 180, ...HALF_LIFE_DAYS }),
+  };
+  // A skill must not lose standing faster than the concerns it came from.
+  // Checked only on values that passed their own range check, so one
+  // typo gives one problem.
+  const rangeOk = (v: unknown) => v === undefined || (typeof v === 'number' && Number.isFinite(v) && v > 0 && v <= 3650);
+  if (rangeOk(o.halfLifeDays) && rangeOk(o.graduatedHalfLifeDays) && decay.graduatedHalfLifeDays < decay.halfLifeDays) {
+    r.fail('decay.graduatedHalfLifeDays', `must be at least decay.halfLifeDays (got ${decay.graduatedHalfLifeDays} and ${decay.halfLifeDays})`);
+  }
+  return decay;
+}
+
+function parseSkillLifecycle(r: Reader, value: unknown): SkillLifecycleConfig {
+  const o = r.object(value, 'skillLifecycle', [
+    'checksPerDay', 'recheckDays', 'applyEdits', 'retireSkills', 'openPullRequests',
+    'maxRetirementsPerDay', 'maxCheckRounds', 'retireRefusedBackoffDays',
+  ]);
+  const at = (key: string) => `skillLifecycle.${key}`;
+  return {
+    checksPerDay: r.number(o.checksPerDay, at('checksPerDay'), { fallback: 10, min: 0, max: 100, integer: true }),
+    recheckDays: r.number(o.recheckDays, at('recheckDays'), { fallback: 90, min: 7, max: 3650, integer: true }),
+    applyEdits: r.boolean(o.applyEdits, at('applyEdits'), false),
+    retireSkills: r.boolean(o.retireSkills, at('retireSkills'), false),
+    openPullRequests: r.boolean(o.openPullRequests, at('openPullRequests'), false),
+    maxRetirementsPerDay: r.number(o.maxRetirementsPerDay, at('maxRetirementsPerDay'), { fallback: 3, min: 1, max: 50, integer: true }),
+    // The curator rejects values outside 5..100 at boot (CHECK_MAX_ROUNDS).
+    maxCheckRounds: r.number(o.maxCheckRounds, at('maxCheckRounds'), { fallback: 25, min: 5, max: 100, integer: true }),
+    retireRefusedBackoffDays: r.number(o.retireRefusedBackoffDays, at('retireRefusedBackoffDays'), { fallback: 30, min: 1, max: 3650, integer: true }),
+  };
+}
+
+function parseSkillsRepo(r: Reader, value: unknown, defaultSecretName: string): SkillsRepoConfig {
+  const o = r.object(value, 'skillsRepo', ['repo', 'baseBranch', 'appSecretName', 'signOff']);
+  const signOff = o.signOff === undefined ? undefined : r.string(o.signOff, 'skillsRepo.signOff', {
+    pattern: SIGN_OFF, hint: 'one line of the form "Name <email>"',
+  });
+  return {
+    repo: r.string(o.repo, 'skillsRepo.repo', { pattern: REPO, hint: 'owner/name of the bot repository' }),
+    baseBranch: r.string(o.baseBranch, 'skillsRepo.baseBranch', { pattern: BRANCH, hint: 'a branch name', fallback: 'main' }),
+    appSecretName: r.string(o.appSecretName, 'skillsRepo.appSecretName', {
+      pattern: SECRET_NAME, hint: 'a Secrets Manager secret name', fallback: defaultSecretName,
+    }),
+    ...(signOff === undefined ? {} : { signOff }),
+  };
 }
 
 function parseModels(r: Reader, value: unknown, region: string): ModelsConfig {

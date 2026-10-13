@@ -28,5 +28,26 @@
     }
   ],
   "curatorOnlyRoutes": [],
-  "dailyReviewBudget": 40
+  "decay": {
+    "halfLifeDays": 30,
+    "floor": 0.05,
+    "graduatedHalfLifeDays": 180
+  },
+  "skillLifecycle": {
+    "checksPerDay": 10,
+    "recheckDays": 90,
+    "applyEdits": false,
+    "retireSkills": false,
+    "openPullRequests": false,
+    "maxRetirementsPerDay": 3,
+    "maxCheckRounds": 25,
+    "retireRefusedBackoffDays": 30
+  },
+  "skillsRepo": {
+    "repo": "your-org/valkey-review-bot",
+    "baseBranch": "main"
+  },
+  "dailyReviewBudget": 40,
+  "maxAutomaticReviewsPerPr": 3,
+  "pushReviewDelaySeconds": 300
 }
