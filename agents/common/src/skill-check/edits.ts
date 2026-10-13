@@ -14,14 +14,16 @@
  * The reason is generated from the changed names ("`a` is now `b`",
  * several joined by "; "); an edit cannot supply one, so no caller or
  * model text reaches the skill. Several citations are separated by
- * ", ". The replacement may differ
- * from the original only where a cited line supports it: both are split
- * on the token class [A-Za-z0-9_./:*>-]+, the text between tokens must
- * be identical and the token count equal, and every changed token must
- * be a code name replacing a code name, or a number replacing a number,
- * that appears on one of the edit's cited lines. So an edit cannot add
- * or remove a word, a sentence or punctuation, and the replacement has
- * as many lines as the original. The frontmatter, fenced blocks and
+ * ", ". The replacement may differ from the original only where a
+ * cited line supports it: both are split on the token class
+ * [A-Za-z0-9_./:*>-]+, the text between tokens must be identical and the
+ * token count equal, and every changed token must be a code name inside
+ * an inline code span (backticks) replacing a code name of the same
+ * sort, or a number replacing a number, that appears on one of the
+ * edit's cited lines. Words outside code spans never change, so an edit
+ * cannot turn "NEVER flag" into "ALWAYS flag", add or remove a word, a
+ * sentence or punctuation, and the replacement has as many lines as the
+ * original. The frontmatter, fenced blocks and
  * already-suppressed pieces are never edited, and suppressed blocks do
  * not nest.
  *
@@ -116,7 +118,10 @@ const PATH_MAX_CHARS = 400;
 
 const TOKEN_RE = /[A-Za-z0-9_.\/:*>-]+/g;
 const WORD_CHAR_RE = /[A-Za-z0-9_]/;
-const NUMBER_RE = /^[0-9]+(?:\.[0-9]+)*$/;
+/** A number, or a version such as 9.0.1 or v9.0. */
+const NUMBER_RE = /^v?[0-9]+(?:\.[0-9]+)*$/;
+/** Inline code spans, CommonMark style (matching backtick runs), as names.ts reads them. */
+const CODE_SPAN_RE = /(?<!`)(`+)(?!`)(.+?)(?<!`)\1(?!`)/g;
 
 const FENCE_OPEN_RE = /^ {0,3}(`{3,}|~{3,})/;
 const FENCE_CLOSE_RE = /^ {0,3}(`{3,}|~{3,})\s*$/;
@@ -340,37 +345,81 @@ export function listSuppressedBlocks(skillMd: string): SuppressedBlock[] {
 interface Change {
   readonly from: string;
   readonly to: string;
+  /** A number replacing a number, rather than a name replacing a name. */
+  readonly number: boolean;
 }
 
-function splitTokens(text: string): { tokens: string[]; seps: string[] } {
+interface Tokens {
+  readonly tokens: string[];
+  /** Offset of each token in the text. */
+  readonly starts: number[];
+  readonly seps: string[];
+  /** [start, end) of each inline code span's content. */
+  readonly spans: [number, number][];
+}
+
+function splitTokens(text: string): Tokens {
   const tokens: string[] = [];
+  const starts: number[] = [];
   const seps: string[] = [];
   let last = 0;
   for (const m of text.matchAll(TOKEN_RE)) {
     seps.push(text.slice(last, m.index));
     tokens.push(m[0]);
+    starts.push(m.index);
     last = m.index + m[0].length;
   }
   seps.push(text.slice(last));
-  return { tokens, seps };
+  // '.' does not match '\n', so a span never crosses a line, as in names.ts.
+  const spans: [number, number][] = [...text.matchAll(CODE_SPAN_RE)].map((m) => {
+    const start = m.index + m[1]!.length;
+    return [start, start + m[2]!.length];
+  });
+  return { tokens, starts, seps, spans };
 }
 
-/** A token without its markdown emphasis (`**512**`) and trailing punctuation or `:<line>`. */
-function unwrap(token: string): { pre: string; core: string; post: string } {
+/** Whether token `i` lies inside an inline code span. */
+function inCodeSpan(t: Tokens, i: number): boolean {
+  const start = t.starts[i]!;
+  const end = start + t.tokens[i]!.length;
+  return t.spans.some(([s, e]) => start >= s && end <= e);
+}
+
+interface Unwrapped {
+  readonly pre: string;
+  readonly core: string;
+  readonly post: string;
+}
+
+/** A token in a code span without a `:<line>` suffix (`src/db.c:120`). */
+function unwrapCode(token: string): Unwrapped {
+  const tail = /:\d+(?:-\d+)?$/.exec(token)?.[0] ?? '';
+  if (!tail || tail.length === token.length) return { pre: '', core: token, post: '' };
+  return { pre: '', core: token.slice(0, -tail.length), post: tail };
+}
+
+/**
+ * A token of prose without sentence punctuation and the markdown
+ * emphasis around it: `**512**.` and `**512.**` give `512`.
+ */
+function unwrapProse(token: string): Unwrapped {
+  let core = token;
   let pre = '';
   let post = '';
-  let core = token;
-  const lead = /^\*+/.exec(core)?.[0] ?? '';
-  const trail = /\*+$/.exec(core)?.[0] ?? '';
-  if (lead && trail && lead.length + trail.length < core.length) {
+  const cut = (re: RegExp) => {
+    const tail = re.exec(core)?.[0] ?? '';
+    if (tail && tail.length < core.length) {
+      post = tail + post;
+      core = core.slice(0, -tail.length);
+    }
+  };
+  cut(/[.:]+$/);
+  const lead = /^(?:\*+|_+)/.exec(core)?.[0] ?? '';
+  if (lead && core.length > 2 * lead.length && core.endsWith(lead)) {
     pre = lead;
-    post = trail;
-    core = core.slice(lead.length, core.length - trail.length);
-  }
-  const tail = /(?::\d+(?:-\d+)?|[.:]+)$/.exec(core)?.[0] ?? '';
-  if (tail && tail.length < core.length) {
-    post = tail + post;
-    core = core.slice(0, core.length - tail.length);
+    post = lead + post;
+    core = core.slice(lead.length, -lead.length);
+    cut(/[.:]+$/);
   }
   return { pre, core, post };
 }
@@ -394,18 +443,26 @@ function diffTokens(original: string, replacement: string): { changes: Change[] 
   const changes: Change[] = [];
   for (let i = 0; i < a.tokens.length; i++) {
     if (a.tokens[i] === b.tokens[i]) continue;
-    const x = unwrap(a.tokens[i]!);
-    const y = unwrap(b.tokens[i]!);
+    const code = inCodeSpan(a, i) && inCodeSpan(b, i);
+    const x = code ? unwrapCode(a.tokens[i]!) : unwrapProse(a.tokens[i]!);
+    const y = code ? unwrapCode(b.tokens[i]!) : unwrapProse(b.tokens[i]!);
+    const numbers = NUMBER_RE.test(x.core) && NUMBER_RE.test(y.core);
+    if (!code && !numbers) {
+      const looseNumber = (t: string) => NUMBER_RE.test(t.replace(/^[*_]+|[*_.:]+$/g, ''));
+      if (looseNumber(a.tokens[i]!) && looseNumber(b.tokens[i]!)) {
+        return { problem: `"${b.tokens[i]}" changes the markup or punctuation around "${a.tokens[i]}"` };
+      }
+      return { problem: `"${b.tokens[i]}" replaces "${a.tokens[i]}" outside a code span; only names in backticks and numbers may change` };
+    }
     if (x.pre !== y.pre || x.post !== y.post) {
       return { problem: `"${b.tokens[i]}" changes the markup or punctuation around "${a.tokens[i]}"` };
     }
-    const numbers = NUMBER_RE.test(x.core) && NUMBER_RE.test(y.core);
     const kx = nameKind(x.core);
     const ky = nameKind(y.core);
     if (!numbers && !(kx && ky && nameSort(kx) === nameSort(ky))) {
       return { problem: `"${b.tokens[i]}" replaces "${a.tokens[i]}", but only a code name can replace a code name of the same sort (file, identifier or config), or a number a number` };
     }
-    changes.push({ from: x.core, to: y.core });
+    changes.push({ from: x.core, to: y.core, number: numbers });
   }
   if (changes.length === 0) return { problem: 'the replacement is the same as the original' };
   return { changes };
@@ -420,6 +477,18 @@ function containsWord(text: string, word: string): boolean {
     const before = i > 0 ? text[i - 1]! : '';
     const after = text[i + word.length] ?? '';
     if ((!checkBefore || !WORD_CHAR_RE.test(before)) && (!checkAfter || !WORD_CHAR_RE.test(after))) return true;
+  }
+  return false;
+}
+
+/** Whether `num` occurs in `text` as a whole number: not part of a word or of a longer number (`9.0` is not in `9.0.1`). */
+function containsNumber(text: string, num: string): boolean {
+  for (let i = text.indexOf(num); i >= 0; i = text.indexOf(num, i + 1)) {
+    const before = text.slice(Math.max(0, i - 2), i);
+    const after = text.slice(i + num.length, i + num.length + 2);
+    if (WORD_CHAR_RE.test(before.slice(-1)) || /\d\.$/.test(before)) continue;
+    if (WORD_CHAR_RE.test(after.slice(0, 1)) || /^\.\d/.test(after)) continue;
+    return true;
   }
   return false;
 }
@@ -477,6 +546,7 @@ function changedComponents(from: string, to: string): string[] | null {
  */
 function supports(change: Change, c: Citation, line: string): boolean {
   const to = change.to;
+  if (change.number) return containsNumber(line, to);
   if (containsWord(line, to)) return true;
   switch (nameKind(to)) {
     case 'prefix': return containsWordStart(line, to.slice(0, -1));

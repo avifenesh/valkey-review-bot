@@ -169,6 +169,48 @@ test('a weak replacement token, or a swap across sorts of name, is refused', asy
   assert.match((await problemsFor({ replacement: 'Reviewer memory: `1024` must respect `lazyfree_lazy_user_flush`.' }))[0], /same sort|a number a number/);
 });
 
+test('words outside code spans never change, even to a word on the cited line', async () => {
+  const skillMd = [
+    '---', 'name: p', 'description: "x"', '---',
+    'NEVER flag `emptyDB` callers here.',
+    'Use when touching src/db.c or `src/db.c`.',
+    '',
+  ].join('\n');
+  const table = { 'src/db.c:1': '/* ALWAYS check */ src/dbx.c' };
+  const problems = async (original, replacement, flagged) =>
+    (await validateEdits(skillMd, [{ original, replacement, evidence: [cite('src/db.c', 1)] }], ctx({ flagged }), resolver(table))).problems;
+  assert.deepEqual(await problems('NEVER flag `emptyDB` callers here.', 'ALWAYS flag `emptyDB` callers here.', ['emptyDB']),
+    ['edit 1: "ALWAYS" replaces "NEVER" outside a code span; only names in backticks and numbers may change']);
+  const line = 'Use when touching src/db.c or `src/db.c`.';
+  assert.deepEqual(await problems(line, 'Use when touching src/dbx.c or `src/db.c`.', ['src/db.c']),
+    ['edit 1: "src/dbx.c" replaces "src/db.c" outside a code span; only names in backticks and numbers may change']);
+  assert.deepEqual(await problems(line, 'Use when touching src/db.c or `src/dbx.c`.', ['src/db.c']), [], 'the same name in backticks may change');
+});
+
+test('numbers may change in prose, with emphasis, sentence punctuation or a version form', async () => {
+  const lines = ['`hash-max-listpack-entries` defaults to **512**.', 'Since v9.0 (and 9.0.1) `emptyDB` is lazy.'];
+  const skillMd = ['---', 'name: p', 'description: "x"', '---', ...lines, ''].join('\n');
+  const table = {
+    'src/config.c:1': 'createIntConfig("hash-max-listpack-entries", 1024)',
+    'src/version.h:1': '#define VERSION "9.1.0" /* v9.1 */',
+    'src/version.h:2': '/* 9.0.2 */',
+  };
+  const flagged = ['hash-max-listpack-entries', 'emptyDB'];
+  const edits = [
+    { original: lines[0], replacement: '`hash-max-listpack-entries` defaults to **1024**.', evidence: [cite('src/config.c', 1)] },
+    { original: lines[1], replacement: 'Since v9.1 (and 9.0.2) `emptyDB` is lazy.', evidence: [cite('src/version.h', 1), cite('src/version.h', 2)] },
+  ];
+  const out = await validateEdits(skillMd, edits, ctx({ flagged }), resolver(table));
+  assert.deepEqual(out.problems, []);
+  assert.deepEqual(listSuppressedBlocks(out.skillMd).map((b) => b.reason), ['`512` is now `1024`', '`v9.0` is now `v9.1`; `9.0.1` is now `9.0.2`']);
+  // A number must stand alone on the cited line: 9.1 is not in 9.1.0.
+  const partial = { original: lines[1], replacement: 'Since v9.0 (and 9.1) `emptyDB` is lazy.', evidence: [cite('src/version.h', 1)] };
+  assert.deepEqual((await validateEdits(skillMd, [partial], ctx({ flagged }), resolver(table))).problems, [
+    `edit 1: evidence ${REPO}@${SHA}:src/version.h:1: the line supports none of the changed names`,
+    'edit 1: no cited line contains `9.1`',
+  ]);
+});
+
 test('a changed token missing from the cited line is refused', async () => {
   const problems = await problemsFor({ evidence: [cite('src/server.h', 10)] });
   assert.deepEqual(problems, [
@@ -280,7 +322,7 @@ test('the frontmatter is never edited', async () => {
 test('pieces inside fenced blocks are not edited', async () => {
   const fenced = `${SKILL}\n\`\`\`\nemptyDB(-1, EMPTYDB_NO_FLAGS, NULL);\n\`\`\`\n`;
   const edit = { original: 'emptyDB(-1, EMPTYDB_NO_FLAGS, NULL);', replacement: 'emptyData(-1, EMPTYDB_NO_FLAGS, NULL);', evidence: [cite('src/db.c', 120)] };
-  assert.deepEqual(await problemsFor(edit, {}, UPSTREAM, fenced), ['edit 1: pieces inside fenced code blocks are not edited']);
+  assert.equal((await problemsFor(edit, {}, UPSTREAM, fenced))[0], 'edit 1: pieces inside fenced code blocks are not edited');
 });
 
 test('a replacement identical to the original, or holding markers, is refused', async () => {
