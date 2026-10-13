@@ -14,9 +14,10 @@ const INPUT = {
 };
 
 /** `taken` lists the names other records' skills already hold in the registry. */
-function setup({ item, upsert, taken = [], exists, reinforced = { areaBucket: 'src', recordId: 'r1' }, updates = () => ({}) }) {
+function setup({ item, upsert, taken = [], exists, reinforced = { areaBucket: 'src', recordId: 'r1' }, edited = null, updates = () => ({}) }) {
   const run = newRun();
   run.reinforced = reinforced;
+  run.edited = edited;
   const ddb = fakeDdb({ GetCommand: () => ({ Item: item }), UpdateCommand: updates });
   const published = [];
   const lookups = [];
@@ -229,4 +230,53 @@ test('submit_skill adds the provenance sentence once, even to a description copi
   const out = parse(await submit.invoke({ ...INPUT, description: `${INPUT.description}\n\nGraduated from concern record_id=r1.` }));
   assert.equal(out.ok, true);
   assert.equal(published[0].description, `${INPUT.description}\n\nGraduated from concern record_id=r1.`);
+});
+
+test('update_concern on a graduated record lets the run re-publish its skill', async () => {
+  const { submit, published, run } = setup({
+    item: { area_bucket: 'src', record_id: 'r1', reinforcement_count: 5, graduated_record_name: 'original-name' },
+    reinforced: null,
+    edited: { areaBucket: 'src', recordId: 'r1' },
+  });
+  const out = parse(await submit.invoke(INPUT));
+  assert.equal(out.ok, true);
+  assert.equal(out.record_name, 'original-name');
+  assert.equal(published[0].name, 'original-name');
+  assert.deepEqual(run.actions, ['submit_skill r1']);
+});
+
+test('update_concern alone never graduates a record for the first time', async () => {
+  const { submit, ddb, published, run } = setup({
+    item: { area_bucket: 'src', record_id: 'r1', reinforcement_count: 5 },
+    reinforced: null,
+    edited: { areaBucket: 'src', recordId: 'r1' },
+  });
+  const out = parse(await submit.invoke(INPUT));
+  assert.equal(out.ok, false);
+  assert.match(out.error, /never graduated; a first graduation needs a bump or merge/);
+  assert.deepEqual(ddb.ops(), ['GetCommand'], 'nothing is claimed');
+  assert.equal(published.length, 0);
+  assert.equal(run.take('skill_submit', 'next'), null);
+});
+
+test('re-publication after update_concern still needs the threshold and the same record', async () => {
+  const low = setup({
+    item: { area_bucket: 'src', record_id: 'r1', reinforcement_count: 3, graduated_record_name: 'original-name' },
+    reinforced: null,
+    edited: { areaBucket: 'src', recordId: 'r1' },
+  });
+  const below = parse(await low.submit.invoke(INPUT));
+  assert.equal(below.ok, false);
+  assert.match(below.error, /has 3 reinforcements; graduation needs 4/);
+  assert.equal(low.published.length, 0);
+
+  const other = setup({
+    item: { area_bucket: 'src', record_id: 'r1', reinforcement_count: 9, graduated_record_name: 'original-name' },
+    reinforced: null,
+    edited: { areaBucket: 'src', recordId: 'r2' },
+  });
+  const out = parse(await other.submit.invoke(INPUT));
+  assert.equal(out.ok, false);
+  assert.match(out.error, /or a graduated record this run changed with update_concern/);
+  assert.equal(other.ddb.calls.length, 0);
 });

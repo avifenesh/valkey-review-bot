@@ -4,14 +4,16 @@ import { tool } from '@strands-agents/sdk';
 import { UpdateCommand } from '@aws-sdk/lib-dynamodb';
 import { GRADUATED_SKILL_MAX_CHARS, type UpsertSkillInput } from '../../../common/src/skills-registry.js';
 import { getRecord, reservedBucketError, type ConcernsDeps } from './concerns-ddb.js';
-import { errorText, fail, ok } from './run.js';
+import { errorText, fail, ok, type TouchedRecord } from './run.js';
 
 /**
  * Graduate a concern into the reviewer's skills registry.
  *
  * The gate is enforced here, not by the prompt: the source must be the
- * record this run bumped or merged into, and its stored
- * reinforcement_count must reach the threshold. The record name is
+ * record this run bumped or merged into, or a graduated record whose
+ * skill this run's update_concern corrected (an update, never a first
+ * graduation), and its stored reinforcement_count must reach the
+ * threshold. The record name is
  * written onto the source record before publishing, so a later
  * graduation of the same record updates that skill (upsert by name)
  * instead of adding a second one under a different slug.
@@ -110,6 +112,11 @@ async function firstFreeName(registry: SkillPublisher, candidates: readonly stri
   return null;
 }
 
+/** Whether `touched` is the record the input names. */
+function isRecord(touched: TouchedRecord | null, input: { area_bucket: string; source_record_id: string }): boolean {
+  return touched !== null && touched.areaBucket === input.area_bucket && touched.recordId === input.source_record_id;
+}
+
 function isConditionFailure(err: unknown): boolean {
   return (err as { name?: string } | null)?.name === 'ConditionalCheckFailedException';
 }
@@ -119,7 +126,7 @@ export function buildSubmitSkillTool(deps: SubmitSkillDeps) {
   return tool({
     name: 'submit_skill',
     description:
-`Publish a graduated skill to this reviewer's skills registry. Allowed once per run, only for the record this run bumped or merged into, and only when that record's reinforcement_count is at least ${threshold}; the tool checks both against the store.
+`Publish a graduated skill to this reviewer's skills registry, or update the skill a record published before. Allowed once per run, for the record this run bumped or merged into, or for a graduated record this run changed with update_concern (an update only, never a first graduation). The record's reinforcement_count must be at least ${threshold}. The tool checks all of this against the store.
 
 Inputs:
 - \`area_bucket\`, \`source_record_id\`: the record being graduated.
@@ -143,9 +150,9 @@ Do not delete the source record afterwards; it stays as the skill's provenance.`
       if (busy) return fail(busy);
       let published = false;
       try {
-        const reinforced = run.reinforced;
-        if (!reinforced || reinforced.areaBucket !== input.area_bucket || reinforced.recordId !== input.source_record_id) {
-          return fail('submit_skill: only the record this run bumped or merged into can graduate');
+        const reinforced = isRecord(run.reinforced, input);
+        if (!reinforced && !isRecord(run.edited, input)) {
+          return fail('submit_skill: only the record this run bumped or merged into can graduate, or a graduated record this run changed with update_concern');
         }
         const source = await getRecord(deps, input.area_bucket, input.source_record_id);
         if (!source) return fail(`submit_skill: record ${input.source_record_id} does not exist in ${input.area_bucket}`);
@@ -155,6 +162,10 @@ Do not delete the source record afterwards; it stays as the skill's provenance.`
         }
 
         let recordName = typeof source.graduated_record_name === 'string' ? source.graduated_record_name : '';
+        if (!reinforced && !recordName) {
+          // update_concern is not a reinforcement: it can correct a skill, not create one.
+          return fail(`submit_skill: record ${input.source_record_id} never graduated; a first graduation needs a bump or merge in this run`);
+        }
         if (!recordName) {
           const slug = slugify(input.subject);
           const candidates = [slug, suffixedName(slug, input.source_record_id)];
