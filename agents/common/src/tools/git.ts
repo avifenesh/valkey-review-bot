@@ -202,14 +202,16 @@ export function gitArgv(args: readonly string[]): string[] {
 }
 
 /**
- * Environment for the git process: no credentials, no system gitconfig
- * (which could define helpers), no index refresh on `git status`, and
- * no credential prompt when a lazy blob fetch needs the network.
+ * Environment for the git process: no credentials, no system or global
+ * gitconfig (which could define helpers), no index refresh on
+ * `git status`, and no credential prompt when a lazy blob fetch needs
+ * the network.
  */
 function gitEnv(): NodeJS.ProcessEnv {
   return {
     ...buildChildEnv(),
     GIT_CONFIG_NOSYSTEM: '1',
+    GIT_CONFIG_GLOBAL: '/dev/null',
     GIT_OPTIONAL_LOCKS: '0',
     GIT_TERMINAL_PROMPT: '0',
   };

@@ -16,14 +16,63 @@ import {
   defaultNodeWriteOperations,
   InMemoryLedger,
   InMemoryCache,
+  isInsideAnyRoot,
+  matchesAnyPattern,
   type PermissionPolicy,
+  type WriteOperations,
 } from '@agent-sh/harness-core';
+import { realpath } from 'node:fs/promises';
+import path from 'node:path';
 import { createSpawnLspClient, type LspManifest } from '@agent-sh/harness-tools/lsp';
 import { adaptHarnessTool } from './adapter.js';
 
 export interface HarnessToolsBundle {
   readonly tools: readonly unknown[];
   readonly workspaceRoot: string;
+}
+
+/** The real path of `target`'s nearest existing ancestor, joined with the rest of `target`. */
+async function realpathOfExisting(target: string): Promise<string> {
+  const rest: string[] = [];
+  let p = path.resolve(target);
+  for (;;) {
+    try {
+      return path.join(await realpath(p), ...rest);
+    } catch (err) {
+      const parent = path.dirname(p);
+      if (parent === p) throw err;
+      rest.unshift(path.basename(p));
+      p = parent;
+    }
+  }
+}
+
+/**
+ * harness-write checks a path that does not exist yet without resolving
+ * the symlinks in it, so a write or mkdir under a directory symlink from
+ * the PR would land wherever the symlink points. Check where each one
+ * really lands, and refuse it outside the workspace or on a sensitive
+ * path such as .git/hooks.
+ */
+function fenceWriteOps(inner: WriteOperations, root: string, sensitivePatterns: readonly string[]): WriteOperations {
+  let realRoot: Promise<string> | undefined;
+  const check = async (target: string, what: string) => {
+    realRoot ??= realpath(root);
+    const resolved = await realpathOfExisting(target);
+    if (!isInsideAnyRoot(resolved, [await realRoot]) || matchesAnyPattern(resolved, sensitivePatterns)) {
+      throw new Error(`refusing to ${what} ${target}: it resolves to ${resolved}, outside the workspace or on a sensitive path`);
+    }
+  };
+  return {
+    async writeAtomic(target, bytes) {
+      await check(target, 'write');
+      return inner.writeAtomic(target, bytes);
+    },
+    async mkdirp(dir) {
+      await check(dir, 'create');
+      return inner.mkdirp(dir);
+    },
+  };
 }
 
 export async function buildHarnessTools(opts: { workspaceRoot: string; allowWrite?: boolean }): Promise<HarnessToolsBundle> {
@@ -41,7 +90,7 @@ export async function buildHarnessTools(opts: { workspaceRoot: string; allowWrit
   };
 
   const ops = defaultNodeOperations();
-  const writeOps = defaultNodeWriteOperations();
+  const writeOps = fenceWriteOps(defaultNodeWriteOperations(), opts.workspaceRoot, permissions.sensitivePatterns);
 
   const readSession = { cwd: opts.workspaceRoot, permissions, ops, cache: readCache, ledger };
   const grepSession = { cwd: opts.workspaceRoot, permissions, ops };
