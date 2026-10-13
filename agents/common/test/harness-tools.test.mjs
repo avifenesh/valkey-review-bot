@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, symlinkSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import test from 'node:test';
@@ -47,4 +47,20 @@ test('write refuses a new file in .git reached through a symlink', async () => {
   const { ws, write } = await setup();
   assert.match(await write('gitlink/hooks/post-checkout', '#!/bin/sh\n'), /^ERROR/);
   assert.equal(existsSync(path.join(ws, '.git', 'hooks', 'post-checkout')), false);
+});
+
+test('grep leaves out matches in files on the sensitive-path list', async () => {
+  const ws = tempDir('harness-grep-');
+  mkdirSync(path.join(ws, 'src'));
+  mkdirSync(path.join(ws, 'certs'));
+  writeFileSync(path.join(ws, 'src', 'a.c'), 'needle\n');
+  writeFileSync(path.join(ws, 'certs', 'server.pem'), 'needle\n');
+  writeFileSync(path.join(ws, 'certs', 'server.key'), 'needle\n');
+  const { tools } = await buildHarnessTools({ workspaceRoot: ws });
+  const grep = tools.find((t) => t.name === 'grep');
+  for (const output_mode of ['files_with_matches', 'content', 'count']) {
+    const out = await grep.invoke({ pattern: 'needle', output_mode });
+    assert.match(out, /a\.c/, output_mode);
+    assert.doesNotMatch(out, /server\.(pem|key)/, output_mode);
+  }
 });

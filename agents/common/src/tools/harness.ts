@@ -6,9 +6,10 @@ import {
   read, readToolDefinition,
   write, writeToolDefinition, edit, editToolDefinition,
   multiEdit, multieditToolDefinition,
-  grep, grepToolDefinition,
+  grep, grepToolDefinition, defaultGrepEngine,
   glob, globToolDefinition,
   lsp, lspToolDefinition,
+  type GrepEngine,
   type TextReadResult,
 } from '@agent-sh/harness-tools';
 import {
@@ -75,6 +76,21 @@ function fenceWriteOps(inner: WriteOperations, root: string, sensitivePatterns: 
   };
 }
 
+/**
+ * harness-grep checks the sensitive patterns against the search root
+ * only. Drop matches in files that match them, as read refuses those.
+ */
+function fenceGrepEngine(inner: GrepEngine, sensitivePatterns: readonly string[]): GrepEngine {
+  return {
+    async *search(input) {
+      for await (const m of inner.search(input)) if (!matchesAnyPattern(m.path, sensitivePatterns)) yield m;
+    },
+    async *count(input) {
+      for await (const c of inner.count(input)) if (!matchesAnyPattern(c.path, sensitivePatterns)) yield c;
+    },
+  };
+}
+
 export async function buildHarnessTools(opts: { workspaceRoot: string; allowWrite?: boolean }): Promise<HarnessToolsBundle> {
   const roots = [opts.workspaceRoot] as const;
   const ledger = new InMemoryLedger();
@@ -93,7 +109,7 @@ export async function buildHarnessTools(opts: { workspaceRoot: string; allowWrit
   const writeOps = fenceWriteOps(defaultNodeWriteOperations(), opts.workspaceRoot, permissions.sensitivePatterns);
 
   const readSession = { cwd: opts.workspaceRoot, permissions, ops, cache: readCache, ledger };
-  const grepSession = { cwd: opts.workspaceRoot, permissions, ops };
+  const grepSession = { cwd: opts.workspaceRoot, permissions, ops, engine: fenceGrepEngine(defaultGrepEngine, permissions.sensitivePatterns) };
   const globSession = { cwd: opts.workspaceRoot, permissions, ops };
   const writeSession = { cwd: opts.workspaceRoot, permissions, ops, writeOps, ledger };
 
