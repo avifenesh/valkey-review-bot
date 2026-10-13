@@ -145,6 +145,22 @@ export function githubApi(token: string, fetchImpl: typeof fetch = fetch): GitHu
   };
 }
 
+/**
+ * The App's installation on one repository: its id and the login of the
+ * account it belongs to. `api` must be authenticated as the App (JWT).
+ * Undefined when the App is not installed on the repository.
+ */
+export async function fetchRepoInstallation(api: GitHubApi, repo: string): Promise<{ id: number; account: string } | undefined> {
+  const { status, json } = await api('GET', `repos/${repo}/installation`);
+  if (status === 404) return undefined;
+  if (status !== 200) throw new Error(`GET repos/${repo}/installation returned ${status}`);
+  const i = json as { id?: unknown; account?: { login?: unknown } | null };
+  if (typeof i.id !== 'number' || typeof i.account?.login !== 'string') {
+    throw new Error(`GET repos/${repo}/installation returned no installation id or account`);
+  }
+  return { id: i.id, account: i.account.login };
+}
+
 export interface ReviewComment {
   readonly body: string;
   readonly author?: string;
