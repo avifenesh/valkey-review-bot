@@ -31,6 +31,14 @@ import { errorText, fail, ok, type CuratorRun } from './run.js';
  *   decay_score, updated_at           1.0 and the time of the last reinforcement; ops/src/decay.ts lowers the score
  *   edited_at                         last area/context edit that was not a reinforcement
  *   graduated_record_name, graduated_at   set by submit_skill
+ *   skill_generation                  generation of the published skill, 1 when absent
+ *   retired_at, retired_reason        the skill was retired (decayed, obsolete or operator);
+ *                                     the record stays as a tombstone
+ *   verified_*, check_*, stale_names  the release check's last result
+ *
+ * The release check and the decay job keep more attributes on a
+ * record (audit_names, ignored_names, verified_sha, pending_revision,
+ * previous_skill_md, maintenance_*). recordView never shows them.
  */
 
 export interface ConcernsDeps {
@@ -112,6 +120,34 @@ export function reservedBucketError(toolName: string, areaBucket: string): strin
     : null;
 }
 
+function isRetired(item: Item): boolean {
+  return graduatedName(item) !== '' && item.retired_at !== undefined;
+}
+
+function stringList(value: unknown): string[] | undefined {
+  if (value instanceof Set) return [...value].map(String).sort();
+  return Array.isArray(value) ? value.map(String) : undefined;
+}
+
+/**
+ * The lifecycle state of a graduated record's skill. The check's other
+ * attributes (the name baseline, pending edits, the old text, claims)
+ * are for the operator and the check itself, not for the model.
+ */
+function skillView(item: Item): Record<string, unknown> {
+  return {
+    graduated_record_name: graduatedName(item),
+    graduated_at: item.graduated_at,
+    skill_state: isRetired(item) ? 'retired' : 'live',
+    retired_reason: item.retired_reason,
+    verified_release: item.verified_release,
+    verified_at: item.verified_at,
+    check_outcome: item.check_outcome,
+    check_note: item.check_note,
+    stale_names: stringList(item.stale_names),
+  };
+}
+
 /**
  * What the model sees of a record. The reinforcers set holds GitHub
  * logins, which must not end up in records or skills, so only its size
@@ -129,7 +165,7 @@ export function recordView(item: Item): Record<string, unknown> {
     distinct_reinforcers: reinforcers(item).size,
     decay_score: item.decay_score,
     updated_at: item.updated_at,
-    ...(graduatedName(item) ? { graduated_record_name: graduatedName(item), graduated_at: item.graduated_at } : {}),
+    ...(graduatedName(item) ? skillView(item) : {}),
   };
 }
 
@@ -287,7 +323,7 @@ export function buildListConcernsTool(deps: ConcernsDeps) {
   return tool({
     name: 'list_concerns',
     description:
-`List the concern records in one area_bucket, most reinforced first. Returns up to ${LIST_LIMIT} records and the bucket's total.
+`List the concern records in one area_bucket, most reinforced first, with records whose skill was retired after the rest. Returns up to ${LIST_LIMIT} records and the bucket's total.
 
 Call it with each candidate bucket derived from the anchor path and the touched files, and read the records before deciding.`,
     inputSchema: z.object({ area_bucket: areaBucketField }),
@@ -307,7 +343,9 @@ Call it with each candidate bucket derived from the anchor path and the touched 
           items.push(...(page.Items ?? []).filter((item) => !isReservedBucket(item.area_bucket)));
           startKey = page.LastEvaluatedKey;
         } while (startKey);
-        items.sort((a, b) => count(b) - count(a) || String(b.updated_at ?? '').localeCompare(String(a.updated_at ?? '')));
+        items.sort((a, b) => Number(isRetired(a)) - Number(isRetired(b))
+          || count(b) - count(a)
+          || String(b.updated_at ?? '').localeCompare(String(a.updated_at ?? '')));
         return ok({ area_bucket: input.area_bucket, total: items.length, records: items.slice(0, LIST_LIMIT).map(recordView) });
       } catch (err) {
         return fail(`list_concerns: ${errorText(err)}`);

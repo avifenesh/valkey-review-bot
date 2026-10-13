@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import { buildConcernsTools, LIST_LIMIT } from '../dist/curator/src/tools/concerns-ddb.js';
+import { buildConcernsTools, LIST_LIMIT, recordView } from '../dist/curator/src/tools/concerns-ddb.js';
 import { buildCuratorDoneTool } from '../dist/curator/src/tools/done.js';
 import {
   assertPlaceholdersMatch, conditionFailed, conditionHolds, fakeDdb, newRun, parse, REINFORCER, transactionCanceled,
@@ -388,4 +388,77 @@ test('list_concerns never returns an item from a reserved bucket', async () => {
   const out = parse(await tools(ddb).list_concerns.invoke({ area_bucket: 'src' }));
   assert.equal(out.total, 1);
   assert.deepEqual(out.records.map((r) => r.record_id), ['r1']);
+});
+
+/** A graduated record carrying everything the release check and the decay job keep on it. */
+const checked = (id, count, extra = {}) => record(id, count, {
+  graduated_record_name: `skill-${id}`,
+  graduated_at: '2026-02-01T00:00:00.000Z',
+  verified_release: '9.1.2',
+  verified_at: '2026-03-01T00:00:00.000Z',
+  verified_sha: 'a'.repeat(40),
+  verified_ref: `unstable@${'a'.repeat(12)}`,
+  check_outcome: 'suspect',
+  check_note: '1 of 9 names missing at unstable@aaaaaaaaaaaa: `emptyDB`',
+  stale_names: new Set(['emptyDB', 'dictScan']),
+  stale_since: '2026-03-01T00:00:00.000Z',
+  audit_names: new Set(['src/server.c', 'emptyDB']),
+  ignored_names: new Set(['VM_Foo']),
+  pending_revision: { verdict: 'revise', summary: 'model prose', edits: [] },
+  previous_skill_md: '---\nname: old\n---\nold body',
+  revised_at: '2026-03-01T00:00:00.000Z',
+  obsolete_release: '9.1.2',
+  skill_generation: 2,
+  previous_record_name: 'skill-old',
+  maintenance_id: 'check#valkey-review#r1#2026-03-01T00:00:00.000Z',
+  maintenance_requested_at: '2026-03-01T00:00:00.000Z',
+  maintenance_reason: 'check',
+  maintenance_deprecating: `skill-${id}`,
+  ...extra,
+});
+
+test('recordView shows a graduated record\'s skill state and hides the check\'s own attributes', () => {
+  const view = recordView(checked('r1', 5));
+  assert.equal(view.skill_state, 'live');
+  assert.equal(view.graduated_record_name, 'skill-r1');
+  assert.equal(view.verified_release, '9.1.2');
+  assert.equal(view.verified_at, '2026-03-01T00:00:00.000Z');
+  assert.equal(view.check_outcome, 'suspect');
+  assert.match(view.check_note, /`emptyDB`/);
+  assert.deepEqual(view.stale_names, ['dictScan', 'emptyDB'], 'a string set is shown as a sorted list');
+  assert.equal(view.retired_reason, undefined);
+  for (const hidden of [
+    'audit_names', 'ignored_names', 'verified_sha', 'verified_ref', 'pending_revision', 'previous_skill_md', 'revised_at',
+    'stale_since', 'obsolete_release', 'skill_generation', 'previous_record_name',
+    'maintenance_id', 'maintenance_requested_at', 'maintenance_reason', 'maintenance_deprecating',
+  ]) {
+    assert.ok(!(hidden in view), hidden);
+  }
+  const text = JSON.stringify(view);
+  assert.doesNotMatch(text, /model prose|old body|VM_Foo|maintenance/);
+
+  const retired = recordView(checked('r2', 5, { retired_at: '2026-04-01T00:00:00.000Z', retired_reason: 'decayed' }));
+  assert.equal(retired.skill_state, 'retired');
+  assert.equal(retired.retired_reason, 'decayed');
+
+  const never = recordView(record('r3', 2, { retired_at: 'stray', check_note: 'stray' }));
+  for (const field of ['graduated_record_name', 'skill_state', 'retired_reason', 'check_note', 'stale_names']) {
+    assert.ok(!(field in never), `a record that never graduated has no ${field}`);
+  }
+});
+
+test('list_concerns puts records with a retired skill after the live ones', async () => {
+  const ddb = fakeDdb({
+    QueryCommand: () => ({
+      Items: [
+        checked('tomb', 9, { retired_at: '2026-04-01T00:00:00.000Z', retired_reason: 'decayed' }),
+        record('plain', 1),
+        checked('live', 4),
+        checked('tomb2', 2, { retired_at: '2026-04-01T00:00:00.000Z', retired_reason: 'operator' }),
+      ],
+    }),
+  });
+  const out = parse(await tools(ddb).list_concerns.invoke({ area_bucket: 'src' }));
+  assert.deepEqual(out.records.map((r) => r.record_id), ['live', 'plain', 'tomb', 'tomb2']);
+  assert.deepEqual(out.records.map((r) => r.skill_state), ['live', undefined, 'retired', 'retired']);
 });
