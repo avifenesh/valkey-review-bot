@@ -26,6 +26,8 @@ import { isRepoName, latestReleaseTag, RELEASE_TAG_RE } from './releases.js';
  * the curator queue, CURATOR_QUEUE_URL (see MaintenanceMessage):
  * - "retire" when its score falls below the floor. With RETIRE_SKILLS
  *   off, without a queue, or in a dry run, it only logs would-retire.
+ *   Once the curator has refused a retirement (retire_refused_at), the
+ *   record is left out for RETIRE_REFUSED_BACKOFF_SECONDS.
  * - "check" when a fact check is due: the record was never checked, it
  *   was re-published since its last check, the highest GA release of
  *   the reviewer's upstream differs from the one it was checked at, or
@@ -70,6 +72,8 @@ export interface DecayConfig {
   readonly retireSkills: boolean;
   /** Retire requests per reviewer per pass. */
   readonly maxRetirementsPerDay: number;
+  /** A record whose retirement the curator refused (retire_refused_at) is not requested again for this long. */
+  readonly retireRefusedBackoffSeconds: number;
 }
 
 const DAY_SECONDS = 24 * 3600;
@@ -79,6 +83,7 @@ const DEFAULT_FLOOR = 0.05;
 const DEFAULT_RECHECK_SECONDS = 90 * DAY_SECONDS;
 const DEFAULT_CHECKS_PER_DAY = 10;
 const DEFAULT_MAX_RETIREMENTS_PER_DAY = 3;
+const DEFAULT_RETIRE_REFUSED_BACKOFF_SECONDS = 30 * DAY_SECONDS;
 
 /** A maintenance request younger than this is in flight: the record gets no new one. */
 export const MAINTENANCE_RETRY_DAYS = 7;
@@ -166,6 +171,7 @@ export function loadDecayConfig(env: Env): DecayConfig {
     recheckSeconds: positiveNumber(env, 'SKILL_RECHECK_SECONDS', DEFAULT_RECHECK_SECONDS),
     retireSkills,
     maxRetirementsPerDay: integerSetting(env, 'MAX_RETIREMENTS_PER_DAY', DEFAULT_MAX_RETIREMENTS_PER_DAY, 1),
+    retireRefusedBackoffSeconds: positiveNumber(env, 'RETIRE_REFUSED_BACKOFF_SECONDS', DEFAULT_RETIRE_REFUSED_BACKOFF_SECONDS),
   };
 }
 
@@ -225,6 +231,15 @@ export interface CheckMessage {
   readonly dry_run: boolean;
 }
 
+/**
+ * When the registry refuses the deprecation, the curator SETs
+ * retire_refused_at (ISO time) in the write that releases the claim. The
+ * pass then requests no retirement of the record for
+ * RETIRE_REFUSED_BACKOFF_SECONDS (30 days by default), so a skill the
+ * registry will not deprecate does not take a slot of
+ * MAX_RETIREMENTS_PER_DAY every day. It only reads the age of the
+ * attribute: the curator may leave it or REMOVE it later.
+ */
 export interface RetireMessage {
   /** "retire#<reviewer_id>#<record_id>#<ISO time of the pass>", at most 200 characters. */
   readonly maintenance_id: string;
@@ -374,6 +389,8 @@ export interface Stats {
   readonly wouldRetire: number;
   /** Candidates over a per-pass cap; they are due again at the next pass. */
   readonly deferred: number;
+  /** Retirement candidates left alone because the curator refused their retirement lately. */
+  readonly retireBackoff: number;
   /** Items in reserved buckets other than REPO_SKILL_KEY, left unwritten. */
   readonly reserved: number;
 }
@@ -381,7 +398,7 @@ export interface Stats {
 export function summaryLine(s: Stats): string {
   return `[decay] ${s.table} scanned=${s.scanned} decayed=${s.decayed} deleted=${s.deleted} skipped=${s.skipped} errors=${s.errors}`
     + ` kept_retired=${s.keptRetired} checks_requested=${s.checksRequested} retire_requested=${s.retireRequested}`
-    + ` would_retire=${s.wouldRetire} deferred=${s.deferred} reserved=${s.reserved}`;
+    + ` would_retire=${s.wouldRetire} deferred=${s.deferred} retire_backoff=${s.retireBackoff} reserved=${s.reserved}`;
 }
 
 function isConditionFailure(err: unknown): boolean {
@@ -426,6 +443,7 @@ const SCAN_ATTRIBUTES = {
   '#va': 'verified_at',
   '#vr': 'verified_release',
   '#mra': 'maintenance_requested_at',
+  '#rra': 'retire_refused_at',
 } as const;
 
 const stringOrEmpty = (value: unknown): string => (typeof value === 'string' ? value : '');
@@ -500,6 +518,7 @@ export async function decayTable(
   let retireRequested = 0;
   let wouldRetire = 0;
   let deferred = 0;
+  let retireBackoff = 0;
   let reserved = 0;
   let cursor: Record<string, unknown> | undefined;
   const nowIso = new Date(nowMs).toISOString();
@@ -709,7 +728,15 @@ export async function decayTable(
       const requestedMs = Date.parse(stringOrEmpty(item.maintenance_requested_at));
       const inFlight = Number.isFinite(requestedMs) && nowMs - requestedMs < MAINTENANCE_RETRY_DAYS * DAY_SECONDS * 1000;
       if (!inFlight && nextScore < config.floor) {
-        if (!retireOn || queueable(record, name)) {
+        // A refused retirement is not requested again for a while, so it
+        // does not take a slot from the other candidates every day.
+        const refusedAt = stringOrEmpty(item.retire_refused_at);
+        const leftMs = Date.parse(refusedAt) + config.retireRefusedBackoffSeconds * 1000 - nowMs;
+        if (leftMs > 0) {
+          retireBackoff += 1;
+          console.log(`[decay] retire-backoff ${recordRef(tableName, key)} name=${quoted(name)} score=${nextScore.toFixed(4)}`
+            + ` refused_at=${quoted(refusedAt)} retry_in=${Math.ceil(leftMs / (DAY_SECONDS * 1000))}d`);
+        } else if (!retireOn || queueable(record, name)) {
           retirements.push({ ...record, name, retireReason: stringOrEmpty(item.obsolete_release) ? 'obsolete' : 'decayed' });
           continue;
         }
@@ -816,7 +843,10 @@ export async function decayTable(
     }
   }
 
-  return { table: tableName, scanned, decayed, deleted, skipped, errors, keptRetired, checksRequested, retireRequested, wouldRetire, deferred, reserved };
+  return {
+    table: tableName, scanned, decayed, deleted, skipped, errors, keptRetired, checksRequested, retireRequested, wouldRetire, deferred,
+    retireBackoff, reserved,
+  };
 }
 
 /**

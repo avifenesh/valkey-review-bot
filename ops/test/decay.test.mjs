@@ -16,7 +16,7 @@ const CONFIG = { tables: { 'valkey-review': 'concerns' }, halfLifeSeconds: HALF_
 const GRADUATED_HALF_LIFE = 180 * DAY;
 const LIFECYCLE = { ...CONFIG, graduatedHalfLifeSeconds: GRADUATED_HALF_LIFE };
 // Stats fields for skill maintenance and reserved items, all zero for a table with nothing to queue.
-const NOTHING_QUEUED = { keptRetired: 0, checksRequested: 0, retireRequested: 0, wouldRetire: 0, deferred: 0, reserved: 0 };
+const NOTHING_QUEUED = { keptRetired: 0, checksRequested: 0, retireRequested: 0, wouldRetire: 0, deferred: 0, retireBackoff: 0, reserved: 0 };
 
 test('the score halves every half-life', () => {
   assert.equal(decayedScore(1, 0, HALF_LIFE), 1);
@@ -51,6 +51,7 @@ test('configuration is validated', () => {
     recheckSeconds: 90 * DAY,
     retireSkills: false,
     maxRetirementsPerDay: 3,
+    retireRefusedBackoffSeconds: 30 * DAY,
   });
   // Checks are on by default; a missing queue does not stop the job (see runDecay).
   const noQueue = loadDecayConfig({ CONCERNS_TABLES_JSON: tables, RETIRE_SKILLS: 'true' });
@@ -271,6 +272,7 @@ test('the scan projects exactly the attributes the pass reads', async () => {
     'maintenance_requested_at',
     'obsolete_release',
     'record_id',
+    'retire_refused_at',
     'retired_at',
     'updated_at',
     'verified_at',
@@ -288,6 +290,7 @@ const FULL = {
   recheckSeconds: 90 * DAY,
   retireSkills: true,
   maxRetirementsPerDay: 3,
+  retireRefusedBackoffSeconds: 30 * DAY,
 };
 const NOW_ISO = new Date(NOW).toISOString();
 
@@ -415,6 +418,54 @@ test('retirements go lowest score first, within maxRetirementsPerDay, with reaso
   assert.equal(stats.decayed, 5, 'deferred candidates still get their score');
   const deferredLines = log.mock.calls.map((c) => c.arguments[0]).filter((l) => l.startsWith('[decay] deferred'));
   assert.deepEqual(deferredLines.map((l) => /\bid="([^"]*)"/.exec(l)?.[1]), ['d900', 'd800']);
+});
+
+test('a retirement the curator refused is not requested again for the back-off period', async (t) => {
+  const log = quietLogs(t);
+  const { ctx } = maintenance();
+  // The refused records have the lowest scores, so without the back-off
+  // they would take both slots.
+  const ddb = table([
+    faded('refused-1d', { updated_at: daysAgo(3000), retire_refused_at: daysAgo(1) }),
+    faded('refused-29d', { updated_at: daysAgo(3000), retire_refused_at: daysAgo(29.5) }),
+    faded('refused-31d', { updated_at: daysAgo(2500), retire_refused_at: daysAgo(31) }),
+    faded('bad-time', { updated_at: daysAgo(2000), retire_refused_at: 'soon' }),
+    faded('other', { updated_at: daysAgo(1500) }),
+  ]);
+  const stats = await decayTable(ddb, 'concerns', { ...FULL, maxRetirementsPerDay: 2 }, NOW, ctx);
+
+  assert.deepEqual(bodies(ctx.sqs).map((b) => b.record_id), ['refused-31d', 'bad-time']);
+  assert.equal(stats.retireBackoff, 2);
+  assert.equal(stats.retireRequested, 2);
+  assert.equal(stats.deferred, 1);
+  assert.equal(stats.decayed, 5, 'records in back-off still get their score');
+  const plain = ddb.writes.filter((w) => w.input.UpdateExpression === 'SET #ds = :s, #da = :now').map((w) => w.input.Key.record_id);
+  assert.deepEqual(plain.sort(), ['other', 'refused-1d', 'refused-29d']);
+  const lines = log.mock.calls.map((c) => c.arguments[0]).filter((l) => l.startsWith('[decay] retire-backoff '));
+  assert.equal(lines.length, 2);
+  assert.match(lines[0], /^\[decay\] retire-backoff concerns bucket="src" id="refused-1d" name="skill-refused-1d" score=0\.\d{4} refused_at="[^"]+" retry_in=29d$/);
+  assert.equal(lines[0].match(/refused_at="([^"]+)"/)[1], daysAgo(1));
+  assert.match(lines[1], / id="refused-29d" .* retry_in=1d$/);
+
+  // The period is configurable, and applies in report mode too.
+  const short = maintenance();
+  const again = table([faded('refused-1d', { retire_refused_at: daysAgo(1) }), faded('refused-6d', { retire_refused_at: daysAgo(6) })]);
+  const shortStats = await decayTable(again, 'concerns', { ...FULL, retireRefusedBackoffSeconds: 5 * DAY }, NOW, short.ctx);
+  assert.deepEqual(bodies(short.ctx.sqs).map((b) => b.record_id), ['refused-6d']);
+  assert.equal(shortStats.retireBackoff, 1);
+  const report = maintenance({ dryRun: true });
+  const reportStats = await decayTable(table([faded('refused-1d', { retire_refused_at: daysAgo(1) })]), 'concerns', FULL, NOW, report.ctx);
+  assert.equal(reportStats.wouldRetire, 0);
+  assert.equal(reportStats.retireBackoff, 1);
+});
+
+test('a refusal does not stop the checks of a record above the floor', async (t) => {
+  quietLogs(t);
+  const { ctx } = maintenance();
+  const ddb = table([live('r', { verified_at: undefined, retire_refused_at: daysAgo(1) })]);
+  const stats = await decayTable(ddb, 'concerns', FULL, NOW, ctx);
+  assert.deepEqual(bodies(ctx.sqs).map((b) => [b.record_id, b.reason]), [['r', 'check']]);
+  assert.equal(stats.retireBackoff, 0);
 });
 
 test('each check-due rule queues a check, and a record checked at the current release is left alone', async (t) => {
@@ -682,9 +733,9 @@ test('report lines strip invisible format and line-separator characters from tab
 test('the summary line names every counter', () => {
   const line = summaryLine({
     table: 'valkey_review_concerns', scanned: 9, decayed: 5, deleted: 1, skipped: 1, errors: 0,
-    keptRetired: 2, checksRequested: 3, retireRequested: 1, wouldRetire: 0, deferred: 4, reserved: 6,
+    keptRetired: 2, checksRequested: 3, retireRequested: 1, wouldRetire: 0, deferred: 4, retireBackoff: 7, reserved: 6,
   });
-  assert.equal(line, '[decay] valkey_review_concerns scanned=9 decayed=5 deleted=1 skipped=1 errors=0 kept_retired=2 checks_requested=3 retire_requested=1 would_retire=0 deferred=4 reserved=6');
+  assert.equal(line, '[decay] valkey_review_concerns scanned=9 decayed=5 deleted=1 skipped=1 errors=0 kept_retired=2 checks_requested=3 retire_requested=1 would_retire=0 deferred=4 retire_backoff=7 reserved=6');
 });
 
 test('the manual event turns on recheck_all and dry_run only when set to true', () => {
@@ -777,7 +828,12 @@ test('skill maintenance settings are validated', () => {
     recheckSeconds: 30 * DAY,
     retireSkills: true,
     maxRetirementsPerDay: 5,
+    retireRefusedBackoffSeconds: 30 * DAY,
   });
+  assert.equal(loadDecayConfig({ ...on, RETIRE_REFUSED_BACKOFF_SECONDS: String(7 * DAY) }).retireRefusedBackoffSeconds, 7 * DAY);
+  for (const bad of ['0', '-1', 'month']) {
+    assert.throws(() => loadDecayConfig({ ...on, RETIRE_REFUSED_BACKOFF_SECONDS: bad }), /RETIRE_REFUSED_BACKOFF_SECONDS must be a number greater than 0/, bad);
+  }
   assert.deepEqual(loadDecayConfig({ ...base, UPSTREAM_REPOS_JSON: '{}', RETIRE_SKILLS: 'false', SKILL_CHECKS_PER_DAY: '0' }).upstreamRepos, {});
 
   assert.equal(loadDecayConfig({ ...base, SKILL_CHECKS_PER_DAY: '1', CURATOR_QUEUE_URL: '  ' }).curatorQueueUrl, '');
