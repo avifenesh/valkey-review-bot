@@ -4,6 +4,24 @@
 
 import { scanItems } from './aws-cli.mjs';
 
+/**
+ * area_bucket values starting with this hold skill-lifecycle items, not
+ * concern records (RESERVED_BUCKET_PREFIX in ops/src/decay.ts).
+ */
+export const RESERVED_BUCKET_PREFIX = '#';
+
+export const isReservedBucket = (bucket) => typeof bucket === 'string' && bucket.startsWith(RESERVED_BUCKET_PREFIX);
+
+/**
+ * The reviewer id a concerns table belongs to. infra names each table
+ * `<reviewer id with - as _>_concerns`, and reviewer ids are lowercase
+ * words joined by hyphens. Null for any other name.
+ */
+export function reviewerIdOfTable(table) {
+  const m = /^([a-z0-9]+(?:_[a-z0-9]+)*)_concerns$/.exec(table);
+  return m ? m[1].replaceAll('_', '-') : null;
+}
+
 /** Every graduated_record_name in a concerns table, tombstones included. */
 export function graduatedNames(aws, table) {
   const items = scanItems(aws, table, {
