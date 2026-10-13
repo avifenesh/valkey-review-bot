@@ -162,7 +162,7 @@ test('markdown without a complete frontmatter block is kept whole', () => {
 const SHA = '0eb4ba3c1d2e4f5a6b7c8d9e0f1a2b3c4d5e6f7a';
 const SHA64 = `${SHA}${'9'.repeat(24)}`;
 const openMarker = (tag = '9.1.2', evidence = `valkey-io/valkey@${SHA}:src/db.c:512`) =>
-  `<!-- suppressed: superseded in ${tag}, 2026-10-13; emptyDB was renamed to emptyData; evidence: ${evidence} -->`;
+  `<!-- suppressed: superseded in ${tag}, 2026-10-13; \`emptyDB\` is now \`emptyData\`; evidence: ${evidence} -->`;
 const CLOSE = '<!-- /suppressed -->';
 const openLabel = (tag) => `**Superseded in ${tag}.** The text from here to "End of superseded text" describes code before ${tag}. `
   + 'It can still hold on older release lines, so it matters for backports to them; do not apply it to the current head.';
@@ -175,7 +175,7 @@ test('a suppressed piece is kept, labelled with the release that superseded it, 
   const md = ['## Patterns', 'Before.', openMarker(), ...piece, CLOSE, '- `emptyData(-1, EMPTYDB_NO_FLAGS, NULL)` clears every database.', 'After.'].join('\n');
   const out = bodyOf(md);
   assert.ok(out.includes(['### Patterns', 'Before.', openLabel('9.1.2'), ...piece, CLOSE_LABEL, '- `emptyData(-1, EMPTYDB_NO_FLAGS, NULL)` clears every database.', 'After.'].join('\n')));
-  assert.doesNotMatch(out, /<!--|-->|renamed to|evidence|valkey-io\/valkey@/);
+  assert.doesNotMatch(out, /<!--|-->|is now|evidence|valkey-io\/valkey@/);
 });
 
 test('every suppressed block in a skill gets its own label, and headings inside are demoted', () => {
@@ -212,7 +212,9 @@ test('suppression markers that do not pair up or do not have the exact form are 
     [openMarker('9.1.2', 'valkey-io/valkey@<sha>:src/db.c:512'), 'old', CLOSE],
     ['<!-- suppressed: superseded in <release tag>, <YYYY-MM-DD>; <one-line reason>; evidence: <upstream repo>@<commit sha>:<path>:<line> -->', 'old', CLOSE],
     // a reason that would end the comment early
-    [openMarker().replace('was renamed', 'was --> renamed'), 'old', CLOSE],
+    [openMarker().replace(' is now ', ' is --> now '), 'old', CLOSE],
+    // a reason the release check did not write
+    [openMarker().replace('`emptyDB` is now `emptyData`', 'emptyDB was renamed to emptyData'), 'old', CLOSE],
   ];
   for (const lines of cases) {
     const md = lines.join('\n');
@@ -238,7 +240,7 @@ test('reviewers see a piece labelled exactly when the release check reads it as 
     // forms the check refuses: a short commit, a bare branch, a reason with "--!>"
     [openMarker('9.1.2', `valkey-io/valkey@${SHA.slice(0, 12)}:src/db.c:512`), 'old', CLOSE],
     [openMarker('unstable'), 'old', CLOSE],
-    [openMarker().replace('was renamed', 'was --!> renamed'), 'old', CLOSE],
+    [openMarker().replace(' is now ', ' is --!> now '), 'old', CLOSE],
     // a long commit, and the branch and commit of a check without a known release, which it accepts
     [openMarker('9.1.2', `valkey-io/valkey@${SHA64}:src/db.c:512`), 'old', CLOSE],
     [openMarker('unstable@0eb4ba3c1d2e'), 'old', CLOSE],

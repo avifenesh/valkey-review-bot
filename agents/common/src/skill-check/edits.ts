@@ -17,9 +17,10 @@
  * grammar; names.ts keeps a copy of it, kept in step by the tests.
  *
  * The reason is generated from the changed names ("`a` is now `b`",
- * several joined by "; "); an edit cannot supply one, so no caller or
- * model text reaches the skill. Several citations are separated by
- * ", ".
+ * several joined by "; ", then "; and N more" when they do not all
+ * fit); an edit cannot supply one, so no caller or model text reaches
+ * the skill, and parseSuppressed reads no other reason as well formed.
+ * Several citations are separated by ", ".
  *
  * The replacement may differ from the original only where a cited line
  * supports it. Both are split on the token class [A-Za-z0-9_./:*>-]+;
@@ -146,6 +147,11 @@ const TOKEN_RE = /[A-Za-z0-9_.\/:*>-]+/g;
 const WORD_CHAR_RE = /[A-Za-z0-9_]/;
 /** A number, or a version such as 9.0.1 or v9.0. */
 const NUMBER_RE = /^v?[0-9]+(?:\.[0-9]+)*$/;
+/** Longer numbers are not changed, so one "`a` is now `b`" part always fits in a reason. */
+const NUMBER_MAX_CHARS = 40;
+/** One part of a generated reason; names and numbers are made of the token characters. */
+const REASON_PART_RE = /^`([A-Za-z0-9_.\/:*>-]{1,120})` is now `([A-Za-z0-9_.\/:*>-]{1,120})`$/;
+const REASON_MORE_RE = /^and [1-9][0-9]{0,3} more$/;
 
 const FENCE_OPEN_RE = /^ {0,3}(`{3,}|~{3,})/;
 const FENCE_CLOSE_RE = /^ {0,3}(`{3,}|~{3,})\s*$/;
@@ -514,6 +520,10 @@ function unwrapProse(token: string): Unwrapped {
   return { pre, core, post };
 }
 
+function isNumber(token: string): boolean {
+  return token.length <= NUMBER_MAX_CHARS && NUMBER_RE.test(token);
+}
+
 function snippet(text: string): string {
   return JSON.stringify(text.length > 60 ? `${text.slice(0, 57)}...` : text);
 }
@@ -551,7 +561,7 @@ function diffTokens(original: string, replacement: string): { changes: Change[] 
     const code = inCodeSpan(a, i) && inCodeSpan(b, i);
     const x = code ? unwrapCode(a.tokens[i]!) : unwrapProse(a.tokens[i]!);
     const y = code ? unwrapCode(b.tokens[i]!) : unwrapProse(b.tokens[i]!);
-    const numbers = NUMBER_RE.test(x.core) && NUMBER_RE.test(y.core);
+    const numbers = isNumber(x.core) && isNumber(y.core);
     if (!code && !numbers) {
       const looseNumber = (t: string) => NUMBER_RE.test(t.replace(/^[*_]+|[*_.:]+$/g, ''));
       if (looseNumber(a.tokens[i]!) && looseNumber(b.tokens[i]!)) {
@@ -668,30 +678,44 @@ function assertContext(ctx: EditContext): void {
   }
 }
 
-/** Why a marker reason is malformed: it must be one line that cannot end the HTML comment early. */
+/**
+ * Why a marker reason is not one generatedReason can write: one or more
+ * "`a` is now `b`" parts, a and b each a code name or a number, joined
+ * with "; ", optionally ending in "; and N more", at most
+ * MAX_REASON_CHARS. So text a person or a model wrote never reads as a
+ * well-formed marker, and no reason can end the HTML comment early.
+ */
 function reasonProblem(reason: string): string | null {
   if (reason.length === 0 || reason.length > MAX_REASON_CHARS) return `the reason must be 1-${MAX_REASON_CHARS} characters`;
-  if (reason !== reason.trim() || /[\x00-\x1f\x7f]/.test(reason)) return 'the reason must be one line without surrounding spaces';
   if (/-->|--!>|<!--/.test(reason)) return 'the reason must not contain "<!--", "-->" or "--!>"';
+  const parts = reason.split('; ');
+  if (parts.length > 1 && REASON_MORE_RE.test(parts[parts.length - 1]!)) parts.pop();
+  const token = (t: string) => nameKind(t) !== null || isNumber(t);
+  for (const part of parts) {
+    const m = REASON_PART_RE.exec(part);
+    if (!m || m[1] === m[2] || !token(m[1]!) || !token(m[2]!)) {
+      return `"${part.slice(0, 60)}" is not a generated reason part; a reason is "\`a\` is now \`b\`" parts joined with "; ", optionally ending in "; and N more"`;
+    }
+  }
   return null;
 }
 
 /**
  * The marker's reason, built only from the validated changes:
  * "`a` is now `b`; `c` is now `d`", with "; and N more" past
- * MAX_REASON_CHARS.
+ * MAX_REASON_CHARS. Names have at most 120 characters and numbers at
+ * most NUMBER_MAX_CHARS, so the first part always fits.
  */
 function generatedReason(changes: readonly Change[]): string {
   const parts = [...new Set(changes.map((c) => `\`${c.from}\` is now \`${c.to}\``))];
-  let out = '';
-  let used = 0;
-  for (const part of parts) {
-    const next = out ? `${out}; ${part}` : part;
+  let out = parts[0] ?? '';
+  let used = 1;
+  for (const part of parts.slice(1)) {
+    const next = `${out}; ${part}`;
     if (next.length > MAX_REASON_CHARS - 20) break;
     out = next;
     used++;
   }
-  if (!out) return 'code names changed upstream';
   return used < parts.length ? `${out}; and ${parts.length - used} more` : out;
 }
 

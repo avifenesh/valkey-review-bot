@@ -189,6 +189,8 @@ const MARKER_HEADER_RE = /^<!-- suppressed: superseded in ([^\s,;]+), (\d{4}-\d{
 const MARKER_TAG_RE = /^v?[0-9]{1,4}\.[0-9]{1,4}\.[0-9]{1,4}$/;
 const MARKER_BRANCH_RE = /^(?!.*\.\.)(?!.*\/\/)(?!.*\/\.)(?!.*\/$)(?!.*\.$)(?!.*\.lock$)[A-Za-z0-9][A-Za-z0-9._\/-]{0,99}$/;
 const MARKER_CITATION_RE = /^[A-Za-z0-9_.-]{1,100}\/[A-Za-z0-9_.-]{1,100}@(?:[0-9a-f]{40}|[0-9a-f]{64}):(.+):[1-9][0-9]{0,6}$/;
+const MARKER_REASON_PART_RE = /^`([A-Za-z0-9_.\/:*>-]{1,120})` is now `([A-Za-z0-9_.\/:*>-]{1,120})`$/;
+const MARKER_NUMBER_RE = /^v?[0-9]+(?:\.[0-9]+)*$/;
 
 function isMarkerRelease(release: string): boolean {
   if (MARKER_TAG_RE.test(release)) return true;
@@ -207,12 +209,22 @@ function isMarkerCitation(text: string): boolean {
   return p.split('/').every((part) => part !== '' && part !== '.' && part !== '..');
 }
 
+/** "`a` is now `b`" parts, a and b code names or numbers, joined with "; ", optionally ending in "; and N more". */
+function isMarkerReason(reason: string): boolean {
+  if (reason.length === 0 || reason.length > 300 || /-->|--!>|<!--/.test(reason)) return false;
+  const parts = reason.split('; ');
+  if (parts.length > 1 && /^and [1-9][0-9]{0,3} more$/.test(parts[parts.length - 1]!)) parts.pop();
+  const token = (t: string) => classifyToken(t) !== null || (t.length <= 40 && MARKER_NUMBER_RE.test(t));
+  return parts.every((part) => {
+    const m = MARKER_REASON_PART_RE.exec(part);
+    return m !== null && m[1] !== m[2] && token(m[1]!) && token(m[2]!);
+  });
+}
+
 /** Whether a trimmed line is a well-formed opening marker. */
 function isMarkerHeader(text: string): boolean {
   const m = MARKER_HEADER_RE.exec(text);
-  if (!m || !isMarkerRelease(m[1]!) || !isMarkerDate(m[2]!)) return false;
-  const reason = m[3]!;
-  if (reason.length > 300 || reason !== reason.trim() || /[\x00-\x1f\x7f]/.test(reason) || /-->|--!>|<!--/.test(reason)) return false;
+  if (!m || !isMarkerRelease(m[1]!) || !isMarkerDate(m[2]!) || !isMarkerReason(m[3]!)) return false;
   return m[4]!.split(', ').every(isMarkerCitation);
 }
 
