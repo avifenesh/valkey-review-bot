@@ -35,8 +35,9 @@
  * outside code spans never change, so an edit cannot turn "NEVER flag"
  * into "ALWAYS flag", add or remove a word, a sentence or punctuation,
  * and the replacement has as many lines as the original. An escaped
- * backtick (\`) is text, not a span delimiter, and a line whose
- * backticks do not pair up is never edited. The
+ * backtick (\`) is text, not a span delimiter; a line with a backtick
+ * that pairs with none, or an escaped one inside a span, is never
+ * edited. The
  * frontmatter, fenced blocks and already-suppressed pieces are never
  * edited, and suppressed blocks do not nest.
  *
