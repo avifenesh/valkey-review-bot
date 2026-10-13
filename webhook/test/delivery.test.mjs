@@ -236,6 +236,7 @@ test('new commits start a delayed review that holds the pull request\'s pending 
     options: { delaySeconds: 300 },
   });
   assert.equal(store.pending.get(`${REPO}#7`), 'pending-2');
+  assert.deepEqual(store.pendingDelays, [0, 300], 'the marker outlives the delay');
   assert.equal(store.autoReviews.get(`${REPO}#7`), 2);
   assert.equal(store.slotsTaken, 2, 'it takes a budget slot like any automatic review');
   assert.equal(logs.at(-2), `[auto-review] route=valkey-review repo=${REPO} pr=7 round=2/3 queued delay=300s`);
@@ -427,7 +428,7 @@ test('a reopen or a draft marked ready joins a waiting review of new commits', a
 });
 
 test('reviews that are not from new commits hold the marker and name their trigger, with no delay', async () => {
-  const { handler, sent } = setup();
+  const { handler, sent, store } = setup();
   await handler(delivery('pull_request', prEvent('opened')));
   await handler(delivery('pull_request', prEvent('reopened', { number: 8 })));
   await handler(delivery('pull_request', prEvent('ready_for_review', {}, GLIDE)));
@@ -438,6 +439,7 @@ test('reviews that are not from new commits hold the marker and name their trigg
     ['pending-3', 'ready_for_review', true, undefined],
     ['pending-4', 'opened', true, undefined],
   ], 'the runtime skips the run if the pull request is closed, or a draft on a skipDrafts route, by then');
+  assert.deepEqual(store.pendingDelays, [0, 0, 0, 0], 'their markers expire an hour after they are taken');
 });
 
 test('a push or a reopen while a reopened pull request\'s review waits joins it', async () => {

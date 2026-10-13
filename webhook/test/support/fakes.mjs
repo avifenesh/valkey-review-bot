@@ -80,7 +80,8 @@ export function fakeDdb() {
  * An in-memory DeliveryStore with the same behavior as src/store.ts.
  * autoReviews counts automatic reviews and pending holds the pending
  * marker ids ("pending-1", "pending-2", ...), both per "owner/name#pr",
- * lowercased. Pending markers never expire here.
+ * lowercased. pendingDelays has the delay of every marker taken, in
+ * order. Pending markers never expire here.
  */
 export function fakeStore({ budget = Infinity } = {}) {
   const keys = new Map();
@@ -88,6 +89,7 @@ export function fakeStore({ budget = Infinity } = {}) {
   const autoReviews = new Map();
   const returned = [];
   const pending = new Map();
+  const pendingDelays = [];
   let slots = 0;
   let markers = 0;
   const prKey = (repo, prNumber) => `${repo.toLowerCase()}#${prNumber}`;
@@ -97,6 +99,7 @@ export function fakeStore({ budget = Infinity } = {}) {
     autoReviews,
     returned,
     pending,
+    pendingDelays,
     get slotsTaken() { return slots; },
     async claim(key, attributes = {}) {
       if (keys.has(key)) return false;
@@ -126,6 +129,7 @@ export function fakeStore({ budget = Infinity } = {}) {
     async markReviewPending(repo, prNumber, delaySeconds) {
       if (typeof delaySeconds !== 'number') throw new Error('markReviewPending needs the delay');
       if (pending.has(prKey(repo, prNumber))) return null;
+      pendingDelays.push(delaySeconds);
       markers += 1;
       pending.set(prKey(repo, prNumber), `pending-${markers}`);
       return `pending-${markers}`;
