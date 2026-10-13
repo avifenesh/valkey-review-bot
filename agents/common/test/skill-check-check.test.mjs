@@ -6,7 +6,7 @@ import path from 'node:path';
 import test from 'node:test';
 
 // No resolve hook: these modules must load under plain type stripping.
-const { areaFileCounts, checkSkill, globToRegExp, RARE_MAX } = await import('../src/skill-check/check.ts');
+const { areaFileCounts, checkSkill, DIFF_MAX_BYTES, DIFF_MAX_CANDIDATES, globToRegExp, RARE_MAX } = await import('../src/skill-check/check.ts');
 const { extractNames } = await import('../src/skill-check/names.ts');
 const { createGitRunner } = await import('../src/skill-check/upstream.ts');
 
@@ -194,6 +194,34 @@ test('without a usable base nothing is touched', async () => {
     assert.deepEqual(result.touched, []);
     assert.equal(result.clean, true);
   }
+  r.cleanup();
+});
+
+test('a capped candidate list is not clean, and says why', async () => {
+  // Each file holds a rare cited name, and each changed, but not on the name's line.
+  const count = DIFF_MAX_CANDIDATES + 1;
+  const file = (i, v) => `x = ${v};\nint rare_cap_${i};\n`;
+  const base = Object.fromEntries(Array.from({ length: count }, (_, i) => [`f/${i}.txt`, file(i, 1)]));
+  const tip = Object.fromEntries(Array.from({ length: count }, (_, i) => [`f/${i}.txt`, file(i, 2)]));
+  const r = repo(base, tip);
+  const cited = Array.from({ length: count }, (_, i) => `rare_cap_${i}`);
+  const result = await checkSkill(r.git, { names: names(cited.map((t) => `\`${t}\``).join(' ')), baseline: cited, baseSha: r.baseSha });
+  assert.deepEqual(result.touched, []);
+  assert.deepEqual(result.lost, []);
+  assert.equal(result.candidatesCapped, true);
+  assert.deepEqual(result.incomplete, [`only ${DIFF_MAX_CANDIDATES} of the ${count} changed files that hold a cited name were diffed`]);
+  assert.equal(result.clean, false);
+  r.cleanup();
+});
+
+test('a truncated diff is not clean, and says why', async () => {
+  const filler = (c) => `${Array.from({ length: 30_000 }, () => c.repeat(80)).join('\n')}\n`;
+  const r = repo({ 'big.txt': `${filler('a')}int rare_big_name;\n` }, { 'big.txt': `${filler('b')}int rare_big_name;\n` });
+  const result = await checkSkill(r.git, { names: names('`rare_big_name`'), baseline: ['rare_big_name'], baseSha: r.baseSha });
+  assert.deepEqual(result.touched, []);
+  assert.equal(result.diffTruncated, true);
+  assert.deepEqual(result.incomplete, [`the diff of the candidate files passed ${DIFF_MAX_BYTES} bytes and was read only that far`]);
+  assert.equal(result.clean, false);
   r.cleanup();
 });
 

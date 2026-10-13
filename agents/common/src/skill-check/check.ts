@@ -63,7 +63,11 @@ export interface CheckResult {
   readonly excerpts: readonly DiffExcerpt[];
   /** |baseline ∩ present| / |baseline|, 1 when the baseline is empty. */
   readonly keptFraction: number;
-  /** Nothing lost, new and absent, or touched. */
+  /**
+   * Nothing lost, new and absent, or touched, and the diff was read in
+   * full (`incomplete` is empty). A caller may advance the verified
+   * commit only on a clean result.
+   */
   readonly clean: boolean;
   /** The base was available and diffed; without it `touched` is empty. */
   readonly compared: boolean;
@@ -71,6 +75,10 @@ export interface CheckResult {
   readonly changedFiles: number;
   /** The diff of the candidate files passed DIFF_MAX_BYTES, so `touched` may be incomplete. */
   readonly diffTruncated: boolean;
+  /** More than DIFF_MAX_CANDIDATES changed files held a rare cited name; the rest were not diffed. */
+  readonly candidatesCapped: boolean;
+  /** Why `touched` may be incomplete, one line each; empty when the whole diff was examined. */
+  readonly incomplete: readonly string[];
 }
 
 /**
@@ -419,6 +427,8 @@ export async function checkSkill(git: GitRunner, input: CheckInput): Promise<Che
   let compared = false;
   let changedFiles = 0;
   let diffTruncated = false;
+  let candidatesCapped = false;
+  const incomplete: string[] = [];
   const touched: string[] = [];
   const excerpts: DiffExcerpt[] = [];
   const base = input.baseSha;
@@ -446,7 +456,12 @@ export async function checkSkill(git: GitRunner, input: CheckInput): Promise<Che
       const probeWords = [...new Set(probes.filter((p) => !p.stem).map((p) => p.word))];
       const probeStems = [...new Set(probes.filter((p) => p.stem).map((p) => p.word))];
       const withNames = probes.length > 0 ? await filesContaining(git, commit, probeWords, probeStems) : new Set<string>();
-      const candidates = [...new Set([...touchedPaths, ...changed.filter((f) => withNames.has(f))])].slice(0, DIFF_MAX_CANDIDATES);
+      const all = [...new Set([...touchedPaths, ...changed.filter((f) => withNames.has(f))])];
+      const candidates = all.slice(0, DIFF_MAX_CANDIDATES);
+      if (all.length > candidates.length) {
+        candidatesCapped = true;
+        incomplete.push(`only ${candidates.length} of the ${all.length} changed files that hold a cited name were diffed`);
+      }
       if (candidates.length > 0) {
         const r = await git([
           '--literal-pathspecs', ...DIFF, '-U0', '--no-renames', '--no-ext-diff', '--no-textconv',
@@ -454,6 +469,7 @@ export async function checkSkill(git: GitRunner, input: CheckInput): Promise<Che
         ], { maxBytes: DIFF_MAX_BYTES });
         if (r.code !== 0 && !r.truncated) throw new Error(`git diff exited ${r.code}: ${r.stderr.trim().slice(0, 2000)}`);
         diffTruncated = r.truncated;
+        if (r.truncated) incomplete.push(`the diff of the candidate files passed ${DIFF_MAX_BYTES} bytes and was read only that far`);
         hunks = parseHunks(r.stdout);
       }
     }
@@ -504,10 +520,12 @@ export async function checkSkill(git: GitRunner, input: CheckInput): Promise<Che
     touched,
     excerpts,
     keptFraction,
-    clean: lost.length === 0 && newAbsent.length === 0 && touched.length === 0,
+    clean: lost.length === 0 && newAbsent.length === 0 && touched.length === 0 && incomplete.length === 0,
     compared,
     changedFiles,
     diffTruncated,
+    candidatesCapped,
+    incomplete,
   };
 }
 
