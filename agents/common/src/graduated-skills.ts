@@ -54,8 +54,19 @@ const INTRO = 'These rules graduated from the concerns store after repeated rein
 
 /** The provenance sentence submit_skill appends to a description, for operators. */
 const RECORD_ID_SENTENCE_RE = /\s*Graduated from concern record_id=\S*\s*$/;
-/** The citation the curator ends a skill body with, `_(graduated from concern record_id=<id>)_`. */
-const RECORD_ID_CITATION_RE = /\s*[_*]?\(graduated from concern record_id=[^)\s]*\)[_*]?[ \t]*(?=\r?$)/i;
+/**
+ * The citation the curator ends a skill body with, `_(graduated from concern record_id=<id>)_`.
+ * No leading `\s*`: retried at every space of a long run, it takes
+ * quadratic time. withoutCitation trims the space before it instead.
+ */
+const RECORD_ID_CITATION_RE = /[_*]?\(graduated from concern record_id=[^)\s]*\)[_*]?[ \t]*(?=\r?$)/i;
+
+/** `line` without the record id citation at its end and the whitespace before it. */
+function withoutCitation(line: string): string {
+  const m = RECORD_ID_CITATION_RE.exec(line);
+  if (!m) return line;
+  return line.slice(0, m.index).trimEnd() + line.slice(m.index + m[0].length);
+}
 
 // `.` stops at a CR, so `\r?` lets fences of CRLF text match.
 const FENCE_RE = /^ {0,3}(`{3,}|~{3,})(.*)\r?$/;
@@ -151,7 +162,7 @@ function rewriteLines(markdown: string, graduated: boolean): string {
       if (!graduated || fenced[i]) return [line];
       // The record id means nothing to a reviewer. A line that held only
       // the citation goes with it.
-      const uncited = line.replace(RECORD_ID_CITATION_RE, '');
+      const uncited = withoutCitation(line);
       if (uncited !== line && uncited.trim() === '') return [];
       return [uncited.replace(HEADING_RE, '$1#$2')];
     })

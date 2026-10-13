@@ -104,6 +104,19 @@ test('the record id citation at the end of the body is not rendered', () => {
   assert.ok(renderGraduatedSkills([skill({ skillMd: fenced })]).includes(fenced));
 });
 
+test('a long run of whitespace renders in linear time', () => {
+  const run = ' '.repeat(100_000);
+  const citation = '_(graduated from concern record_id=abc)_';
+  for (const [line, want] of [[run, run], [`${run}x`, `${run}x`], [`${run}\t${citation}`, null], [`body${run}${citation}`, 'body']]) {
+    const start = performance.now();
+    const out = renderGraduatedSkills([skill({ skillMd: `## Use when\n${line}\ntail` })]);
+    const ms = performance.now() - start;
+    // Quadratic matching takes seconds here.
+    assert.ok(ms < 250, `${ms.toFixed(0)} ms for a line of ${line.length} characters`);
+    assert.ok(out.includes(want === null ? '### Use when\ntail' : `### Use when\n${want}\ntail`));
+  }
+});
+
 test('the introduction says the code at the PR head wins', () => {
   const out = renderGraduatedSkills([skill()]);
   assert.doesNotMatch(out, /Treat as established conventions/);
