@@ -5,6 +5,7 @@ import './support/ts-resolve.mjs';
 
 const { labelSuppressedPieces, loadGraduatedSkills, renderGraduatedSkills } = await import('../src/graduated-skills.ts');
 const { GRADUATED_SKILL_MAX_CHARS } = await import('../src/skills-registry.ts');
+const { listSuppressedBlocks } = await import('../src/skill-check/edits.ts');
 
 /** Answers list and get calls from `records`, like the registry control plane. */
 function fakeRegistry(t, records) {
@@ -159,6 +160,7 @@ test('markdown without a complete frontmatter block is kept whole', () => {
 });
 
 const SHA = '0eb4ba3c1d2e4f5a6b7c8d9e0f1a2b3c4d5e6f7a';
+const SHA64 = `${SHA}${'9'.repeat(24)}`;
 const openMarker = (tag = '9.1.2', evidence = `valkey-io/valkey@${SHA}:src/db.c:512`) =>
   `<!-- suppressed: superseded in ${tag}, 2026-10-13; emptyDB was renamed to emptyData; evidence: ${evidence} -->`;
 const CLOSE = '<!-- /suppressed -->';
@@ -178,7 +180,7 @@ test('a suppressed piece is kept, labelled with the release that superseded it, 
 
 test('every suppressed block in a skill gets its own label, and headings inside are demoted', () => {
   const md = [
-    openMarker('v2.5.3', `valkey-io/valkey-glide@${SHA.slice(0, 12)}:glide-core/src/client/mod.rs:88, valkey-io/valkey-glide@${SHA}:glide-core/src/lib.rs:7`),
+    openMarker('v2.5.3', `valkey-io/valkey-glide@${SHA}:glide-core/src/client/mod.rs:88, valkey-io/valkey-glide@${SHA64}:glide-core/src/lib.rs:7`),
     '## Old heading',
     CLOSE,
     '## New heading',
@@ -225,9 +227,36 @@ test('suppressed blocks in CRLF text are labelled outside fences only, keeping t
   assert.ok(bodyOf(md).includes(['```', openMarker(), 'fenced', CLOSE, '```', openLabel('9.1.2'), 'old', CLOSE_LABEL, 'new'].join('\r\n')));
 });
 
-test('suppression does not nest: a second open marker leaves the first one as written', () => {
+test('suppression does not nest: an open marker inside a block is left as written', () => {
   const md = [openMarker('9.0.6'), 'outer', openMarker('9.1.2'), 'inner', CLOSE, 'new'].join('\n');
-  assert.ok(bodyOf(md).includes([openMarker('9.0.6'), 'outer', openLabel('9.1.2'), 'inner', CLOSE_LABEL, 'new'].join('\n')));
+  assert.ok(bodyOf(md).includes([openLabel('9.0.6'), 'outer', openMarker('9.1.2'), 'inner', CLOSE_LABEL, 'new'].join('\n')));
+});
+
+test('reviewers see a piece labelled exactly when the release check reads it as suppressed', () => {
+  const docs = [
+    [openMarker(), 'old', CLOSE, 'new'],
+    // forms the check refuses: a short commit, a bare branch, a reason with "--!>"
+    [openMarker('9.1.2', `valkey-io/valkey@${SHA.slice(0, 12)}:src/db.c:512`), 'old', CLOSE],
+    [openMarker('unstable'), 'old', CLOSE],
+    [openMarker().replace('was renamed', 'was --!> renamed'), 'old', CLOSE],
+    // a long commit, and the branch and commit of a check without a known release, which it accepts
+    [openMarker('9.1.2', `valkey-io/valkey@${SHA64}:src/db.c:512`), 'old', CLOSE],
+    [openMarker('unstable@0eb4ba3c1d2e'), 'old', CLOSE],
+    [openMarker('9.0.6'), 'outer', openMarker('9.1.2'), 'inner', CLOSE, 'new'],
+    ['```', openMarker(), 'old', CLOSE, '```', openMarker('9.1.2'), 'two', CLOSE],
+    // a marker in the frontmatter is not a block
+    ['---', 'name: x', openMarker(), 'description: y', CLOSE, '---', openMarker('9.0.6'), 'body', CLOSE],
+  ];
+  for (const lines of docs) {
+    for (const eol of ['\n', '\r\n']) {
+      const md = lines.join(eol);
+      const labelled = labelSuppressedPieces(md).split(eol)
+        .flatMap((line, i) => (line === lines[i] ? [] : [i + 1]));
+      const blocks = listSuppressedBlocks(md).flatMap((b) => [b.startLine, b.endLine]);
+      assert.deepEqual(labelled, blocks, md);
+    }
+  }
+  assert.equal(labelSuppressedPieces([openMarker('unstable@0eb4ba3c1d2e'), 'old', CLOSE].join('\n')), [openLabel('unstable@0eb4ba3c1d2e'), 'old', CLOSE_LABEL].join('\n'));
 });
 
 test('labelSuppressedPieces labels markers in skill text without touching anything else', () => {

@@ -1,4 +1,5 @@
 import { createRegistryClient, GRADUATED_SKILLS_MAX_CHARS, loadSkills } from './skills-registry.js';
+import { parseSuppressed } from './skill-check/edits.js';
 
 /**
  * Load the reviewer's graduated skills from its AWS Agent Registry
@@ -80,81 +81,73 @@ function fencedLines(lines: readonly string[]): boolean[] {
   return out;
 }
 
-/** The markdown without its leading `---` frontmatter block, when it has a complete one. */
-function stripFrontmatter(skillMd: string): string {
-  if (!/^---\r?\n/.test(skillMd)) return skillMd;
-  const lines = skillMd.split('\n');
+/** Index of the first line after a complete leading `---` frontmatter block; 0 when there is none. */
+function bodyStartOf(lines: readonly string[]): number {
+  if (lines.length < 2 || lines[0].trimEnd() !== '---') return 0;
   const end = lines.findIndex((line, i) => i > 0 && line.trimEnd() === '---');
-  return end < 0 ? skillMd : lines.slice(end + 1).join('\n');
+  return end < 0 ? 0 : end + 1;
 }
 
 /*
  * A release check that finds a stale piece of a skill keeps it in place
  * between suppression markers and adds the replacement after them:
  *
- *   <!-- suppressed: superseded in <tag>, <YYYY-MM-DD>; <reason>; evidence: <repo>@<sha>:<path>:<line> -->
+ *   <!-- suppressed: superseded in <release>, <YYYY-MM-DD>; <reason>; evidence: <repo>@<sha>:<path>:<line> -->
  *   <the original piece>
  *   <!-- /suppressed -->
  *   <the replacement>
  *
- * The piece can still hold on release lines older than <tag>, so it stays
- * for backport reviews, labelled so it is not applied to the current
- * head. Only the tag reaches the label; the reason and evidence are for
- * maintainers reading the record.
+ * The piece can still hold on release lines older than <release>, so it
+ * stays for backport reviews, labelled so it is not applied to the
+ * current head. Only the release reaches the label; the reason and
+ * evidence are for maintainers reading the record.
+ *
+ * The blocks are the ones parseSuppressed (skill-check/edits.ts) reads,
+ * the same grammar the release check writes and its name check skips,
+ * so a piece is labelled for reviewers exactly when the check treats it
+ * as suppressed. Markers it does not accept are left as written.
  */
-const CITATION = String.raw`[\w.-]+/[\w.-]+@[0-9a-f]{7,40}:[^\s,]+:\d+`;
-const SUPPRESSED_OPEN_RE = new RegExp(
-  String.raw`^(\s*)<!-- suppressed: superseded in ([A-Za-z0-9][\w.+/@-]{0,63}), \d{4}-\d{2}-\d{2}; (?:(?!-->).)+; evidence: ${CITATION}(?:, ${CITATION})* -->\s*$`,
-);
-const SUPPRESSED_CLOSE_RE = /^(\s*)<!-- \/suppressed -->\s*$/;
-
-function suppressedOpenLabel(tag: string): string {
-  return `**Superseded in ${tag}.** The text from here to "End of superseded text" describes code before ${tag}. `
+function suppressedOpenLabel(release: string): string {
+  return `**Superseded in ${release}.** The text from here to "End of superseded text" describes code before ${release}. `
     + 'It can still hold on older release lines, so it matters for backports to them; do not apply it to the current head.';
 }
 
 const SUPPRESSED_CLOSE_LABEL = '**End of superseded text.**';
 
-/**
- * Labels for the marker lines of each well-formed suppressed block, by
- * line index. A block is an open marker and the next close marker, both
- * outside fenced blocks. Markers that do not pair up, or do not have the
- * exact form, are left as written.
- */
-function suppressedLabels(lines: readonly string[], fenced: readonly boolean[]): Map<number, string> {
+/** `label` in place of the marker `line`: the marker's indentation and line ending are kept. */
+function inPlaceOf(line: string, label: string): string {
+  const indent = line.slice(0, line.length - line.trimStart().length);
+  return `${indent}${label}${line.endsWith('\r') ? '\r' : ''}`;
+}
+
+/** Labels for the marker lines of each suppressed block, by line index in `markdown`. */
+function suppressedLabels(markdown: string, lines: readonly string[]): Map<number, string> {
   const labels = new Map<number, string>();
-  let open: { at: number; indent: string; tag: string } | null = null;
-  for (let i = 0; i < lines.length; i++) {
-    if (fenced[i]) continue;
-    const opening = SUPPRESSED_OPEN_RE.exec(lines[i]);
-    if (opening) {
-      // Suppression does not nest: a second open marker leaves the first unpaired.
-      open = { at: i, indent: opening[1], tag: opening[2] };
-      continue;
-    }
-    const closing = SUPPRESSED_CLOSE_RE.exec(lines[i]);
-    if (closing && open) {
-      labels.set(open.at, open.indent + suppressedOpenLabel(open.tag));
-      labels.set(i, closing[1] + SUPPRESSED_CLOSE_LABEL);
-      open = null;
-    }
+  for (const block of parseSuppressed(markdown).blocks) {
+    const open = block.startLine - 1;
+    const close = block.endLine - 1;
+    labels.set(open, inPlaceOf(lines[open], suppressedOpenLabel(block.release)));
+    labels.set(close, inPlaceOf(lines[close], SUPPRESSED_CLOSE_LABEL));
   }
   return labels;
 }
 
 /**
  * Label the suppressed pieces. For a graduated skill (`graduated`), also
- * demote headings and drop the record id citation, outside fenced blocks.
+ * drop a complete frontmatter block, and outside fenced blocks demote
+ * headings and drop the record id citation.
  */
 function rewriteLines(markdown: string, graduated: boolean): string {
-  const lines = markdown.split('\n');
+  const all = markdown.split('\n');
+  // parseSuppressed takes the whole markdown and skips the frontmatter itself, as the release check does.
+  const labels = suppressedLabels(markdown, all);
+  const bodyStart = graduated ? bodyStartOf(all) : 0;
+  const lines = all.slice(bodyStart);
   const fenced = fencedLines(lines);
-  const labels = suppressedLabels(lines, fenced);
   return lines
     .flatMap((line, i) => {
-      const label = labels.get(i);
-      // A label keeps the line ending of the marker it replaces.
-      if (label !== undefined) return [line.endsWith('\r') ? `${label}\r` : label];
+      const label = labels.get(bodyStart + i);
+      if (label !== undefined) return [label];
       if (!graduated || fenced[i]) return [line];
       // The record id means nothing to a reviewer. A line that held only
       // the citation goes with it.
@@ -181,7 +174,7 @@ export function labelSuppressedPieces(markdown: string): string {
  * labelled. Lines in fenced blocks are left alone.
  */
 function renderSkillBody(skillMd: string): string {
-  return rewriteLines(stripFrontmatter(skillMd), true).trim();
+  return rewriteLines(skillMd, true).trim();
 }
 
 /** The description on one line, without the record id sentence that means nothing to a reviewer. */
