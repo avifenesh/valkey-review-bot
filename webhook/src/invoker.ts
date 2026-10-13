@@ -1,8 +1,8 @@
 import { BedrockAgentCoreClient, InvokeAgentRuntimeCommand } from '@aws-sdk/client-bedrock-agentcore';
 import { DynamoDBClient } from '@aws-sdk/client-dynamodb';
-import { DynamoDBDocumentClient, GetCommand, ScanCommand } from '@aws-sdk/lib-dynamodb';
+import { DynamoDBDocumentClient, GetCommand, ScanCommand, UpdateCommand } from '@aws-sdk/lib-dynamodb';
 import { loadInvokerConfig } from './config.js';
-import { pendingMarkerOf, type PendingMarker } from './review-envelope.js';
+import { heartbeatRunKey, pendingMarkerOf, type PendingMarker } from './review-envelope.js';
 import { clearPendingReview, extendPendingReview, holdsPendingReview } from './store.js';
 import { decide, isCuratorMessage, messageTag, type HeartbeatRecord, type PullRequestRun } from './watchdog.js';
 
@@ -11,8 +11,8 @@ import { decide, isCuratorMessage, messageTag, type HeartbeatRecord, type PullRe
  * route's AgentCore runtime (a reviewer or the curator). The receiver
  * shaped each envelope for its runtime, so this code stays agnostic of
  * the payload. src/watchdog.ts decides whether a message runs at all.
- * Just before it runs an automatic review, it removes the pull request's
- * pending marker.
+ * Just before it runs a review, it writes the run's start record in the
+ * heartbeat table, then removes an automatic review's pending marker.
  */
 
 const config = loadInvokerConfig(process.env);
@@ -35,6 +35,9 @@ interface SqsEvent {
  * another receive of the same message is starting the run.
  */
 class StillRunning extends Error {}
+
+/** Same lifetime as the records the runtime writes (agents/common/src/heartbeat.ts). */
+const HEARTBEAT_TTL_SECONDS = 24 * 3600;
 
 async function readHeartbeat(runKey: string): Promise<HeartbeatRecord | undefined> {
   const resp = await ddb.send(new GetCommand({ TableName: config.heartbeatTable, Key: { run_key: runKey } }));
@@ -91,12 +94,61 @@ async function holdsMarker(marker: PendingMarker | undefined, tag: string): Prom
 }
 
 /**
+ * Writes the run's start record, status running under the run key its
+ * runtime writes, just before the invoke. It does two things:
+ *
+ *   - Other reviews of the pull request see the run at once, not only
+ *     after the runtime's first heartbeat, seconds later. It is written
+ *     before the pending marker goes, so an automatic review queued
+ *     after that finds it.
+ *   - Only one receive of a message starts the run. SQS can deliver a
+ *     message twice, and a receive that reads the marker after the
+ *     other removed it cannot tell from the marker that the run started.
+ *     The write is refused while the key has a fresh running record
+ *     (this run, or another message's run of the same key) or a
+ *     completed one this message wrote: "taken". Over a dead run (stale
+ *     or failed), or one that another message finished, it goes ahead.
+ *
+ * The runtime's heartbeat writes keep message_id. A worker without the
+ * grant to write the table runs the review unclaimed, as before, and an
+ * automatic review's marker delete is then the only start claim. Any
+ * other failed write throws, and the message is retried.
+ */
+async function claimRunStart(runKey: string, messageId: string, tag: string): Promise<'claimed' | 'taken' | 'unclaimed'> {
+  const now = Date.now();
+  try {
+    await ddb.send(new UpdateCommand({
+      TableName: config.heartbeatTable,
+      Key: { run_key: runKey },
+      UpdateExpression: 'SET #a = :now, #s = :running, #t = :ttl, #m = :message',
+      ConditionExpression: 'NOT ((#s = :running AND #a >= :fresh) OR (#s = :completed AND #m = :message))',
+      ExpressionAttributeNames: { '#a': 'last_activity', '#s': 'status', '#t': 'ttl', '#m': 'message_id' },
+      ExpressionAttributeValues: {
+        ':now': now,
+        ':running': 'running',
+        ':completed': 'completed',
+        // Fresh as src/watchdog.ts liveRun counts it.
+        ':fresh': now - config.staleMs,
+        ':ttl': Math.floor(now / 1000) + HEARTBEAT_TTL_SECONDS,
+        ':message': messageId,
+      },
+    }));
+    return 'claimed';
+  } catch (err) {
+    const name = (err as { name?: string } | null)?.name;
+    if (name === 'ConditionalCheckFailedException') return 'taken';
+    if (name !== 'AccessDeniedException') throw err;
+    console.error(`[start] ${tag} may not write ${config.heartbeatTable}; the run is not visible until its runtime writes a heartbeat`, err);
+    return 'unclaimed';
+  }
+}
+
+/**
  * Removes the marker just before the run starts. False when it was
- * already gone. The delete is conditioned on the marker, so it also
- * claims the start: when SQS delivers the message twice at once, only
- * the receive whose delete succeeds runs the review. A failed delete
- * throws, so the message is retried instead of run: a marker left in
- * place would make the next receive run the review a second time.
+ * already gone. A failed delete throws, so the message is retried
+ * instead of run: a marker left in place would make the next receive
+ * run the review a second time. The start record already written then
+ * holds other reviews of the pull request back until it goes stale.
  */
 async function clearMarkerForRun(marker: PendingMarker, tag: string): Promise<boolean> {
   const cleared = await clearPendingReview(ddb, config.idempotencyTable, marker.repo, marker.prNumber, marker.markerId);
@@ -177,17 +229,22 @@ async function handleOne(record: SqsRecord): Promise<void> {
     throw new StillRunning();
   }
 
-  if (marker && held && !(await clearMarkerForRun(marker, tag))) {
-    // The marker was there a moment ago, so another receive of this
-    // message took it and is starting the run: a duplicate delivery.
-    // This receive does not run the review again and logs no failure.
-    // It leaves the message on the queue instead of deleting it: a
-    // delete could remove the message for the other receive too, and its
-    // redeliveries are what watch that run once it outlives its worker.
-    // The next receive finds the run's heartbeat, or, if the marker went
-    // some other way, such as expiry, runs the review as one whose
-    // attempt died.
-    console.log(`[pending] ${tag} marker=${marker.markerId} was taken by another receive of this message; not run twice`);
+  // A receive that does not start the run logs no failure, and leaves
+  // the message on the queue instead of deleting it: a delete could
+  // remove the message for the receive that runs it too, and its
+  // redeliveries are what watch that run once it outlives its worker.
+  // The next receive decides from the run's heartbeat.
+  const runKey = heartbeatRunKey(envelope);
+  const claim = curator ? 'unclaimed' : await claimRunStart(runKey, record.messageId, tag);
+  if (claim === 'taken') {
+    console.log(`[start] ${tag} run=${runKey} is already running or done; not run twice`);
+    throw new StillRunning();
+  }
+  // With the start claimed, a marker that is already gone went some
+  // other way (given back by the receiver, or expired), and the run goes
+  // ahead. Without a start record, its delete is the only start claim.
+  if (marker && held && !(await clearMarkerForRun(marker, tag)) && claim !== 'claimed') {
+    console.log(`[pending] ${tag} marker=${marker.markerId} was gone when this receive went to start the run (another receive of this message took it, or it was given back or expired); not run`);
     throw new StillRunning();
   }
 

@@ -37,10 +37,13 @@ import { heartbeatRunKey, pullRequestRunPrefix } from './review-envelope.js';
  * SentTimestamp: a review still waiting when the budget is used up is
  * dropped with an error, and one that starts late is watched only until
  * the budget ends (the run itself goes on, without the fallback). A run
- * shows up once its runtime writes the first heartbeat, a few seconds
- * after its worker invokes it; an automatic review that starts in those
- * seconds can still run alongside it, most likely one with no queue
- * delay, such as a reopen.
+ * shows up as soon as it starts: before the worker removes an automatic
+ * review's marker and invokes the runtime, it writes the run's start
+ * record, status running under the run's key (src/invoker.ts). The same
+ * record keeps a second receive of the message from starting the run
+ * again. A start record whose runtime never starts, because the invoke
+ * failed, holds other automatic reviews of the pull request back until
+ * it goes stale, and is then treated like the record of a run that died.
  *
  * Curator messages, feedback or maintenance, have no heartbeat. Each
  * receive runs the curator; the curator queue dead-letters after three
