@@ -20,8 +20,12 @@
 //                    check the next scheduled pass checks the skill again.
 //   --reviewer       the reviewer id, for a table whose name does not give it;
 //                    valkey_review_concerns is valkey-review's table
-//   --limit          queue at most N checks (default 10, the decay job's
-//                    default SKILL_CHECKS_PER_DAY)
+//   --limit          queue at most N checks (default 10). The default is the
+//                    decay job's code default for SKILL_CHECKS_PER_DAY, not
+//                    the deployed skillLifecycle.checksPerDay, and these
+//                    checks come on top of that day's decay checks. If
+//                    checksPerDay is set lower to spare the queue, pass
+//                    that or less.
 //   --apply          send dry_run: false (see below)
 //   --plan           print the checks it would queue; write and send nothing
 //
@@ -143,7 +147,8 @@ console.log(`reviewer ${reviewerId}, table ${table}, release ${releaseTag || 'no
 console.log(dryRun
   ? 'report mode: dry_run=true, so the curator makes no registry change and opens no pull request; --apply sends dry_run=false'
   : 'apply mode: dry_run=false, so the curator acts as its skillLifecycle settings allow');
-console.log(`limit: at most ${limit} check(s), 60 seconds apart${limit > 16 ? '; past the 16th they arrive together, at the 900-second SQS maximum' : ''}`);
+console.log(`limit: at most ${limit} check(s), 60 seconds apart${limit > 16 ? '; past the 16th they arrive together, at the 900-second SQS maximum' : ''}`
+  + (values.limit === undefined ? `; ${limit} is the decay job's code default, not the deployed skillLifecycle.checksPerDay` : ''));
 if (values.plan) console.log('plan only: nothing is claimed or sent');
 
 let result;

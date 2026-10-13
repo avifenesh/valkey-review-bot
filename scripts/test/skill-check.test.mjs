@@ -143,5 +143,5 @@ test('--limit caps the checks queued; the rest are listed and counted', async ()
   const many = await skillCheck([...STACKS, '--limit', '40', '--plan']);
   assert.match(many.stdout, /^limit: at most 40 check\(s\), 60 seconds apart; past the 16th they arrive together/m);
   const defaults = await skillCheck([...STACKS, '--plan']);
-  assert.match(defaults.stdout, /^limit: at most 10 check\(s\), 60 seconds apart$/m);
+  assert.match(defaults.stdout, /^limit: at most 10 check\(s\), 60 seconds apart; 10 is the decay job's code default, not the deployed skillLifecycle\.checksPerDay$/m);
 });
