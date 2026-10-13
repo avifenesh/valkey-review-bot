@@ -49,6 +49,7 @@ import { awsRunner, quoted } from './lib/aws-cli.mjs';
 import { cliArgs, fail, loadRegistryModule, resolveRegistryId, stackOutput } from './lib/registry-cli.mjs';
 import { factsJson, factsReport, skillFacts } from './lib/skill-facts.mjs';
 import { findGraduatedRecord } from './lib/skill-records.mjs';
+import { asciiJson, printable } from './lib/text.mjs';
 
 const USAGE = [
   'usage: node scripts/skill-facts.mjs --file FILE (--repo OWNER/NAME [--ref BRANCH] | --url URL [--ref BRANCH] | --checkout DIR [--rev REV])',
@@ -112,8 +113,8 @@ if (values.file) {
   }
   if (!skill) fail(`no SKILL record named ${quoted(values.name)} in registry ${registryId}`);
   skillMd = skill.skillMd;
-  label = `${quoted(skill.name)} (record ${skill.recordId}, ${skill.status || 'status unknown'})`;
-  if (isRetiredStatus(skill.status)) console.error(`note: the record is ${skill.status}; the curator no longer checks it`);
+  label = `${quoted(skill.name)} (record ${printable(skill.recordId)}, ${printable(skill.status || 'status unknown')})`;
+  if (isRetiredStatus(skill.status)) console.error(`note: the record is ${printable(skill.status)}; the curator no longer checks it`);
 
   const table = values.table ?? (values.stack ? stackOutput(values.stack, values.region, ['ConcernsTableName']) : null);
   if (table) {
@@ -138,6 +139,7 @@ try {
 } catch (err) {
   fail(err.message);
 }
-if (values.json) console.log(JSON.stringify(factsJson(facts, { label }), null, 2));
+// The excerpts are upstream code: with non-ASCII escaped, no character of it can act on the terminal.
+if (values.json) console.log(asciiJson(factsJson(facts, { label }), 2));
 else for (const line of factsReport(facts, { label, allNames: values.names })) console.log(line);
 process.exit(facts.result.clean ? 0 : 2);

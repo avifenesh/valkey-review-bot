@@ -53,6 +53,7 @@ import { RELEASE_TAG_RE } from '../ops/src/releases.ts';
 import { awsRunner, quoted, stackOutputs } from './lib/aws-cli.mjs';
 import { queueChecks, REVIEWER_ID_RE } from './lib/check-queue.mjs';
 import { reviewerIdOfTable } from './lib/skill-records.mjs';
+import { printable } from './lib/text.mjs';
 
 const USAGE = [
   'usage: node scripts/skill-check.mjs (--stack REVIEWER_STACK | --table CONCERNS_TABLE)',
@@ -61,7 +62,7 @@ const USAGE = [
 ].join('\n');
 
 function fail(message) {
-  console.error(`error: ${message}`);
+  console.error(`error: ${printable(message, { multiline: true })}`);
   process.exit(1);
 }
 

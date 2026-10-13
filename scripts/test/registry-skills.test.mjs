@@ -2,7 +2,7 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 import { deprecateTarget, findOrphans, graduatedNames } from '../lib/skill-records.mjs';
 import { fakeAws, fakeAwsCli, flag, runScript, typed } from './support/aws.mjs';
-import { fakeRegistry, registryEnv } from './support/registry.mjs';
+import { failingRegistry, fakeRegistry, registryEnv } from './support/registry.mjs';
 
 const isRetired = (s) => s === 'DEPRECATED' || s === 'REJECTED';
 
@@ -119,4 +119,30 @@ test('deprecate by name refuses a name whose records are all retired', async () 
   assert.equal(r.code, 1);
   assert.match(r.stderr, /no record named refused that is not already deprecated or rejected in registry reg-1/);
   assert.ok(!r.requests.some((q) => q.method === 'PATCH'));
+});
+
+test('list shows registry names, ids and statuses without control or format characters', async () => {
+  const registry = await fakeRegistry([{ recordId: 'r-\u001b[2J', name: 'evil\tname\u202e\n', status: 'DRAFT\u009b' }]);
+  try {
+    const r = await runScript('registry-skills.mjs', ['list', '--registry-id', 'reg-1'], { env: registryEnv(fakeAwsCli({}).env, registry) });
+    assert.equal(r.code, 0, r.stderr);
+    assert.equal(r.stdout, 'evil name? \tr-?[2J\tDRAFT?\t2026-10-01T00:00:00.000Z\n', 'one row of four columns');
+  } finally {
+    await registry.close();
+  }
+});
+
+test('a registry error is one printable error line, not a stack trace', async () => {
+  const registry = await failingRegistry('no such registry \u001b[2J\u202e');
+  try {
+    for (const script of [['registry-skills.mjs', 'list'], ['publish-curator-skills.mjs']]) {
+      const r = await runScript(script[0], [...script.slice(1), '--registry-id', 'reg-1'], { env: registryEnv(fakeAwsCli({}).env, registry) });
+      assert.equal(r.code, 1, script[0]);
+      assert.match(r.stderr, /^error: registry reg-1: .*no such registry \?\[2J\?/, script[0]);
+      assert.ok(!/[\u001b\u202e]/.test(r.stderr), script[0]);
+      assert.ok(!r.stderr.includes('    at '), `${script[0]}: no stack trace`);
+    }
+  } finally {
+    await registry.close();
+  }
 });

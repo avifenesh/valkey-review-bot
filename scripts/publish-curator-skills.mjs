@@ -19,6 +19,7 @@ import { readdirSync, readFileSync } from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { cliArgs, fail, loadRegistryModule, resolveRegistryId } from './lib/registry-cli.mjs';
+import { printable } from './lib/text.mjs';
 
 const USAGE = 'usage: node scripts/publish-curator-skills.mjs (--registry-id ID | --stack CURATOR_STACK) [--region REGION] [--dry-run]';
 const SKILLS_DIR = fileURLToPath(new URL('../agents/curator/skills/', import.meta.url));
@@ -83,8 +84,10 @@ console.log(`publishing ${skills.length} skill(s) to registry ${registryId}`);
 try {
   for (const s of skills) {
     const result = await upsertSkill(client, registryId, { name: s.name, description: s.description, skillMd: s.skillMd });
-    console.log(`  ${result.action} ${s.name} status=${result.status || '?'}`);
+    console.log(`  ${result.action} ${s.name} status=${printable(result.status || '?')}`);
   }
+} catch (err) {
+  fail(`registry ${registryId}: ${err instanceof Error ? err.message : String(err)}`);
 } finally {
   client.destroy();
 }

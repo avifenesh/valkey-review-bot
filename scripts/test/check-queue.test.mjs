@@ -236,3 +236,13 @@ test('values from the table are quoted in every line', () => {
   assert.ok(!lines[0].includes('\n') && !lines[0].includes('\u202e'));
   assert.match(lines[0], /bucket="src\\n\[decay\] fake"/);
 });
+
+test('AWS error text in a line is printable and stays on the line', () => {
+  const aws = cliWith([live('a')], {
+    'sqs send-message': (args) => { throw cliError(args, 'An error occurred\n\u001b[2Jerror bucket="src" id="b": forged\u202e'); },
+  });
+  const { lines } = run(aws);
+  const sendLine = lines.find((l) => l.includes('send failed'));
+  assert.ok(sendLine.endsWith('An error occurred ?[2Jerror bucket="src" id="b": forged?'), sendLine);
+  for (const l of lines) assert.ok(!/[\n\u001b\u202e]/.test(l), JSON.stringify(l));
+});

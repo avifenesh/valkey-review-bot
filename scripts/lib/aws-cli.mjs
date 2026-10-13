@@ -4,6 +4,8 @@
 
 import { execFileSync } from 'node:child_process';
 
+export { quoted } from './text.mjs';
+
 /** The CLI exited non-zero. `stderr` holds its message (AWS errors carry no secret values). */
 export class AwsCliError extends Error {
   constructor(args, status, stderr) {
@@ -87,13 +89,4 @@ export function scanItems(aws, table, { projection, names, filter, values } = {}
   if (names) args.push('--expression-attribute-names', JSON.stringify(names));
   if (values) args.push('--expression-attribute-values', JSON.stringify(values));
   return ((aws(args) ?? {}).Items ?? []).map(fromItem);
-}
-
-/**
- * A value read from a table or the registry, for one output line:
- * JSON-quoted, with non-ASCII escaped too, so it can neither break the
- * line nor reorder how the terminal shows it.
- */
-export function quoted(value) {
-  return JSON.stringify(String(value)).replace(/[\u007f-\uffff]/g, (c) => `\\u${c.charCodeAt(0).toString(16).padStart(4, '0')}`);
 }

@@ -58,3 +58,21 @@ export function registryEnv(base, registry) {
     AWS_SHARED_CREDENTIALS_FILE: '/dev/null',
   };
 }
+
+/** A registry endpoint that answers every request with HTTP 400 ValidationException and `message`. */
+export async function failingRegistry(message) {
+  const server = http.createServer((req, res) => {
+    req.resume();
+    req.on('end', () => {
+      res.statusCode = 400;
+      res.setHeader('content-type', 'application/json');
+      res.setHeader('x-amzn-errortype', 'ValidationException');
+      res.end(JSON.stringify({ message }));
+    });
+  });
+  await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
+  return {
+    url: `http://127.0.0.1:${server.address().port}`,
+    close: () => new Promise((resolve) => server.close(resolve)),
+  };
+}

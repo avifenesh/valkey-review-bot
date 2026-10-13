@@ -31,6 +31,7 @@
 import { awsRunner } from './lib/aws-cli.mjs';
 import { cliArgs, fail, loadRegistryModule, resolveRegistryId, stackOutput } from './lib/registry-cli.mjs';
 import { deprecateTarget, findOrphans, graduatedNames } from './lib/skill-records.mjs';
+import { printable } from './lib/text.mjs';
 
 const USAGE = [
   'usage: node scripts/registry-skills.mjs list (--registry-id ID | --stack STACK) [--region REGION]',
@@ -65,7 +66,8 @@ const table = command === 'orphans' ? (values.table ?? stackOutput(values.stack,
 const { createRegistryClient, deprecateSkill, isRetiredStatus, listSkillSummaries } = await loadRegistryModule();
 const client = createRegistryClient(values.region);
 
-const row = (r) => [r.name, r.recordId, r.status, r.updatedAt?.toISOString() ?? '-'].join('\t');
+// Names, ids and statuses come from the registry: printable, so no tab or control character can shift a column or the terminal.
+const row = (r) => [r.name, r.recordId, r.status, r.updatedAt?.toISOString() ?? '-'].map((v) => printable(v ?? '-')).join('\t');
 
 try {
   const records = await listSkillSummaries(client, registryId);
@@ -99,8 +101,10 @@ try {
       fail(`${err.message} in registry ${registryId}`);
     }
     const status = await deprecateSkill(client, registryId, recordId, values.reason);
-    console.log(`deprecated ${recordId} status=${status || '?'}`);
+    console.log(`deprecated ${printable(recordId)} status=${printable(status || '?')}`);
   }
+} catch (err) {
+  fail(`registry ${registryId}: ${err instanceof Error ? err.message : String(err)}`);
 } finally {
   client.destroy();
 }

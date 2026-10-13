@@ -6,6 +6,7 @@
 
 import { isConditionFailure, quoted, scanItems } from './aws-cli.mjs';
 import { isReservedBucket } from './skill-records.mjs';
+import { printable } from './text.mjs';
 
 // The limits ops/src/decay.ts applies, so the curator accepts every
 // message this sends. test/check-queue.test.mjs checks the messages and
@@ -194,7 +195,7 @@ export function queueChecks({ aws, table, queueUrl, reviewerId, name, releaseTag
         log(`skipped ${line}: it changed since it was read (reinforced, retired or claimed by the decay pass)`);
       } else {
         errors += 1;
-        log(`error ${line}: claim failed: ${err.message}`);
+        log(`error ${line}: claim failed: ${printable(err.message)}`);
       }
       continue;
     }
@@ -208,12 +209,12 @@ export function queueChecks({ aws, table, queueUrl, reviewerId, name, releaseTag
       log(`queued ${line} delay=${delay}s maintenance=${quoted(id)}`);
     } catch (err) {
       errors += 1;
-      log(`error ${line}: send failed: ${err.message}`);
+      log(`error ${line}: send failed: ${printable(err.message)}`);
       try {
         aws(releaseArgs(table, check.key, id));
       } catch (releaseErr) {
         if (!isConditionFailure(releaseErr)) {
-          log(`error ${line}: could not release maintenance=${quoted(id)}; the record gets no new request for ${MAINTENANCE_RETRY_DAYS} days: ${releaseErr.message}`);
+          log(`error ${line}: could not release maintenance=${quoted(id)}; the record gets no new request for ${MAINTENANCE_RETRY_DAYS} days: ${printable(releaseErr.message)}`);
         }
       }
     }

@@ -115,3 +115,12 @@ test('a failed send exits 1 after releasing the claim', async () => {
   assert.match(r.stdout, /errors 2$/m);
   assert.equal(r.calls.filter((c) => c.op === 'dynamodb update-item' && flag(c.args, '--update-expression').startsWith('REMOVE')).length, 2);
 });
+
+test('an AWS error reaches the terminal without control or format characters', async () => {
+  const r = await skillCheck(STACKS, {
+    'cloudformation describe-stacks': { stderr: 'An error occurred (ValidationException): Stack \u001b[2J\u202e does not exist\n', status: 254 },
+  });
+  assert.equal(r.code, 1);
+  assert.match(r.stderr, /^error: could not read the outputs of stack ValkeyReviewAgent: .*Stack \?\[2J\? does not exist/);
+  assert.ok(!/[\u001b\u202e]/.test(r.stderr));
+});

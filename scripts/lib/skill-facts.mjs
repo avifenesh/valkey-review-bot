@@ -10,7 +10,7 @@ import path from 'node:path';
 import { areaFileCounts, checkSkill } from '../../agents/common/src/skill-check/check.ts';
 import { extractNames } from '../../agents/common/src/skill-check/names.ts';
 import { createGitRunner, prepareUpstreamCheckout, removeCheckout } from '../../agents/common/src/skill-check/upstream.ts';
-import { quoted } from './aws-cli.mjs';
+import { printable, quoted } from './text.mjs';
 
 const SHA_RE = /^(?:[0-9a-f]{40}|[0-9a-f]{64})$/;
 
@@ -116,30 +116,35 @@ export async function skillFacts({ skillMd, upstream, record = null, base }) {
   }
 }
 
-const list = (tokens) => (tokens.length === 0 ? '-' : tokens.map((t) => `\`${t}\``).join(', '));
+const list = (tokens) => (tokens.length === 0 ? '-' : tokens.map((t) => `\`${printable(t)}\``).join(', '));
 
-/** The report as text lines. `label` names the skill; with `allNames` every cited name gets a line. */
+/**
+ * The report as text lines. `label` names the skill; with `allNames` every
+ * cited name gets a line. Names, area globs, the branch and git's messages
+ * come from the skill, the concern record or the upstream, so each goes
+ * through printable().
+ */
 export function factsReport(facts, { label, allNames = false }) {
   const { names, result, upstream, base, baseline, area } = facts;
   const short = (sha) => sha.slice(0, 12);
-  const lines = [`skill: ${label}`];
+  const lines = [`skill: ${printable(label)}`];
   lines.push(upstream.url
-    ? `upstream: ${upstream.url} ${upstream.branch}@${short(upstream.commit)}`
-    : `upstream: checkout ${upstream.checkout} at ${upstream.rev} (${short(upstream.commit)})`);
+    ? `upstream: ${printable(upstream.url)} ${printable(upstream.branch)}@${short(upstream.commit)}`
+    : `upstream: checkout ${printable(upstream.checkout)} at ${printable(upstream.rev)} (${short(upstream.commit)})`);
   if (!base) lines.push('base: none, so no names are touched');
   else if (!base.available) lines.push(`base: ${quoted(base.sha)} is not available here, so no names are touched`);
   else lines.push(`base: ${short(base.sha)}, ${result.changedFiles} file(s) changed since`);
   if (baseline.from === 'record') lines.push(`baseline: ${baseline.names.length} name(s), the concern record's audit_names`);
   else if (baseline.from === 'base') lines.push(`baseline: ${baseline.names.length} name(s), the cited names present at the base`);
-  else if (baseline.error) lines.push(`baseline: none, the names at the base could not be read (${baseline.error.slice(0, 300)})`);
+  else if (baseline.error) lines.push(`baseline: none, the names at the base could not be read (${printable(baseline.error.slice(0, 300))})`);
   else lines.push('baseline: none (a first check): every absent name is new');
   lines.push(`names: ${names.length} cited, ${result.present.length} present`);
   lines.push(`lost (${result.lost.length}): ${list(result.lost)}`);
   lines.push(`new absent (${result.newAbsent.length}): ${list(result.newAbsent)}`);
   lines.push(`touched (${result.touched.length}): ${list(result.touched)}`);
-  for (const why of result.incomplete) lines.push(`incomplete: ${why}`);
+  for (const why of result.incomplete) lines.push(`incomplete: ${printable(why)}`);
   lines.push(`kept fraction: ${result.keptFraction.toFixed(3)}`);
-  if (area.length > 0) lines.push(`area: ${area.map((a) => `\`${a.glob}\` ${a.files} file(s)`).join(', ')}`);
+  if (area.length > 0) lines.push(`area: ${area.map((a) => `\`${printable(a.glob)}\` ${a.files} file(s)`).join(', ')}`);
   lines.push(`clean: ${result.clean ? 'yes' : 'no'}`);
   if (allNames) {
     const lost = new Set(result.lost);
@@ -152,7 +157,7 @@ export function factsReport(facts, { label, allNames = false }) {
       if (lost.has(n.token)) state = 'lost';
       else if (count === 0 && ignored.has(n.token)) state = 'ignored';
       else if (touched.has(n.token)) state = 'touched';
-      lines.push(`${state.padEnd(10)} ${n.kind.padEnd(10)} ${String(count).padStart(5)}  ${n.token}`);
+      lines.push(`${state.padEnd(10)} ${printable(n.kind).padEnd(10)} ${String(count).padStart(5)}  ${printable(n.token)}`);
     }
   }
   return lines;

@@ -162,6 +162,36 @@ test('the report lists every cited name with --names, and the JSON carries the e
   assert.deepEqual(json.names[1], { token: 'emptyDB', kind: 'symbol', count: 0 });
 });
 
+const UNSAFE_RE = /[\p{Cc}\p{Cf}\p{Zl}\p{Zp}]/u;
+
+test('the report shows no control, escape or format character from the record, the upstream or git', () => {
+  // A record's area globs are written by the curator model; the branch comes from the remote.
+  const evil = 'x\u001b[2J\u202e\u200b\u009by';
+  const facts = {
+    names: [{ token: `name${evil}`, kind: `symbol${evil}` }],
+    result: {
+      present: [], lost: [`lost${evil}`], newAbsent: [`new${evil}`], touched: [], incomplete: [`git said ${evil}\nclean: yes`],
+      keptFraction: 0, changedFiles: 0, counts: new Map(), clean: false,
+    },
+    upstream: { url: 'file:///up.git', branch: `main${evil}`, commit: 'a'.repeat(40) },
+    base: null,
+    baseline: { from: 'none', names: [], error: `bad object ${evil}` },
+    ignored: [],
+    area: [{ glob: `src/${evil}*.c`, files: 1 }],
+  };
+  const lines = factsReport(facts, { label: `skill${evil}.md`, allNames: true });
+  for (const line of lines) assert.ok(!UNSAFE_RE.test(line), JSON.stringify(line));
+  const shown = 'x?[2J???y';
+  assert.ok(lines.includes(`area: \`src/${shown}*.c\` 1 file(s)`));
+  assert.ok(lines.includes(`incomplete: git said ${shown} clean: yes`), 'one line, so it cannot pose as the verdict');
+  assert.ok(!lines.includes('clean: yes'));
+  for (const text of [`skill: skill${shown}.md`, `upstream: file:///up.git main${shown}@aaaaaaaaaaaa`, `lost (1): \`lost${shown}\``]) {
+    assert.ok(lines.includes(text), text);
+  }
+  assert.ok(lines.some((l) => l.includes(`bad object ${shown}`)));
+  assert.match(lines.at(-1), new RegExp(`^absent +symbol${shown.replace(/[?[]/g, '\\$&')} +0  name${shown.replace(/[?[]/g, '\\$&')}$`));
+});
+
 const write = (dir, name, text) => {
   const file = path.join(dir, name);
   writeFileSync(file, text);
@@ -182,6 +212,20 @@ test('skill-facts.mjs exits 0 for a clean skill and 2 for a stale one', async ()
   const json = await runScript('skill-facts.mjs', ['--file', path.join(dir, 'skill.md'), '--url', up.url, '--json']);
   assert.equal(json.code, 2, json.stderr);
   assert.deepEqual(JSON.parse(json.stdout).newAbsent, ['emptyDB', 'old_counter', 'src/old.c', 'not_in_upstream']);
+  rmSync(dir, { recursive: true, force: true });
+});
+
+test('skill-facts.mjs prints the JSON as plain ASCII, the same data', async () => {
+  const dir = tempDir('facts-cli-');
+  const file = write(dir, 'skill\u202e\u0085.md', SKILL);
+  const json = await runScript('skill-facts.mjs', ['--file', file, '--url', up.url, '--base', up.baseSha, '--json']);
+  assert.equal(json.code, 2, json.stderr);
+  assert.match(json.stdout, /^[\n\x20-\x7e]*$/);
+  const parsed = JSON.parse(json.stdout);
+  assert.equal(parsed.skill, file);
+  assert.ok(parsed.excerpts.length > 0);
+  const text = await runScript('skill-facts.mjs', ['--file', file, '--url', up.url]);
+  assert.ok(text.stdout.startsWith(`skill: ${dir}/skill??.md\n`), text.stdout);
   rmSync(dir, { recursive: true, force: true });
 });
 

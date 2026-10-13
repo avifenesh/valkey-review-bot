@@ -4,9 +4,11 @@
 
 import { parseArgs } from 'node:util';
 import { awsRunner, stackOutputs } from './aws-cli.mjs';
+import { printable } from './text.mjs';
 
+/** Print the error and exit 1. The message can carry AWS or git output, so it is made printable. */
 export function fail(message) {
-  console.error(`error: ${message}`);
+  console.error(`error: ${printable(message, { multiline: true })}`);
   process.exit(1);
 }
 
@@ -15,7 +17,7 @@ export function cliArgs(options, usage) {
   try {
     return parseArgs({ options: { ...options, help: { type: 'boolean', short: 'h' } }, allowPositionals: true });
   } catch (err) {
-    console.error(err.message);
+    console.error(printable(err.message, { multiline: true }));
     console.error(usage);
     process.exit(1);
   }
