@@ -117,7 +117,8 @@ const DIGITS = /^\d{1,20}$/;
 const REGISTRY_ID = /^[A-Za-z0-9_-]{1,64}$/;
 const BOOTSTRAP_QUALIFIER = /^[a-z0-9]{1,10}$/;
 const LOGIN = /^[A-Za-z0-9](?:[A-Za-z0-9-]{0,38})(?:\[bot\])?$/;
-const REPO = /^[A-Za-z0-9](?:[A-Za-z0-9-]{0,38})\/[A-Za-z0-9._-]{1,100}$/;
+/** "owner/name"; the decay job, the curator and the brokers refuse a name of "." or "..". */
+const REPO = /^[A-Za-z0-9](?:[A-Za-z0-9-]{0,38})\/(?!\.\.?$)[A-Za-z0-9._-]{1,100}$/;
 const ROUTE_ID = /^[A-Za-z0-9-]{1,64}$/;
 const SECRET_NAME = /^[A-Za-z0-9/_+=.@-]{1,512}$/;
 const MODEL_ID = /^[a-z0-9-]+\.[A-Za-z0-9][A-Za-z0-9._:-]{0,200}$/;

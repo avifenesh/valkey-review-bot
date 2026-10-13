@@ -73,6 +73,18 @@ describe('defaults', () => {
     expect(tokenBrokerRepos(config, 'valkey-glide-review')).toEqual(['example-org/valkey-glide']);
   });
 
+  test('a repository named . or .. is refused, as the decay job and the curator refuse it', () => {
+    const message = problems(withChange((raw) => {
+      raw.upstreamRepos = { 'valkey-review': 'valkey-io/..', 'valkey-glide-review': 'valkey-io/.' };
+      raw.routes[0].repo = 'example-org/..';
+    }));
+    expect(message).toContain('upstreamRepos.valkey-review must be owner/name');
+    expect(message).toContain('upstreamRepos.valkey-glide-review must be owner/name');
+    expect(message).toContain('routes[0].repo must be owner/name');
+    expect(parseDeploymentConfig(withChange((raw) => { raw.upstreamRepos = { 'valkey-review': 'valkey-io/.valkey..x' }; }))
+      .upstreamRepos['valkey-review']).toBe('valkey-io/.valkey..x');
+  });
+
   test('an empty upstream repository means "use the pull request repository"', () => {
     const config = parseDeploymentConfig(withChange((raw) => { raw.upstreamRepos = { 'valkey-review': '' }; }));
     expect(config.upstreamRepos['valkey-review']).toBe('');
