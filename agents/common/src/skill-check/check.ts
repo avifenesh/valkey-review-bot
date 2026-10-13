@@ -87,15 +87,15 @@ export interface CheckResult {
   readonly baseGone: boolean;
   /** Files changed between the base and the commit. */
   readonly changedFiles: number;
-  /** The diff of the candidate files passed DIFF_MAX_BYTES, so `touched` may be incomplete. */
+  /** The diff of a candidate file passed DIFF_MAX_BYTES on its own and was read only that far, so `touched` may be incomplete. */
   readonly diffTruncated: boolean;
-  /** More than DIFF_MAX_CANDIDATES changed files held a rare cited name; the rest were not diffed. */
+  /** DIFF_BUDGET_BYTES ran out before every candidate file was diffed; the rest were not. */
   readonly candidatesCapped: boolean;
   /**
-   * Why `touched` may be incomplete, one line each: a capped candidate
-   * list, a truncated diff, a base that was given but is missing or
-   * could not be fetched. Empty when the whole diff was examined, or
-   * none was asked for. See confirmableCommit.
+   * Why `touched` may be incomplete, one line each: a diff budget that
+   * ran out, a file whose diff was cut, a base that was given but is
+   * missing or could not be fetched. Empty when the whole diff was
+   * examined, or none was asked for. See confirmableCommit.
    */
   readonly incomplete: readonly string[];
 }
@@ -127,8 +127,12 @@ const GREP_CONCURRENCY = 4;
 const COMPONENT_MIN_CHARS = 3;
 /** A name with at most this many occurrences at the commit is rare enough to report as touched. */
 export const RARE_MAX = 40;
-export const DIFF_MAX_CANDIDATES = 200;
+/** Candidate files (changed files that hold a rare cited name, and cited paths that changed) per git diff call. */
+export const DIFF_FILES_PER_CALL = 200;
+/** Output read per git diff call. The files of a call past it that were not read in full are diffed again; one file past it on its own is read that far. */
 export const DIFF_MAX_BYTES = 4 * 1024 * 1024;
+/** Diff output read per check, over all calls, split ones included. Once it is spent the files left are not diffed. */
+export const DIFF_BUDGET_BYTES = 64 * 1024 * 1024;
 export const EXCERPT_HUNKS_PER_NAME = 3;
 export const EXCERPTS_MAX_CHARS = 24_000;
 const HUNK_MAX_CHARS = 4_000;
@@ -339,6 +343,11 @@ function diffPath(line: string): string {
   return rest;
 }
 
+/** The file path of each patch in `git diff` output, in order. */
+function diffPaths(diff: string): string[] {
+  return diff.split('\n').filter((line) => line.startsWith('diff --git ')).map(diffPath);
+}
+
 /** Hunks of `git diff -U0` output. */
 function parseHunks(diff: string): Hunk[] {
   const hunks: Hunk[] = [];
@@ -395,6 +404,13 @@ function hitsIn(hunk: Hunk, wordRe: RegExp | null, stemRe: RegExp | null, byWord
     }
   }
   return names;
+}
+
+/** A hunk kept for the excerpts. */
+interface Shown {
+  readonly path: string;
+  /** The hunk's text, capped at HUNK_MAX_CHARS. */
+  readonly text: string;
 }
 
 function capHunk(text: string): string {
@@ -505,29 +521,6 @@ export async function checkSkill(git: GitRunner, input: CheckInput): Promise<Che
       else if (n.kind === 'prefix') probes.push({ name: n.token, word: n.token.slice(0, -1), stem: true });
     }
 
-    let hunks: Hunk[] = [];
-    if (changed.length > 0 && (probes.length > 0 || touchedPaths.length > 0)) {
-      const probeWords = [...new Set(probes.filter((p) => !p.stem).map((p) => p.word))];
-      const probeStems = [...new Set(probes.filter((p) => p.stem).map((p) => p.word))];
-      const withNames = probes.length > 0 ? await filesContaining(git, commit, probeWords, probeStems) : new Set<string>();
-      const all = [...new Set([...touchedPaths, ...changed.filter((f) => withNames.has(f))])];
-      const candidates = all.slice(0, DIFF_MAX_CANDIDATES);
-      if (all.length > candidates.length) {
-        candidatesCapped = true;
-        incomplete.push(`only ${candidates.length} of the ${all.length} changed files that hold a cited name were diffed`);
-      }
-      if (candidates.length > 0) {
-        const r = await git([
-          '--literal-pathspecs', ...DIFF, '-U0', '--no-renames', '--no-ext-diff', '--no-textconv',
-          '--src-prefix=a/', '--dst-prefix=b/', base, commit, '--', ...candidates,
-        ], { maxBytes: DIFF_MAX_BYTES });
-        if (r.code !== 0 && !r.truncated) throw new Error(`git diff exited ${r.code}: ${r.stderr.trim().slice(0, 2000)}`);
-        diffTruncated = r.truncated;
-        if (r.truncated) incomplete.push(`the diff of the candidate files passed ${DIFF_MAX_BYTES} bytes and was read only that far`);
-        hunks = parseHunks(r.stdout);
-      }
-    }
-
     const byWord = new Map<string, Probe[]>();
     const byStem = new Map<string, Probe[]>();
     for (const p of probes) {
@@ -538,31 +531,105 @@ export async function checkSkill(git: GitRunner, input: CheckInput): Promise<Che
     const wordRe = byWord.size > 0 ? new RegExp(`(?<![${WORD_CHARS}])(?:${alternation(byWord.keys())})(?![${WORD_CHARS}])`, 'g') : null;
     const stemRe = byStem.size > 0 ? new RegExp(`(?<![${WORD_CHARS}])(?:${alternation(byStem.keys())})[${WORD_CHARS}]*`, 'g') : null;
 
-    const hunksOf = new Map<string, Hunk[]>();
-    for (const h of hunks) {
-      const hit = hitsIn(h, wordRe, stemRe, byWord, byStem);
-      for (const t of touchedPaths) if (h.path === t) hit.add(t);
-      for (const name of hit) hunksOf.set(name, [...(hunksOf.get(name) ?? []), h]);
-    }
-    for (const n of names) if (hunksOf.has(n.token) || touchedPaths.includes(n.token)) touched.push(n.token);
+    const touchedSet = new Set(touchedPaths);
+    // Per name that a hunk hit, its first EXCERPT_HUNKS_PER_NAME hunks, capped. A hunk that hit several names is one object.
+    const shownOf = new Map<string, Shown[]>();
+    const scan = (hunks: readonly Hunk[]) => {
+      for (const h of hunks) {
+        const hit = hitsIn(h, wordRe, stemRe, byWord, byStem);
+        if (touchedSet.has(h.path)) hit.add(h.path);
+        let shown: Shown | undefined;
+        for (const name of hit) {
+          const list = shownOf.get(name) ?? [];
+          shownOf.set(name, list);
+          if (list.length >= EXCERPT_HUNKS_PER_NAME) continue;
+          shown ??= { path: h.path, text: capHunk(h.text) };
+          list.push(shown);
+        }
+      }
+    };
 
-    // Up to EXCERPT_HUNKS_PER_NAME hunks per touched name, each hunk once, within EXCERPTS_MAX_CHARS.
-    const chosen = new Map<Hunk, { names: string[]; text: string }>();
-    let chars = 0;
-    for (const name of touched) {
-      for (const h of (hunksOf.get(name) ?? []).slice(0, EXCERPT_HUNKS_PER_NAME)) {
-        const existing = chosen.get(h);
-        if (existing) {
-          existing.names.push(name);
+    if (changed.length > 0 && (probes.length > 0 || touchedPaths.length > 0)) {
+      const probeWords = [...new Set(probes.filter((p) => !p.stem).map((p) => p.word))];
+      const probeStems = [...new Set(probes.filter((p) => p.stem).map((p) => p.word))];
+      const withNames = probes.length > 0 ? await filesContaining(git, commit, probeWords, probeStems) : new Set<string>();
+      // In the order git lists them, which is the order the hunks come in.
+      const candidates = changed.filter((f) => touchedSet.has(f) || withNames.has(f));
+      const pending = chunks(candidates, DIFF_FILES_PER_CALL);
+      // Never an empty batch: `git diff -- ` with no path diffs the whole tree.
+      const requeue = (...batches: string[][]) => pending.unshift(...batches.filter((b) => b.length > 0));
+      let spent = 0;
+      let cut = 0;
+      let skipped = 0;
+      while (pending.length > 0) {
+        const batch = pending.shift()!;
+        if (spent >= DIFF_BUDGET_BYTES) {
+          skipped += batch.length;
           continue;
         }
-        const text = capHunk(h.text);
-        if (chars + text.length > EXCERPTS_MAX_CHARS) continue;
-        chars += text.length;
-        chosen.set(h, { names: [name], text });
+        const r = await git([
+          '--literal-pathspecs', ...DIFF, '-U0', '--no-renames', '--no-ext-diff', '--no-textconv',
+          '--src-prefix=a/', '--dst-prefix=b/', base, commit, '--', ...batch,
+        ], { maxBytes: DIFF_MAX_BYTES });
+        if (r.code !== 0 && !r.truncated) throw new Error(`git diff exited ${r.code}: ${r.stderr.trim().slice(0, 2000)}`);
+        spent += Buffer.byteLength(r.stdout);
+        if (!r.truncated) {
+          scan(parseHunks(r.stdout));
+          continue;
+        }
+        // Cut short, maybe inside a line, which is left out. The files whose
+        // patch ended before the last one began were read in full.
+        const out = r.stdout.slice(0, r.stdout.lastIndexOf('\n') + 1);
+        const hunks = parseHunks(out);
+        const inBatch = new Set(batch);
+        const paths = diffPaths(out);
+        const last = paths[paths.length - 1];
+        const full = new Set(paths.filter((f) => f !== last && inBatch.has(f)));
+        if (full.size > 0) {
+          scan(hunks.filter((h) => full.has(h.path)));
+          requeue(batch.filter((f) => !full.has(f)));
+        } else if (batch.length === 1) {
+          // The file's diff alone passed the cap: it is read that far.
+          cut++;
+          scan(hunks);
+        } else if (last !== undefined && inBatch.has(last)) {
+          // Likewise the first file's, so the call needs no repeat for it.
+          cut++;
+          scan(hunks.filter((h) => h.path === last));
+          requeue(batch.filter((f) => f !== last));
+        } else {
+          // Paths git quoted, so they cannot be matched: diff each half on its own.
+          const half = Math.ceil(batch.length / 2);
+          requeue(batch.slice(0, half), batch.slice(half));
+        }
+      }
+      if (cut > 0) {
+        diffTruncated = true;
+        incomplete.push(`${cut} of the ${candidates.length} changed files that hold a cited name had a diff of more than ${DIFF_MAX_BYTES} bytes, which was read only that far`);
+      }
+      if (skipped > 0) {
+        candidatesCapped = true;
+        incomplete.push(`the diff budget of ${DIFF_BUDGET_BYTES} bytes ran out, so ${skipped} of the ${candidates.length} changed files that hold a cited name were not diffed`);
       }
     }
-    for (const [h, { names: hunkNames, text }] of chosen) excerpts.push({ names: hunkNames, path: h.path, hunk: text });
+    for (const n of names) if (shownOf.has(n.token) || touchedSet.has(n.token)) touched.push(n.token);
+
+    // Up to EXCERPT_HUNKS_PER_NAME hunks per touched name, each hunk once, within EXCERPTS_MAX_CHARS.
+    const chosen = new Map<Shown, string[]>();
+    let chars = 0;
+    for (const name of touched) {
+      for (const shown of shownOf.get(name) ?? []) {
+        const listed = chosen.get(shown);
+        if (listed) {
+          listed.push(name);
+          continue;
+        }
+        if (chars + shown.text.length > EXCERPTS_MAX_CHARS) continue;
+        chars += shown.text.length;
+        chosen.set(shown, [name]);
+      }
+    }
+    for (const [shown, listed] of chosen) excerpts.push({ names: listed, path: shown.path, hunk: shown.text });
   }
 
   return {

@@ -6,7 +6,7 @@ import path from 'node:path';
 import test from 'node:test';
 
 // No resolve hook: these modules must load under plain type stripping.
-const { areaFileCounts, checkSkill, confirmableCommit, DIFF_MAX_BYTES, DIFF_MAX_CANDIDATES, globToRegExp, RARE_MAX } = await import('../src/skill-check/check.ts');
+const { areaFileCounts, checkSkill, confirmableCommit, DIFF_BUDGET_BYTES, DIFF_FILES_PER_CALL, DIFF_MAX_BYTES, globToRegExp, RARE_MAX } = await import('../src/skill-check/check.ts');
 const { extractNames } = await import('../src/skill-check/names.ts');
 const { createGitRunner } = await import('../src/skill-check/upstream.ts');
 
@@ -249,32 +249,121 @@ test('only a complete result gives a commit to record as verified', async () => 
   r.cleanup();
 });
 
-test('a capped candidate list is not clean, and says why', async () => {
-  // Each file holds a rare cited name, and each changed, but not on the name's line.
-  const count = DIFF_MAX_CANDIDATES + 1;
-  const file = (i, v) => `x = ${v};\nint rare_cap_${i};\n`;
+/** A runner that counts the git diff -U0 calls and the files each names. */
+function countingDiffs(git) {
+  const calls = [];
+  const run = (args, opts) => {
+    if (args.includes('-U0')) calls.push(args.slice(args.indexOf('--') + 1));
+    return git(args, opts);
+  };
+  return { run, calls };
+}
+
+test('more candidate files than one diff call takes are all diffed', async () => {
+  // Each file holds a rare cited name, and each name's line changed.
+  const count = DIFF_FILES_PER_CALL + 1;
+  const file = (i, v) => `x = 1;\nint rare_cap_${i} = ${v};\n`;
   const base = Object.fromEntries(Array.from({ length: count }, (_, i) => [`f/${i}.txt`, file(i, 1)]));
   const tip = Object.fromEntries(Array.from({ length: count }, (_, i) => [`f/${i}.txt`, file(i, 2)]));
   const r = repo(base, tip);
   const cited = Array.from({ length: count }, (_, i) => `rare_cap_${i}`);
-  const result = await checkSkill(r.git, { names: names(cited.map((t) => `\`${t}\``).join(' ')), baseline: cited, baseSha: r.baseSha });
-  assert.deepEqual(result.touched, []);
-  assert.deepEqual(result.lost, []);
-  assert.equal(result.candidatesCapped, true);
-  assert.deepEqual(result.incomplete, [`only ${DIFF_MAX_CANDIDATES} of the ${count} changed files that hold a cited name were diffed`]);
+  const { run, calls } = countingDiffs(r.git);
+  const result = await checkSkill(run, { names: names(cited.map((t) => `\`${t}\``).join(' ')), baseline: cited, baseSha: r.baseSha });
+  assert.deepEqual(calls.map((c) => c.length), [DIFF_FILES_PER_CALL, 1]);
+  assert.deepEqual(result.touched, cited);
+  assert.deepEqual([result.candidatesCapped, result.diffTruncated, result.incomplete], [false, false, []]);
+  assert.equal(confirmableCommit(result), r.tipSha);
+  r.cleanup();
+});
+
+/** `lines` lines of 80 copies of `c`. */
+const filler = (c, lines) => `${Array.from({ length: lines }, () => c.repeat(80)).join('\n')}\n`;
+
+test('a diff call cut short keeps the files it read in full and diffs the rest again', async () => {
+  // a.txt and b.txt each have a diff of about 2.4 MB, so the first call stops inside b.txt.
+  const r = repo(
+    { 'a.txt': `int rare_a_name = 1;\n${filler('a', 15_000)}`, 'b.txt': `int rare_b_name = 1;\n${filler('a', 15_000)}`, 'c.txt': 'int rare_c_name = 1;\n' },
+    { 'a.txt': `int rare_a_name = 2;\n${filler('b', 15_000)}`, 'b.txt': `int rare_b_name = 2;\n${filler('b', 15_000)}`, 'c.txt': 'int rare_c_name = 2;\n' },
+  );
+  const cited = ['rare_a_name', 'rare_b_name', 'rare_c_name'];
+  const { run, calls } = countingDiffs(r.git);
+  const result = await checkSkill(run, { names: names(cited.map((t) => `\`${t}\``).join(' ')), baseline: cited, baseSha: r.baseSha });
+  assert.deepEqual(calls, [['a.txt', 'b.txt', 'c.txt'], ['b.txt', 'c.txt']]);
+  assert.deepEqual(result.touched, cited);
+  assert.deepEqual([result.diffTruncated, result.candidatesCapped, result.incomplete], [false, false, []]);
+  assert.deepEqual(result.excerpts.map((e) => e.path), ['a.txt', 'b.txt', 'c.txt']);
+  r.cleanup();
+});
+
+test('a cut call never leaves an empty batch, which would diff the whole tree', async () => {
+  // d/foo became a directory: its pathspec also matches d/foo/x, whose patch comes last and is cut.
+  const r = repo({ 'd/foo': filler('a', 30_000), 'd/other.txt': 'x\n' }, { 'd/foo': null, 'd/foo/x': filler('b', 30_000), 'd/other.txt': 'y\n' });
+  const { run, calls } = countingDiffs(r.git);
+  const result = await checkSkill(run, { names: names('`d/foo`'), baseline: ['d/foo'], baseSha: r.baseSha });
+  assert.deepEqual(calls, [['d/foo']]);
+  assert.deepEqual(result.touched, ['d/foo']);
+  assert.deepEqual(result.incomplete, []);
+  r.cleanup();
+});
+
+test('a cut call whose paths git quoted is diffed again in halves', async () => {
+  // A double quote in a file name makes git quote the path in the patch header.
+  const r = repo(
+    { 'q"1.txt': `int rare_q1_name = 1;\n${filler('a', 15_000)}`, 'q"2.txt': `int rare_q2_name = 1;\n${filler('a', 15_000)}` },
+    { 'q"1.txt': `int rare_q1_name = 2;\n${filler('b', 15_000)}`, 'q"2.txt': `int rare_q2_name = 2;\n${filler('b', 15_000)}` },
+  );
+  const cited = ['rare_q1_name', 'rare_q2_name'];
+  const { run, calls } = countingDiffs(r.git);
+  const result = await checkSkill(run, { names: names(cited.map((t) => `\`${t}\``).join(' ')), baseline: cited, baseSha: r.baseSha });
+  assert.deepEqual(calls, [['q"1.txt', 'q"2.txt'], ['q"1.txt'], ['q"2.txt']]);
+  assert.deepEqual(result.touched, cited);
+  assert.deepEqual(result.incomplete, []);
+  r.cleanup();
+});
+
+test('a file whose diff alone passes the cap is read that far, and the result is incomplete', async () => {
+  const r = repo(
+    { 'big.txt': `int rare_head_name = 1;\n${filler('a', 30_000)}int rare_big_name;\n`, 'small.txt': 'int rare_small_name = 1;\n' },
+    { 'big.txt': `int rare_head_name = 2;\n${filler('b', 30_000)}int rare_big_name;\n`, 'small.txt': 'int rare_small_name = 2;\n' },
+  );
+  const cited = ['rare_head_name', 'rare_big_name', 'rare_small_name'];
+  const { run, calls } = countingDiffs(r.git);
+  const result = await checkSkill(run, { names: names(cited.map((t) => `\`${t}\``).join(' ')), baseline: cited, baseSha: r.baseSha });
+  // The first call stops inside big.txt, which comes first; it is not diffed again.
+  assert.deepEqual(calls, [['big.txt', 'small.txt'], ['small.txt']]);
+  assert.deepEqual(result.touched, ['rare_head_name', 'rare_small_name']);
+  assert.equal(result.diffTruncated, true);
+  assert.deepEqual(result.incomplete, [`1 of the 2 changed files that hold a cited name had a diff of more than ${DIFF_MAX_BYTES} bytes, which was read only that far`]);
   assert.equal(result.clean, false);
   assert.equal(confirmableCommit(result), null);
   r.cleanup();
 });
 
-test('a truncated diff is not clean, and says why', async () => {
-  const filler = (c) => `${Array.from({ length: 30_000 }, () => c.repeat(80)).join('\n')}\n`;
-  const r = repo({ 'big.txt': `${filler('a')}int rare_big_name;\n` }, { 'big.txt': `${filler('b')}int rare_big_name;\n` });
-  const result = await checkSkill(r.git, { names: names('`rare_big_name`'), baseline: ['rare_big_name'], baseSha: r.baseSha });
-  assert.deepEqual(result.touched, []);
-  assert.equal(result.diffTruncated, true);
-  assert.deepEqual(result.incomplete, [`the diff of the candidate files passed ${DIFF_MAX_BYTES} bytes and was read only that far`]);
-  assert.equal(result.clean, false);
+test('once the diff budget is spent the files left are not diffed, and the result is incomplete', async () => {
+  const count = 20;
+  const file = (i, v) => `int rare_bud_${i} = ${v};\n`;
+  const r = repo(
+    Object.fromEntries(Array.from({ length: count }, (_, i) => [`f${String(i).padStart(2, '0')}.txt`, file(i, 1)])),
+    Object.fromEntries(Array.from({ length: count }, (_, i) => [`f${String(i).padStart(2, '0')}.txt`, file(i, 2)])),
+  );
+  const cited = Array.from({ length: count }, (_, i) => `rare_bud_${i}`);
+  // Every diff call reads its first file's patch to the cap.
+  let diffs = 0;
+  const git = async (args, opts) => {
+    if (!args.includes('-U0')) return r.git(args, opts);
+    diffs++;
+    const first = args[args.indexOf('--') + 1];
+    const stdout = `diff --git a/${first} b/${first}\n@@ -1 +1 @@\n-${'x'.repeat(opts.maxBytes)}`.slice(0, opts.maxBytes);
+    return { code: -1, stdout, stderr: '', truncated: true };
+  };
+  const result = await checkSkill(git, { names: names(cited.map((t) => `\`${t}\``).join(' ')), baseline: cited, baseSha: r.baseSha });
+  const read = Math.ceil(DIFF_BUDGET_BYTES / DIFF_MAX_BYTES);
+  assert.equal(diffs, read);
+  assert.deepEqual([result.candidatesCapped, result.diffTruncated], [true, true]);
+  assert.deepEqual(result.incomplete, [
+    `${read} of the ${count} changed files that hold a cited name had a diff of more than ${DIFF_MAX_BYTES} bytes, which was read only that far`,
+    `the diff budget of ${DIFF_BUDGET_BYTES} bytes ran out, so ${count - read} of the ${count} changed files that hold a cited name were not diffed`,
+  ]);
   assert.equal(confirmableCommit(result), null);
   r.cleanup();
 });
