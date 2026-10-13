@@ -508,6 +508,28 @@ test('a deprecation the lifecycle started is marked decayed or obsolete, and the
   assert.match(out.error, /only a reinforcement can publish it again/);
 });
 
+test('a retirement is not recorded when the retire run\'s marker changes before the write', async () => {
+  const isRetirement = (command) => command.constructor.name === 'UpdateCommand' && command.input.UpdateExpression === 'SET #ret = :now, #rr = :reason';
+  const cases = {
+    // Read without a marker (operator); a retire run sets one before the write.
+    'a marker appears': [undefined, (row) => { row.maintenance_deprecating = OLD; }],
+    // Read with this record's marker (decayed); it is removed before the write.
+    'the marker goes': [OLD, (row) => { delete row.maintenance_deprecating; }],
+    // Read with an older generation's marker (operator); a retire run of this record replaces it.
+    'an older marker is replaced': ['an-older-generation', (row) => { row.maintenance_deprecating = OLD; }],
+  };
+  for (const [name, [marker, change]] of Object.entries(cases)) {
+    const item = live(marker ? { maintenance_deprecating: marker } : {});
+    const w = world({ item, skills: DEPRECATED, intercept: (command, row) => { if (isRetirement(command)) change(row); } });
+    let out;
+    const logged = await capturingLogs(async () => { out = parse(await w.submit.invoke(INPUT)); });
+    assert.equal(out.ok, false, name);
+    assert.ok(w.ddb.calls.some((c) => isRetirement({ constructor: { name: c.op }, input: c.input })), `${name}: the write was tried`);
+    assert.ok(!('retired_at' in w.record()), `${name}: no retirement is recorded`);
+    assert.match(logged.warn.join('\n'), /retirement of "replication-handshake-cancel-paths" not recorded on r1: ConditionalCheckFailedException/, name);
+  }
+});
+
 test('an unfinished re-publication finishes under the name it claimed', async () => {
   const claimed = generationName(2);
   const item = tombstone({ graduated_record_name: claimed, skill_generation: 2, previous_record_name: OLD });
