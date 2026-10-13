@@ -4,11 +4,12 @@ import type { AgentConfig } from '@strands-agents/sdk';
 import { DynamoDBClient } from '@aws-sdk/client-dynamodb';
 import { DynamoDBDocumentClient } from '@aws-sdk/lib-dynamodb';
 import { createCuratorModel } from '../../common/src/model-fallback.js';
-import { createRegistryClient, listSkillSummaries, loadSkills, upsertSkill } from '../../common/src/skills-registry.js';
+import { createRegistryClient, loadSkills } from '../../common/src/skills-registry.js';
 
 import { loadAssets, loadEnv, renderTemplate } from './config.js';
 import { curate } from './curate.js';
 import { normalizeFeedback, reinforcerKey, renderFeedbackMessage, requestSchema, untrustedReason, type CuratorRequest } from './feedback.js';
+import { skillPublisher } from './maintenance.js';
 import { assembleCuratorTools } from './tools/index.js';
 import { CuratorRun } from './tools/run.js';
 
@@ -62,12 +63,7 @@ const app = new BedrockAgentCoreApp({
         ddb,
         table,
         run,
-        registry: {
-          upsert: (input) => upsertSkill(registryClient, registryId, input),
-          // The name filter is not documented as an exact match, so compare the names too.
-          exists: async (name) => (await listSkillSummaries(registryClient, registryId, [{ name: 'name', values: [name] }]))
-            .some((r) => r.name === name),
-        },
+        registry: skillPublisher(registryClient, registryId),
         authoring: env.curatorSkillsRegistryId
           ? {
             load: async () => (await loadSkills(registryClient, env.curatorSkillsRegistryId, AUTHORING_SKILL_LIMIT)).skills
