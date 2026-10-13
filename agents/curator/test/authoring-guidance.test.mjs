@@ -16,3 +16,19 @@ test('skill authoring guidance asks for reviewer tool calls, not shell commands'
   const args = JSON.parse(example[1]).map((a) => a.replace('<mergeBase>..<head>', 'abc..def'));
   assert.equal(checkGitArgs(args), null, 'the git tool accepts the example');
 });
+
+test('the curator is told to start from get_skill and never to touch suppression markers', () => {
+  for (const file of ['../config/prompt.md', '../skills/how-to-write-a-skill.md']) {
+    const text = read(file);
+    assert.match(text, /call `get_skill\(area_bucket, record_id\)`/i, file);
+    assert.match(text, /Never write, edit or remove (?:these markers|a marker)/, file);
+    assert.match(text, /`<!-- suppressed: \.\.\. -->`/, file);
+    assert.match(text, /`<!-- \/suppressed -->`/, file);
+    assert.match(text, /retired_reason` (?:is )?`operator`, do not submit/, file);
+    assert.match(text, /If maintainers stop reinforcing it, the skill is retired and the record kept; a later reinforcement can restore it\./, file);
+    assert.doesNotMatch(text, /decay removes/i, file);
+  }
+  const skill = read('../config/skill.md');
+  assert.match(skill, /Retired records are bumped, never recreated/);
+  assert.match(skill, /Never write, edit or remove a suppression marker/);
+});

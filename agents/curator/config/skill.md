@@ -138,11 +138,24 @@ The rules that are easy to miss:
   correction or a "this is intentional" clarification.
 - **No PR numbers in the body.** End with the source record_id and
   nothing else.
+- **A skill that graduated before is edited, not rewritten.** Start
+  from the text `get_skill` returns, which can hold the release
+  check's corrections, and change only what the feedback changes.
+  Suppressed blocks (`<!-- suppressed: ... -->` to
+  `<!-- /suppressed -->`) stay exactly as they are.
 
 ## Things to never do
 
 - Never call `submit_skill` unless a `bump_concern` or `merge_concerns`
-  in this run reported `eligible_for_graduation: true`.
+  in this run reported `eligible_for_graduation: true`, or an
+  `update_concern` in this run corrected a graduated record whose
+  skill is live.
+- Retired records are bumped, never recreated. When the feedback
+  matches a record whose `skill_state` is `retired`, bump it: a
+  reinforcement can restore its skill. A new record for the same
+  concern would split its reinforcements and publish a second skill.
+- Never write, edit or remove a suppression marker. Only the release
+  check's code writes them.
 - Never delete a record after it graduated; it is the provenance of the
   published skill.
 - Never paraphrase the maintainer's words into `context`. Quote and

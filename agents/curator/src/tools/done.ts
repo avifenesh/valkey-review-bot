@@ -14,7 +14,7 @@ export function buildCuratorDoneTool(run: CuratorRun) {
     name: 'curator_done',
     description:
 `End the run. Call exactly once, last.
-- \`decision\`: "bumped", "updated", "merged", "created", "deleted", "graduated" (a bump or merge followed by submit_skill), "dropped" (noise or out of scope, no change) or "noop" (a possible concern, but too weak to record yet).
+- \`decision\`: "bumped", "updated", "merged", "created", "deleted", "graduated" (a bump, merge or update followed by submit_skill), "dropped" (noise or out of scope, no change) or "noop" (a possible concern, but too weak to record yet).
 - \`summary\`: one sentence of rationale naming the record_ids you touched, or "none".
 
 No tool call is honored after this one.`,

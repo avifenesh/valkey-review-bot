@@ -623,7 +623,7 @@ export function buildDeleteConcernTool(deps: ConcernsDeps) {
   return tool({
     name: 'delete_concern',
     description:
-`Delete a record that should not exist: it states a curator-level style rule rather than a code concern, or a maintainer has said the concern itself is wrong. Records that graduated to a skill cannot be deleted; decay removes them later.
+`Delete a record that should not exist: it states a curator-level style rule rather than a code concern, or a maintainer has said the concern itself is wrong. Records that graduated to a skill cannot be deleted; they stay as the skill's provenance, also after the skill is retired.
 
 Do not use it for feedback that is merely unhelpful; make no change instead.`,
     inputSchema: z.object({ area_bucket: areaBucketField, record_id: recordIdField }),
