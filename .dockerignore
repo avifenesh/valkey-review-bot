@@ -3,7 +3,6 @@
 *
 !agents/common/package.json
 !agents/common/package-lock.json
-!agents/common/tsconfig.json
 !agents/common/src
 !agents/common/src/**
 
