@@ -285,12 +285,24 @@ export interface RepoCheckMessage {
 export type MaintenanceMessage = CheckMessage | RetireMessage | RepoCheckMessage;
 
 /**
+ * Characters a log line never shows: Unicode format characters (zero-width
+ * characters, bidi marks, embeddings, overrides and isolates, the BOM), the
+ * line and paragraph separators, and DEL and the C1 controls, NEL among
+ * them. JSON.stringify leaves all of these as they are, so they could hide
+ * text, reorder how a line reads, or break it in a terminal or console.
+ */
+const INVISIBLE_RE = /[\p{Cf}\p{Zl}\p{Zp}\u007f-\u009f]/gu;
+
+/** `text` without INVISIBLE_RE characters. */
+const printable = (text: string): string => text.replace(INVISIBLE_RE, '');
+
+/**
  * A value read from a concerns table, for a log line. The curator model
  * chooses area_bucket and can put any text in it, so every such value is
- * JSON-quoted: it cannot break the line or pose as another field of the
- * operator's report.
+ * stripped of invisible characters and JSON-quoted: it cannot break the
+ * line, hide part of it or pose as another field of the operator's report.
  */
-const quoted = (value: string): string => JSON.stringify(value);
+const quoted = (value: string): string => JSON.stringify(printable(value));
 
 /** A record's table and key, for a log line. */
 const recordRef = (tableName: string, key: { readonly area_bucket: string; readonly record_id: string }): string =>
@@ -642,7 +654,7 @@ export async function decayTable(
       const updatedMs = Date.parse(updatedAt);
       if (typeof areaBucket !== 'string' || typeof recordId !== 'string' || !Number.isFinite(updatedMs)) {
         errors += 1;
-        console.warn(`[decay] ${tableName}: record without area_bucket, record_id or a valid updated_at: ${JSON.stringify(item).slice(0, 200)}`);
+        console.warn(`[decay] ${tableName}: record without area_bucket, record_id or a valid updated_at: ${printable(JSON.stringify(item)).slice(0, 200)}`);
         continue;
       }
 

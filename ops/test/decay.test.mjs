@@ -588,17 +588,18 @@ test('a record the curator could not accept is never queued', async (t) => {
   for (const call of warn.mock.calls) assert.match(call.arguments[0], /^\[decay\] cannot queue maintenance for concerns /);
 });
 
-test('values read from the table are JSON-quoted in every report line', async (t) => {
+/**
+ * Runs passes that log every kind of report and warning line about
+ * records in `bucket`, and returns the lines. `name` is a graduated
+ * record name the curator could not accept.
+ */
+async function reportLines(t, bucket, name) {
   const log = quietLogs(t);
   const warn = t.mock.method(console, 'warn', () => {});
-  // area_bucket is chosen by the curator model; this one tries to end the
-  // line and forge a second report line.
-  const bucket = 'src"\n[decay] would-retire concerns bucket="x" id="y" name="z" score=0.0000 reason=obsolete';
-  const name = 'Not A Slug\n[decay] forged';
   const boom = () => Object.assign(new Error('internal error'), { name: 'InternalServerError' });
 
-  // would-retire
-  await decayTable(table([faded('a', { area_bucket: bucket })]), 'concerns', { ...FULL, retireSkills: false }, NOW, maintenance().ctx);
+  // would-retire, and a record that is not a valid concern record
+  await decayTable(table([faded('a', { area_bucket: bucket }), { area_bucket: bucket, record_id: 'h' }]), 'concerns', { ...FULL, retireSkills: false }, NOW, maintenance().ctx);
   // retire-requested, deferred, check-requested, and a record that cannot be queued
   await decayTable(table([
     faded('b', { area_bucket: bucket, updated_at: daysAgo(2000) }),
@@ -617,9 +618,23 @@ test('values read from the table are JSON-quoted in every report line', async (t
   for (const kind of ['would-retire', 'retire-requested', 'deferred', 'check-requested', 'cannot queue maintenance', 'write failed', 'send failed', 'could not release']) {
     assert.ok(lines.some((l) => l.startsWith(`[decay] ${kind} `)), `a ${kind} line was logged`);
   }
+  assert.ok(lines.some(isDump), 'the invalid record was logged');
+  return lines;
+}
+
+/** The warning that dumps an invalid record as JSON. */
+const isDump = (line) => line.startsWith('[decay] concerns: record without ');
+
+test('values read from the table are JSON-quoted in every report line', async (t) => {
+  // area_bucket is chosen by the curator model; this one tries to end the
+  // line and forge a second report line.
+  const bucket = 'src"\n[decay] would-retire concerns bucket="x" id="y" name="z" score=0.0000 reason=obsolete';
+  const name = 'Not A Slug\n[decay] forged';
+  const lines = await reportLines(t, bucket, name);
+
   for (const line of lines) {
     assert.ok(!line.includes('\n'), `one line: ${JSON.stringify(line)}`);
-    if (line.includes(' id=')) assert.ok(line.includes(` bucket=${JSON.stringify(bucket)} id="`), `bucket quoted: ${JSON.stringify(line)}`);
+    if (line.includes(' id=') && !isDump(line)) assert.ok(line.includes(` bucket=${JSON.stringify(bucket)} id="`), `bucket quoted: ${JSON.stringify(line)}`);
   }
   assert.ok(lines.some((l) => l.includes(`graduated_record_name ${JSON.stringify(name)} is not`)), 'the rejected name is quoted');
   const report = lines.filter((l) => /^\[decay\] (would-retire|retire-requested|deferred|check-requested) /.test(l));
@@ -630,6 +645,30 @@ test('values read from the table are JSON-quoted in every report line', async (t
     assert.match(l.slice(l.indexOf(head) + head.length), /^[a-g]" name="skill-[a-g]" /, l);
   }
   for (const l of lines.filter((l) => l.includes('maintenance='))) assert.match(l, / maintenance="[^"\s]+"/);
+});
+
+test('report lines strip invisible format and line-separator characters from table values', async (t) => {
+  const invisible = [
+    0x200b, 0x200c, 0x200d, 0x200e, 0x200f, // zero-width characters and bidi marks
+    0x2028, 0x2029, // line and paragraph separators
+    0x202a, 0x202b, 0x202c, 0x202d, 0x202e, // bidi embeddings and overrides
+    0x2060, 0x2061, 0x2062, 0x2063, 0x2064, // word joiner and invisible operators
+    0x2066, 0x2067, 0x2068, 0x2069, // bidi isolates
+    0xfeff, 0x0085, 0x009b, 0x007f, // BOM, NEL, CSI, DEL
+  ].map((c) => String.fromCodePoint(c));
+  // With the override it would read "src/ok"; the other characters hide
+  // between the letters of the tail.
+  const bucket = `src/\u202eko ${invisible.join('x')} id="forged"`;
+  const name = 'Not\u202eA\u2028Slug';
+  const lines = await reportLines(t, bucket, name);
+
+  const shown = JSON.stringify(`src/ko ${'x'.repeat(invisible.length - 1)} id="forged"`);
+  for (const line of lines) {
+    for (const c of invisible) assert.ok(!line.includes(c), `U+${c.codePointAt(0).toString(16)} in ${JSON.stringify(line)}`);
+    if (line.includes(' id=') && !isDump(line)) assert.ok(line.includes(` bucket=${shown} id="`), `bucket shown: ${JSON.stringify(line)}`);
+  }
+  assert.ok(lines.some((l) => l.includes('graduated_record_name "NotASlug" is not')), 'the rejected name is stripped');
+  assert.ok(lines.some((l) => isDump(l) && l.includes(`"area_bucket":${shown}`)), 'the record dump is stripped');
 });
 
 test('the summary line names every counter', () => {
