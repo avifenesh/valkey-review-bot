@@ -14,7 +14,8 @@ import { releaseQuietly, type DeliveryStore } from './store.js';
  *      the secret again once in case it was rotated.
  *   2. pull_request opened, reopened, ready_for_review or synchronize (new
  *      commits) on a review route: route gates, idempotency key
- *      repo#pr#head_sha, the pull request's pending marker, the pull
+ *      repo#pr#head_sha (#ready or #push appended for ready_for_review
+ *      and new commits), the pull request's pending marker, the pull
  *      request's cap on automatic reviews, the route's daily review
  *      budget, then the route's queue. A review of new commits waits in
  *      the queue first, holding the marker, and covers every push, reopen
@@ -169,13 +170,19 @@ export function createDeliveryHandler(
       if (!route.authorAllowlist.includes(author)) return skip(`author-not-allowed=${token(author)}`);
     }
 
-    // A ready_for_review run has its own key and heartbeat nonce: the same
-    // head SHA may already have been reviewed while the PR was briefly
-    // open as non-draft, and that completed run must not stand in for
-    // this one.
+    // ready_for_review and new commits have their own key and heartbeat
+    // nonce. A draft's head may already have been reviewed while the PR
+    // was briefly open as non-draft, and that completed run must not
+    // stand in for the review it gets when marked ready. A review of new
+    // commits is skipped, and recorded completed, when the PR is closed
+    // by the time it runs; a reopen at that head must not then be dropped
+    // as its duplicate, or its run be taken for done by the worker. The
+    // cost: a reopen at a head that a review of new commits did cover is
+    // reviewed again, using a round.
     const ready = action === 'ready_for_review';
     const pushed = action === 'synchronize';
-    const key = `${repo}#${prNumber}#${headSha}${ready ? '#ready' : ''}`;
+    const nonce = ready ? 'ready' : pushed ? 'push' : undefined;
+    const key = `${repo}#${prNumber}#${headSha}${nonce ? `#${nonce}` : ''}`;
     if (!(await deps.store.claim(key, { action }))) return skip('duplicate');
 
     // What this review has taken so far, given back newest first when it
@@ -253,7 +260,7 @@ export function createDeliveryHandler(
         pr_number: prNumber,
         installation_id: target.installationId,
         head_sha: headSha,
-        ...(ready ? { run_nonce: 'ready' } : {}),
+        ...(nonce ? { run_nonce: nonce } : {}),
         ...(pendingMarker ? { pending_marker: pendingMarker } : {}),
         ...(pushed ? { trigger: 'push', skip_drafts: route.skipDrafts } : {}),
       };

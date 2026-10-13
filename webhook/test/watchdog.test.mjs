@@ -323,6 +323,7 @@ test('heartbeatRunKey stays byte-identical to agents/common/src/run-agent.ts', (
     review,
     { ...review, run_nonce: 'm101' },
     { ...review, run_nonce: 'ready' },
+    { ...review, run_nonce: 'push' },
     { repo: 'o/r', pr_number: 1, installation_id: 2 },
     { repo: 'o/r', pr_number: 1, installation_id: 2, head_sha: '' },
   ]) {

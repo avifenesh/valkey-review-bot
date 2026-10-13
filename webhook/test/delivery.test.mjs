@@ -6,6 +6,7 @@ import { fakeGitHub, fakeStore } from './support/fakes.mjs';
 
 const { loadReceiverConfig } = await import('../src/config.ts');
 const { createDeliveryHandler } = await import('../src/delivery.ts');
+const { heartbeatRunKey } = await import('../src/review-envelope.ts');
 
 const SECRET = 'webhook-secret';
 const BOT = 'example-reviewer[bot]';
@@ -222,11 +223,11 @@ test('new commits start a delayed review that holds the pull request\'s pending 
   const { handler, sent, store, logs } = setup();
   await handler(delivery('pull_request', prEvent('opened')));
   const resp = await handler(delivery('pull_request', push('bbb')));
-  assert.equal(body(resp).enqueued, `${REPO}#7#bbb`);
+  assert.equal(body(resp).enqueued, `${REPO}#7#bbb#push`);
   assert.deepEqual(sent[1], {
     queueUrl: 'q-valkey',
     body: {
-      repo: REPO, pr_number: 7, installation_id: 42, head_sha: 'bbb', pending_marker: 'pending-1', trigger: 'push', skip_drafts: false,
+      repo: REPO, pr_number: 7, installation_id: 42, head_sha: 'bbb', run_nonce: 'push', pending_marker: 'pending-1', trigger: 'push', skip_drafts: false,
     },
     attributes: { repo: REPO, pr_number: 7, action: 'synchronize' },
     options: { delaySeconds: 300 },
@@ -235,6 +236,21 @@ test('new commits start a delayed review that holds the pull request\'s pending 
   assert.equal(store.autoReviews.get(`${REPO}#7`), 2);
   assert.equal(store.slotsTaken, 2, 'it takes a budget slot like any automatic review');
   assert.equal(logs.at(-2), `[auto-review] route=valkey-review repo=${REPO} pr=7 round=2/3 queued delay=300s`);
+});
+
+test('a review of new commits has its own key and heartbeat nonce, so a reopen at that head still reviews', async () => {
+  // The push review ran on a closed pull request and was skipped; the
+  // pull request is then reopened at the same head.
+  const { handler, sent, store } = setup();
+  await handler(delivery('pull_request', push('bbb')));
+  await store.clearReviewPending(REPO, 7, 'pending-1');
+  const resp = await handler(delivery('pull_request', prEvent('reopened', { head: { sha: 'bbb' } })));
+  assert.equal(body(resp).enqueued, `${REPO}#7#bbb`, 'not a duplicate of the review of new commits');
+  assert.equal(sent.length, 2);
+  assert.equal(sent[0].body.run_nonce, 'push');
+  assert.equal(sent[1].body.run_nonce, undefined);
+  assert.notEqual(heartbeatRunKey(sent[1].body), heartbeatRunKey(sent[0].body), 'the worker reads its own heartbeat');
+  assert.equal(body(await handler(delivery('pull_request', prEvent('reopened', { head: { sha: 'bbb' } })))).skipped, 'duplicate');
 });
 
 test('pushes while a review of new commits waits are covered by it', async () => {
@@ -249,8 +265,8 @@ test('pushes while a review of new commits waits are covered by it', async () =>
   assert.equal(sent.length, 1);
   assert.equal(store.autoReviews.get(`${REPO}#7`), 1, 'no round used');
   assert.equal(store.slotsTaken, 1, 'no budget used');
-  assert.deepEqual(store.released, [`${REPO}#7#ccc`], 'the key is released in case the waiting review is not queued after all');
-  assert.equal(store.keys.has(`${REPO}#7#ccc`), false);
+  assert.deepEqual(store.released, [`${REPO}#7#ccc#push`], 'the key is released in case the waiting review is not queued after all');
+  assert.equal(store.keys.has(`${REPO}#7#ccc#push`), false);
   assert.equal(store.pending.get(`${REPO}#7`), 'pending-1');
   assert.equal(body(await handler(delivery('pull_request', push('ccc')))).skipped, 'auto-review-pending', 'a redelivery joins again');
 });
@@ -283,7 +299,7 @@ test('a push skipped behind a review that then fails to queue is reviewed on red
   assert.equal(store.pending.size, 0, 'the failed review gave its marker back');
 
   const resp = await handler(delivery('pull_request', push('ccc')));
-  assert.equal(body(resp).enqueued, `${REPO}#7#ccc`, 'not dropped as a duplicate');
+  assert.equal(body(resp).enqueued, `${REPO}#7#ccc#push`, 'not dropped as a duplicate');
   assert.equal(sent.length, 1);
   assert.equal(sent[0].b.head_sha, 'ccc');
   assert.equal(store.autoReviews.get(`${REPO}#7`), 1);
@@ -304,7 +320,7 @@ test('once the worker starts the waiting review, the next push starts the next r
   assert.equal(body(resp).skipped, 'auto-review-cap');
   assert.equal(sent.length, 3);
   assert.equal(store.pending.size, 0, 'the capped push leaves no marker');
-  assert.deepEqual(store.released, [`${REPO}#7#ddd`]);
+  assert.deepEqual(store.released, [`${REPO}#7#ddd#push`]);
   assert.equal(store.slotsTaken, 3);
 });
 
@@ -328,7 +344,7 @@ test('new commits pass the same gates as an opened pull request', async () => {
 test('a push to a pull request that is not a draft reviews on a skipDrafts route', async () => {
   const { handler, sent } = setup();
   const resp = await handler(delivery('pull_request', push('b7', { draft: false }, GLIDE)));
-  assert.equal(body(resp).enqueued, `${GLIDE}#7#b7`);
+  assert.equal(body(resp).enqueued, `${GLIDE}#7#b7#push`);
   assert.equal(sent.length, 1);
   assert.equal(sent[0].queueUrl, 'q-glide');
   assert.deepEqual(sent[0].options, { delaySeconds: 300 });
@@ -347,7 +363,7 @@ test('over budget, a review of new commits gives back its marker, its round and 
     assert.equal(sent.length, 1);
     assert.equal(store.pending.size, 0);
     assert.equal(store.autoReviews.get(`${REPO}#7`), 0);
-    assert.deepEqual(store.released, [`${REPO}#7#bbb`]);
+    assert.deepEqual(store.released, [`${REPO}#7#bbb#push`]);
   } finally {
     console.warn = original;
   }
@@ -371,7 +387,7 @@ test('a failed send of a review of new commits gives back its marker, its round 
   }
   assert.equal(store.pending.size, 0);
   assert.equal(store.autoReviews.get(`${REPO}#7`), 0);
-  assert.deepEqual(store.released, [`${REPO}#7#bbb`]);
+  assert.deepEqual(store.released, [`${REPO}#7#bbb#push`]);
 
   fail = false;
   assert.equal((await handler(delivery('pull_request', push('bbb')))).statusCode, 200, 'a redelivery is processed');
