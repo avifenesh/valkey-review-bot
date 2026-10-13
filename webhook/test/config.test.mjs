@@ -130,10 +130,13 @@ test('isAppLogin matches only this App', () => {
 
 test('the invoker needs a runtime and takes its thresholds from the environment', () => {
   assert.deepEqual(loadInvokerConfig({ RUNTIME_ARN: 'runtime' }), {
-    runtimeArn: 'runtime', heartbeatTable: '', runBudgetMs: 90 * 60_000, staleMs: 12 * 60_000,
+    runtimeArn: 'runtime', heartbeatTable: '', runBudgetMs: 90 * 60_000, staleMs: 12 * 60_000, idempotencyTable: '',
   });
-  const custom = loadInvokerConfig({ RUNTIME_ARN: 'runtime', HEARTBEAT_TABLE: 'hb', RUN_BUDGET_MINUTES: '120', HEARTBEAT_STALE_MINUTES: '20' });
+  const custom = loadInvokerConfig({
+    RUNTIME_ARN: 'runtime', HEARTBEAT_TABLE: 'hb', RUN_BUDGET_MINUTES: '120', HEARTBEAT_STALE_MINUTES: '20', IDEMPOTENCY_TABLE: ' idem ',
+  });
   assert.equal(custom.heartbeatTable, 'hb');
+  assert.equal(custom.idempotencyTable, 'idem');
   assert.equal(custom.runBudgetMs, 120 * 60_000);
   assert.equal(custom.staleMs, 20 * 60_000);
   assert.throws(() => loadInvokerConfig({}), /RUNTIME_ARN is not set/);

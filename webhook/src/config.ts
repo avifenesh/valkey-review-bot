@@ -86,6 +86,13 @@ export interface InvokerConfig {
   readonly runBudgetMs: number;
   /** A running review whose heartbeat is older than this is treated as dead. */
   readonly staleMs: number;
+  /**
+   * The receiver's table, where a review of new commits holds its pull
+   * request's pending marker until the worker starts the run. Empty on
+   * the curator's worker. A review worker without it leaves markers to
+   * expire, and new commits on that pull request are skipped until then.
+   */
+  readonly idempotencyTable: string;
 }
 
 function required(env: Env, name: string): string {
@@ -203,6 +210,7 @@ export function loadInvokerConfig(env: Env): InvokerConfig {
     heartbeatTable: env.HEARTBEAT_TABLE?.trim() ?? '',
     runBudgetMs: integer(env, 'RUN_BUDGET_MINUTES', DEFAULT_RUN_BUDGET_MINUTES, 1) * 60_000,
     staleMs: integer(env, 'HEARTBEAT_STALE_MINUTES', DEFAULT_HEARTBEAT_STALE_MINUTES, 1) * 60_000,
+    idempotencyTable: env.IDEMPOTENCY_TABLE?.trim() ?? '',
   };
 }
 

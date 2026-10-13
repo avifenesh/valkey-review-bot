@@ -2,6 +2,8 @@ import { BedrockAgentCoreClient, InvokeAgentRuntimeCommand } from '@aws-sdk/clie
 import { DynamoDBClient } from '@aws-sdk/client-dynamodb';
 import { DynamoDBDocumentClient, GetCommand } from '@aws-sdk/lib-dynamodb';
 import { loadInvokerConfig } from './config.js';
+import { pendingMarkerOf, type PendingMarker } from './review-envelope.js';
+import { clearPendingReview } from './store.js';
 import { decide, isCuratorMessage, messageTag, type HeartbeatRecord } from './watchdog.js';
 
 /**
@@ -9,6 +11,8 @@ import { decide, isCuratorMessage, messageTag, type HeartbeatRecord } from './wa
  * route's AgentCore runtime (a reviewer or the curator). The receiver
  * shaped each envelope for its runtime, so this code stays agnostic of
  * the payload. src/watchdog.ts decides whether a message runs at all.
+ * Before it runs a review of new commits, it removes the pull request's
+ * pending marker.
  */
 
 const config = loadInvokerConfig(process.env);
@@ -31,6 +35,25 @@ class StillRunning extends Error {}
 async function readHeartbeat(runKey: string): Promise<HeartbeatRecord | undefined> {
   const resp = await ddb.send(new GetCommand({ TableName: config.heartbeatTable, Key: { run_key: runKey } }));
   return resp.Item as HeartbeatRecord | undefined;
+}
+
+/**
+ * A review of new commits holds its pull request's pending marker until
+ * its run starts (src/store.ts); from then on a push can queue the next
+ * round. A failure is logged and the run goes ahead: the marker then
+ * expires on its own.
+ */
+async function clearPendingMarker(marker: PendingMarker, tag: string): Promise<void> {
+  if (!config.idempotencyTable) {
+    console.warn(`[pending] ${tag} IDEMPOTENCY_TABLE is not set; the pending marker stays until it expires`);
+    return;
+  }
+  try {
+    const cleared = await clearPendingReview(ddb, config.idempotencyTable, marker.repo, marker.prNumber, marker.markerId);
+    console.log(`[pending] ${tag} marker=${marker.markerId} ${cleared ? 'cleared' : 'already gone'}`);
+  } catch (err) {
+    console.error(`[pending] ${tag} could not clear marker=${marker.markerId}; new commits are skipped until it expires`, err);
+  }
 }
 
 async function handleOne(record: SqsRecord): Promise<void> {
@@ -66,6 +89,9 @@ async function handleOne(record: SqsRecord): Promise<void> {
 
   const payload = decision.useFallbackModel ? { ...envelope, use_fallback_model: true } : envelope;
   console.log(`[invoke] ${tag} attempt=${receiveCount}${decision.useFallbackModel ? ` fallback_model=true (${decision.reason})` : ''}`);
+
+  const marker = pendingMarkerOf(envelope);
+  if (marker) await clearPendingMarker(marker, tag);
 
   const resp = await client.send(new InvokeAgentRuntimeCommand({
     agentRuntimeArn: config.runtimeArn,

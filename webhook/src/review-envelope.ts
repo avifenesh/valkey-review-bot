@@ -31,6 +31,20 @@ export interface ReviewEnvelope {
   readonly pending_marker?: string;
 }
 
+export interface PendingMarker {
+  readonly repo: string;
+  readonly prNumber: number;
+  readonly markerId: string;
+}
+
+/** The pending marker a review of new commits holds, if the envelope names one. */
+export function pendingMarkerOf(envelope: Readonly<Record<string, unknown>>): PendingMarker | undefined {
+  const { repo, pr_number: prNumber, pending_marker: markerId } = envelope;
+  if (typeof markerId !== 'string' || !markerId) return undefined;
+  if (typeof repo !== 'string' || !repo || typeof prNumber !== 'number' || !Number.isInteger(prNumber)) return undefined;
+  return { repo, prNumber, markerId };
+}
+
 /**
  * Key of the run's heartbeat record. Must produce the same string as the
  * runKey in agents/common/src/run-agent.ts, which writes the record:

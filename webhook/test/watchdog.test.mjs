@@ -3,7 +3,7 @@ import * as fs from 'node:fs';
 import test from 'node:test';
 import './support/ts-resolve.mjs';
 
-const { heartbeatRunKey } = await import('../src/review-envelope.ts');
+const { heartbeatRunKey, pendingMarkerOf } = await import('../src/review-envelope.ts');
 const { CURATOR_MAX_RECEIVES, decide, isCuratorMessage, messageTag } = await import('../src/watchdog.ts');
 
 const MIN = 60_000;
@@ -147,6 +147,16 @@ test('the log tag names the message', () => {
   assert.equal(messageTag(review), 'review repo=example-org/valkey pr=7 head=abc123');
   assert.equal(messageTag(curator), 'curator repo=example-org/valkey feedback=rc-1');
   assert.equal(messageTag(maintenance), 'curator maintenance=check#valkey-review#r1#2026-10-13 reviewer=valkey-review');
+});
+
+test('a review of new commits names the pending marker the worker clears', () => {
+  assert.deepEqual(pendingMarkerOf({ ...review, pending_marker: 'm-1' }), { repo: 'example-org/valkey', prNumber: 7, markerId: 'm-1' });
+  assert.equal(pendingMarkerOf(review), undefined);
+  assert.equal(pendingMarkerOf(curator), undefined);
+  assert.equal(pendingMarkerOf({ ...review, pending_marker: '' }), undefined);
+  assert.equal(pendingMarkerOf({ ...review, pending_marker: 5 }), undefined);
+  assert.equal(pendingMarkerOf({ ...review, pr_number: '7', pending_marker: 'm-1' }), undefined);
+  assert.equal(pendingMarkerOf({ pr_number: 7, pending_marker: 'm-1' }), undefined);
 });
 
 test('heartbeatRunKey matches the runtime formula', () => {
