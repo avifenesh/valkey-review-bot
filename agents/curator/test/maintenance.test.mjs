@@ -295,6 +295,31 @@ test('an ambiguous deprecation failure keeps the claim and the marker for the re
   assert.equal(item.retired_at, undefined);
 });
 
+test('a retirement of a skill gone from the registry keeps its reason only while the record is as the decay job saw it', async () => {
+  const plain = setup({ item: record({ ...retireClaim }), skill: null, settings: { retireSkills: true } });
+  assert.equal((await run(retireMessage(), plain.deps)).result.decision, 'retired');
+  assert.equal(plain.table.item(KEY).retired_reason, 'decayed');
+
+  for (const [message, item, change] of [
+    // A maintainer reinforces the record between the read and the tombstone.
+    [retireMessage(), record({ ...retireClaim }), { updated_at: '2026-10-13T00:30:00.000Z', decay_score: 1 }],
+    // A re-publication clears the obsolete finding.
+    [retireMessage({ retire_reason: 'obsolete' }), record({ ...retireClaim, obsolete_release: '9.1.2' }), { obsolete_release: undefined }],
+  ]) {
+    const s = setup({
+      item,
+      skill: null,
+      settings: { retireSkills: true },
+      hooks: { beforeUpdate: (input, table) => { if (input.UpdateExpression.includes('#retiredat')) table.put({ ...table.item(KEY), ...change }); } },
+    });
+    const { result } = await run(message, s.deps);
+    assert.deepEqual(result, { status: 'skipped', decision: 'changed' }, message.retire_reason);
+    const after = s.table.item(KEY);
+    assert.equal(after.retired_at, undefined, message.retire_reason);
+    assert.ok(claimGone(after), message.retire_reason);
+  }
+});
+
 test('with retirement off a retire message is only reported', async () => {
   const s = setup({ item: record({ ...retireClaim }) });
   const { result, lines } = await run(retireMessage(), s.deps);

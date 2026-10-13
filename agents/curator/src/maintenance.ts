@@ -517,18 +517,37 @@ function statusReason(reason: string, today: string, item: Item): string {
 }
 
 /**
- * The tombstone: the skill is retired and the record stays as its
- * provenance. `markerRead` pins the reason it decided: the lifecycle's
- * own reasons need the marker, "operator" needs its absence.
+ * What a tombstone's reason was decided from, which its write pins:
+ *   marker      the marker was read: the lifecycle's own reason needs it still there;
+ *   no-marker   it was not: "operator" needs it still absent;
+ *   decay       the retire message's own decision, for a registry record that is
+ *               gone: the state the decay job decided from (updated_at as seen for
+ *               decayed, obsolete_release for obsolete), as the marker write pins it;
+ *   null        a reason that holds whatever the record says (REJECTED is "operator").
+ *
+ * A gone record gets different reasons in the two runs. A retire run
+ * carries the decay job's decision, so the message's reason stands
+ * (flow 4.2) while the record is still as the job saw it. A check has
+ * no such decision: only the marker tells the lifecycle's retirement
+ * from someone else's.
  */
-async function tombstone(run: Run, reason: string, fromStatus: string | undefined, markerRead: boolean | null): Promise<boolean> {
+type Pin = 'marker' | 'no-marker' | 'decay' | null;
+
+/** The condition that the record is still as the decay job saw it when it asked for this retirement. */
+function decayPin(w: Write, req: RetireRequest): Write {
+  return req.retire_reason === 'decayed' ? w.is('updated_at', req.seen_updated_at) : w.exists('obsolete_release');
+}
+
+/** The tombstone: the skill is retired and the record stays as its provenance. */
+async function tombstone(run: Run, reason: string, fromStatus: string | undefined, pin: Pin): Promise<boolean> {
   const w = new Write()
     .set('retired_at', run.nowIso)
     .set('retired_reason', reason)
     .remove(...CLAIM, MARKER, 'retire_refused_at');
   if (fromStatus) w.set('retired_from_status', fromStatus);
-  if (markerRead === true) w.is(MARKER, run.name);
-  else if (markerRead === false) w.isNot(MARKER, run.name);
+  if (pin === 'marker') w.is(MARKER, run.name);
+  else if (pin === 'no-marker') w.isNot(MARKER, run.name);
+  else if (pin === 'decay' && run.req.reason === 'retire') decayPin(w, run.req);
   const ok = await run.state(w);
   run.log(run.req.reason, ok
     ? { outcome: 'retired', retired_reason: reason, registry_status: fromStatus ?? 'none' }
@@ -541,13 +560,13 @@ async function tombstone(run: Run, reason: string, fromStatus: string | undefine
  * DEPRECATED, REJECTED or gone). A dry run writes no tombstone: it
  * releases the claim and reports what it would have recorded.
  */
-async function retirement(run: Run, reason: string, fromStatus: string | undefined, markerRead: boolean | null): Promise<MaintenanceResult> {
+async function retirement(run: Run, reason: string, fromStatus: string | undefined, pin: Pin): Promise<MaintenanceResult> {
   if (run.req.dry_run) {
     await run.release();
     run.log(run.req.reason, { outcome: 'would-record-retirement', retired_reason: reason, registry_status: fromStatus ?? 'none', mode: 'report' });
     return completed('would-record-retirement');
   }
-  return await tombstone(run, reason, fromStatus, markerRead) ? completed('retired') : skipped('changed');
+  return await tombstone(run, reason, fromStatus, pin) ? completed('retired') : skipped('changed');
 }
 
 /** A retirement the registry refused: back off (decay waits RETIRE_REFUSED_BACKOFF_SECONDS) and release the claim. */
@@ -570,11 +589,11 @@ async function* retire(run: Run, req: RetireRequest): AsyncGenerator<StreamFrame
 
   const markerRead = item![MARKER] === req.record_name;
   const skill = await run.deps.registry.get(req.record_name);
-  if (!skill) return retirement(run, req.retire_reason, undefined, null);
+  if (!skill) return retirement(run, req.retire_reason, undefined, 'decay');
   if (skill.status === 'DEPRECATED' || skill.status === 'REJECTED') {
     // DEPRECATED with the marker: this lifecycle's own deprecation, from a run that died before its tombstone.
     const own = skill.status === 'DEPRECATED' && markerRead;
-    return retirement(run, own ? req.retire_reason : 'operator', skill.status, own ? true : skill.status === 'DEPRECATED' ? false : null);
+    return retirement(run, own ? req.retire_reason : 'operator', skill.status, own ? 'marker' : skill.status === 'DEPRECATED' ? 'no-marker' : null);
   }
   if (BUSY_STATUSES.has(skill.status)) {
     run.log('retire', { outcome: 'pending', registry_status: skill.status, why: 'the registry record is being written; the claim is kept' });
@@ -590,10 +609,7 @@ async function* retire(run: Run, req: RetireRequest): AsyncGenerator<StreamFrame
 
   // The marker first, so a deprecation that lands but is never recorded
   // here is still told apart from an operator's.
-  const mark = new Write().set(MARKER, req.record_name);
-  if (req.retire_reason === 'decayed') mark.is('updated_at', req.seen_updated_at);
-  else mark.exists('obsolete_release');
-  if (await run.state(mark) === false) {
+  if (await run.state(decayPin(new Write().set(MARKER, req.record_name), req)) === false) {
     run.log('retire', { outcome: 'skipped', why: 'the record changed before the deprecation' });
     return skipped('changed');
   }
@@ -606,7 +622,7 @@ async function* retire(run: Run, req: RetireRequest): AsyncGenerator<StreamFrame
     // and the redelivered message finds out what happened.
     if ((err as { name?: string } | null)?.name !== 'ValidationException') throw err;
     const fresh = await run.deps.registry.get(req.record_name);
-    if (!fresh) return await tombstone(run, req.retire_reason, skill.status, null) ? completed('retired') : skipped('changed');
+    if (!fresh) return await tombstone(run, req.retire_reason, skill.status, 'decay') ? completed('retired') : skipped('changed');
     if (fresh.status === 'REJECTED') return await tombstone(run, 'operator', 'REJECTED', null) ? completed('retired') : skipped('changed');
     if (BUSY_STATUSES.has(fresh.status)) {
       run.log('retire', { outcome: 'pending', registry_status: fresh.status, why: 'the deprecation was refused while the record is being written; the claim is kept' });
@@ -615,7 +631,7 @@ async function* retire(run: Run, req: RetireRequest): AsyncGenerator<StreamFrame
     if (fresh.status !== 'DEPRECATED') return refused(run, fresh.status);
     // DEPRECATED after all: a duplicate of this message got there first.
   }
-  return await tombstone(run, req.retire_reason, skill.status, true) ? completed('retired') : skipped('changed');
+  return await tombstone(run, req.retire_reason, skill.status, 'marker') ? completed('retired') : skipped('changed');
 }
 
 // --- Check -----------------------------------------------------------------
@@ -1010,7 +1026,7 @@ async function* check(run: Run, req: CheckRequest): AsyncGenerator<StreamFrame, 
   if (!skill || skill.status === 'DEPRECATED') {
     // With the marker the lifecycle retired it; without it someone else did.
     const reason = markerRead ? (item!.obsolete_release !== undefined ? 'obsolete' : 'decayed') : 'operator';
-    return retirement(run, reason, skill?.status, markerRead);
+    return retirement(run, reason, skill?.status, markerRead ? 'marker' : 'no-marker');
   }
   if (skill.status === 'REJECTED') return retirement(run, 'operator', skill.status, null);
   if (BUSY_STATUSES.has(skill.status)) return inconclusive(run, `the registry record is ${skill.status}`);
