@@ -102,11 +102,15 @@ export function addValkeyReviewerStacks(
     dailyReviewBudget: config.dailyReviewBudget,
   });
 
+  // Created after the webhook stack, whose curator queue it sends to.
   const decay = new DecayCronStack(app, 'ValkeyReviewerDecay', {
     ...common(),
-    description: 'valkey-reviewer daily concerns decay.',
+    description: 'valkey-reviewer daily concerns decay and skill maintenance scheduling.',
     concernsTables,
     decay: config.decay,
+    curatorQueue: webhook.curatorQueue,
+    upstreamRepos: config.upstreamRepos,
+    skillLifecycle: config.skillLifecycle,
   });
 
   return { substrate, reviewers, curator, webhook, decay };

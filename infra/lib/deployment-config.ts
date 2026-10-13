@@ -665,3 +665,11 @@ export function loadDeploymentConfig(contextValue: unknown, env: NodeJS.ProcessE
 export function tokenBrokerRepos(config: DeploymentConfig, reviewerId: ReviewerId): string[] {
   return [...new Set(config.routes.filter((route) => route.reviewer === reviewerId).map((route) => route.repo))];
 }
+
+/**
+ * UPSTREAM_REPOS_JSON for the decay job and the curator: the reviewers
+ * that have an upstream, so a reviewer set to "" gets no release checks.
+ */
+export function upstreamReposJson(upstreamRepos: Readonly<Record<string, string>>): string {
+  return JSON.stringify(Object.fromEntries(Object.entries(upstreamRepos).filter(([, repo]) => repo !== '')));
+}

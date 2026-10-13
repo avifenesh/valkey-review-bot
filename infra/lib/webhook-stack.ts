@@ -126,6 +126,8 @@ export function routeConstructId(routeId: string): string {
 export class WebhookStack extends cdk.Stack {
   /** Dead-letter queue per review route id, plus "curator". */
   readonly deadLetterQueues = new Map<string, sqs.Queue>();
+  /** Feedback from the receiver and skill maintenance requests from the decay job. */
+  readonly curatorQueue: sqs.IQueue;
 
   constructor(scope: Construct, id: string, props: WebhookStackProps) {
     super(scope, id, props);
@@ -202,6 +204,7 @@ export class WebhookStack extends cdk.Stack {
     }
 
     const { queue: curatorQueue, dlq: curatorDlq } = queueWithDlq('CuratorQueue', 'CuratorDlq', CURATOR_MAX_RECEIVES);
+    this.curatorQueue = curatorQueue;
     this.deadLetterQueues.set('curator', curatorDlq);
     queueArns.push(curatorQueue.queueArn);
     const curatorWorker = workerFunction('CuratorWorkerFn', { RUNTIME_ARN: props.curatorRuntimeArn });
@@ -215,6 +218,7 @@ export class WebhookStack extends cdk.Stack {
       actions: ['bedrock-agentcore:InvokeAgentRuntime'],
       resources: [props.curatorRuntimeArn, `${props.curatorRuntimeArn}/*`],
     }));
+    // scripts/skill-check.mjs --webhook-stack reads this output.
     new cdk.CfnOutput(this, 'CuratorQueueUrl', { value: curatorQueue.queueUrl });
     new cdk.CfnOutput(this, 'CuratorDeadLetterQueueName', {
       value: curatorDlq.queueName,

@@ -1,3 +1,5 @@
+import * as fs from 'node:fs';
+import * as path from 'node:path';
 import * as cdk from 'aws-cdk-lib';
 import { Match } from 'aws-cdk-lib/assertions';
 import { bedrockModelArns, modelAccessStatements } from '../lib/bedrock-arns';
@@ -298,6 +300,22 @@ describe('webhook', () => {
     });
   });
 
+  test('outputs what the operator scripts read, and exposes the curator queue', () => {
+    const scripts = path.join(__dirname, '..', '..', 'scripts');
+    const skillCheck = fs.readFileSync(path.join(scripts, 'skill-check.mjs'), 'utf8');
+    expect(skillCheck).toContain("output(values['webhook-stack'], 'CuratorQueueUrl')");
+    expect(skillCheck).toContain("output(values.stack, 'ConcernsTableName')");
+
+    const queueId = Object.keys(s.template(s.stacks.webhook).findResources('AWS::SQS::Queue')).find((id) => id.startsWith('CuratorQueue'))!;
+    expect(s.template(s.stacks.webhook).toJSON().Outputs.CuratorQueueUrl.Value).toEqual({ Ref: queueId });
+    expect(s.stacks.webhook.curatorQueue.node.id).toBe('CuratorQueue');
+    for (const id of ['valkey-review', 'valkey-glide-review'] as const) {
+      expect(reviewerTemplate(id).toJSON().Outputs).toHaveProperty('ConcernsTableName');
+    }
+    // The manual decay pass is invoked by function name.
+    expect(s.template(s.stacks.decay).toJSON().Outputs).toHaveProperty('DecayFnName');
+  });
+
   test('an empty knownBotLogins list keeps the receiver built-in list', () => {
     const custom = synth({ ...fixture(), github: { ...fixture().github, knownBotLogins: [] } });
     expect(custom.config.github.knownBotLogins).toEqual([]);
@@ -330,14 +348,78 @@ describe('webhook', () => {
 });
 
 describe('decay', () => {
+  const decayStatements = (x: Synthesized) => {
+    const t = x.template(x.stacks.decay);
+    return statementsForRole(t, functionRoleId(t, 'DecayFn'));
+  };
+
   test('may use the concerns table key, with settings from the configuration', () => {
-    const custom = synth({ ...fixture(), decay: { halfLifeDays: 10, floor: 0.1 } });
+    const custom = synth({
+      ...fixture(),
+      decay: { halfLifeDays: 10, floor: 0.1, graduatedHalfLifeDays: 365 },
+      upstreamRepos: { 'valkey-review': '' },
+      skillLifecycle: {
+        checksPerDay: 0, recheckDays: 30, retireSkills: true, maxRetirementsPerDay: 7, retireRefusedBackoffDays: 14,
+        applyEdits: true, openPullRequests: true, maxCheckRounds: 60,
+      },
+    });
     const t = custom.template(custom.stacks.decay);
-    const statements = statementsForRole(t, functionRoleId(t, 'DecayFn'));
+    const statements = decayStatements(custom);
     expect(statements.some((st) => actionsOf(st).includes('kms:Decrypt') && JSON.stringify(st.Resource).includes('SubstrateKey'))).toBe(true);
     const ddb = bySid(statements, 'ConcernsDecay')[0]!;
     expect(actionsOf(ddb).sort()).toEqual(['dynamodb:DeleteItem', 'dynamodb:Scan', 'dynamodb:UpdateItem']);
-    expect(functionEnv(t, 'DecayFn')).toMatchObject({ DECAY_HALF_LIFE_SECONDS: String(10 * 86400), DECAY_FLOOR: '0.1' });
+    expect(functionEnv(t, 'DecayFn')).toMatchObject({
+      DECAY_HALF_LIFE_SECONDS: String(10 * 86400),
+      DECAY_FLOOR: '0.1',
+      DECAY_GRADUATED_HALF_LIFE_SECONDS: String(365 * 86400),
+      // A reviewer whose upstream is empty gets no checks.
+      UPSTREAM_REPOS_JSON: JSON.stringify({ 'valkey-glide-review': 'valkey-io/valkey-glide' }),
+      SKILL_CHECKS_PER_DAY: '0',
+      SKILL_RECHECK_SECONDS: String(30 * 86400),
+      RETIRE_SKILLS: 'true',
+      MAX_RETIREMENTS_PER_DAY: '7',
+      RETIRE_REFUSED_BACKOFF_SECONDS: String(14 * 86400),
+    });
+  });
+
+  test('the defaults: 180-day graduated half-life, ten checks a day, retirement off', () => {
+    const env = functionEnv(s.template(s.stacks.decay), 'DecayFn');
+    expect(Object.keys(env).sort()).toEqual([
+      'CONCERNS_TABLES_JSON', 'CURATOR_QUEUE_URL', 'DECAY_FLOOR', 'DECAY_GRADUATED_HALF_LIFE_SECONDS', 'DECAY_HALF_LIFE_SECONDS',
+      'MAX_RETIREMENTS_PER_DAY', 'RETIRE_REFUSED_BACKOFF_SECONDS', 'RETIRE_SKILLS', 'SKILL_CHECKS_PER_DAY', 'SKILL_RECHECK_SECONDS',
+      'UPSTREAM_REPOS_JSON',
+    ]);
+    expect(env).toMatchObject({
+      DECAY_HALF_LIFE_SECONDS: String(30 * 86400),
+      DECAY_GRADUATED_HALF_LIFE_SECONDS: '15552000',
+      UPSTREAM_REPOS_JSON: JSON.stringify({ 'valkey-review': 'valkey-io/valkey', 'valkey-glide-review': 'valkey-io/valkey-glide' }),
+      SKILL_CHECKS_PER_DAY: '10',
+      SKILL_RECHECK_SECONDS: '7776000',
+      RETIRE_SKILLS: 'false',
+      MAX_RETIREMENTS_PER_DAY: '3',
+      RETIRE_REFUSED_BACKOFF_SECONDS: '2592000',
+    });
+  });
+
+  test('sends maintenance requests to the curator queue, and to no other queue', () => {
+    const queueUrl = JSON.stringify(functionEnv(s.template(s.stacks.decay), 'DecayFn').CURATOR_QUEUE_URL);
+    expect(queueUrl).toMatch(/ValkeyReviewWebhook:ExportsOutputRefCuratorQueue/);
+
+    const statements = decayStatements(s);
+    const sqs = statements.filter((st) => actionsOf(st).some((a) => a.startsWith('sqs:')));
+    expect(sqs).toHaveLength(1);
+    expect(actionsOf(sqs[0]!).sort()).toEqual(['sqs:GetQueueAttributes', 'sqs:GetQueueUrl', 'sqs:SendMessage']);
+    const [resource] = resourceStrings(sqs);
+    expect(resourceStrings(sqs)).toHaveLength(1);
+    expect(resource).toMatch(/ValkeyReviewWebhook:ExportsOutputFnGetAttCuratorQueue[A-Z0-9]+Arn/);
+    expect(resource).not.toMatch(/Dlq|DeliveryQueue/);
+    // No registry, secret, model or function access: the curator does the rest.
+    expect(statements.flatMap(actionsOf).filter((a) => /^(agent-registry|secretsmanager|bedrock|lambda|s3):/.test(a))).toEqual([]);
+    expect([...new Set(statements.flatMap(actionsOf))].sort()).toEqual([
+      'dynamodb:DeleteItem', 'dynamodb:Scan', 'dynamodb:UpdateItem',
+      'kms:Decrypt', 'kms:DescribeKey', 'kms:Encrypt', 'kms:GenerateDataKey*', 'kms:ReEncrypt*',
+      'sqs:GetQueueAttributes', 'sqs:GetQueueUrl', 'sqs:SendMessage',
+    ]);
   });
 });
 
