@@ -65,16 +65,23 @@ test('the staleness threshold comes from the input', async () => {
   assert.equal((await decide(value)).action, 'invoke');
 });
 
-test('a review past its run budget is abandoned without reading the heartbeat', async () => {
-  const { value, reads } = input({ sentAt: NOW - 91 * MIN, receiveCount: 7 });
-  const decision = await decide(value);
-  assert.equal(decision.action, 'delete');
-  assert.equal(decision.error, true);
-  assert.match(decision.reason, /91 min > 90 min/);
-  assert.equal(reads.length, 0);
+test('a review past its run budget is abandoned', async () => {
+  for (const record of [undefined, { status: 'running', last_activity: NOW - MIN }, { status: 'failed', last_activity: NOW - MIN }]) {
+    const { value } = input({ sentAt: NOW - 91 * MIN, receiveCount: 7, ...withHeartbeat(record) });
+    const decision = await decide(value);
+    assert.equal(decision.action, 'delete', JSON.stringify(record));
+    assert.equal(decision.error, true);
+    assert.match(decision.reason, /91 min > 90 min/);
+  }
 
   const longer = input({ sentAt: NOW - 91 * MIN, runBudgetMs: 120 * MIN });
   assert.equal((await decide(longer.value)).action, 'invoke');
+});
+
+test('a review that completed is not reported as abandoned once past its budget', async () => {
+  // Received at minutes 80 (running) and 96 (completed in between).
+  const { value } = input({ sentAt: NOW - 96 * MIN, receiveCount: 7, ...withHeartbeat({ status: 'completed', last_activity: NOW - 5 * MIN }) });
+  assert.deepEqual(await decide(value), { action: 'delete', reason: 'prior attempt completed' });
 });
 
 test('a healthy long review ends on its budget before the queue dead-letters it', async () => {

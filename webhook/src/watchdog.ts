@@ -9,11 +9,14 @@ import { heartbeatRunKey } from './review-envelope.js';
  * "check on the run", not "it failed":
  *
  *   - heartbeat completed               -> done; delete the message
+ *   - older than the run budget         -> give up; delete with an error log
  *   - heartbeat running and fresh       -> alive; leave the message for
  *                                          the next visibility timeout
  *   - heartbeat stale, failed or absent -> dead; run again on the
  *                                          fallback model
- *   - older than the run budget         -> give up; delete with an error log
+ *
+ * In that order: a run that completed after the last check is not
+ * reported as abandoned just because the budget ran out since.
  *
  * The run budget must end the message before the queue dead-letters it:
  * infra/lib/webhook-stack.ts sizes maxReceiveCount from the 90-minute
@@ -63,6 +66,9 @@ export async function decide(input: WatchdogInput): Promise<Decision> {
 
   if (receiveCount <= 1) return { action: 'invoke', useFallbackModel: false, reason: 'first attempt' };
 
+  const record = await input.readHeartbeat(heartbeatRunKey(input.envelope));
+  if (record?.status === 'completed') return { action: 'delete', reason: 'prior attempt completed' };
+
   const elapsedMs = input.sentAt ? input.now - input.sentAt : 0;
   if (elapsedMs > input.runBudgetMs) {
     return {
@@ -72,8 +78,6 @@ export async function decide(input: WatchdogInput): Promise<Decision> {
     };
   }
 
-  const record = await input.readHeartbeat(heartbeatRunKey(input.envelope));
-  if (record?.status === 'completed') return { action: 'delete', reason: 'prior attempt completed' };
   if (!record?.last_activity) return { action: 'invoke', useFallbackModel: true, reason: 'no heartbeat record' };
   if (record.status === 'failed') return { action: 'invoke', useFallbackModel: true, reason: 'runtime reported failed' };
   const ageMs = input.now - record.last_activity;
