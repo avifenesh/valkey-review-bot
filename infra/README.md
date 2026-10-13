@@ -518,7 +518,8 @@ read it: `npx cdk deploy ValkeyReviewerCurator ValkeyReviewerDecay`.
   or brought back. A retired skill returns only under a new name, when a
   maintainer reinforces its concern again.
 - `openPullRequests: true`: needs `skillsRepo` and
-  [the skills-repo App](#the-skills-repo-app). Pull requests open on
+  [the skills-repo App](#the-skills-repo-app); without `skillsRepo` it does
+  nothing. Pull requests open on
   `skill-check/<reviewer>/<release>` branches of `skillsRepo.repo`. Close one
   to reject it; nothing more is proposed for that release.
 
@@ -616,9 +617,8 @@ needs nothing: a reinforcement brings it back the same way.
 A check whose base commit cannot be fetched, other than because the
 upstream no longer has it, never confirms the skill, so the same check
 comes back. If a skill keeps ending `inconclusive` for that reason, remove
-`verified_sha` from its record (same command as above, with
-`--update-expression 'REMOVE verified_sha'` and no condition). The next
-check is then a first check, by presence only:
+`verified_sha` from its record. The next check is then a first check, by
+presence only:
 
 ```sh
 aws dynamodb update-item --table-name CONCERNS_TABLE \

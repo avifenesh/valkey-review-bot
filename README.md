@@ -27,8 +27,8 @@ The reviewer runs as a GitHub App. On the Valkey repositories it appears as
 - **Automatic reviews** run when a pull request is opened or reopened and when new
   commits are pushed to it, within a daily budget per repository. A pull request gets at
   most 3 automatic reviews, counting the first (the deployment can set 1 to 20).
-  - A review of new commits starts 5 minutes after the push. Pushes in those 5 minutes
-    join it, so a burst of pushes gets one review, of the newest head.
+  - A review of new commits starts 5 minutes after the push (by default). Pushes in
+    those minutes join it, so a burst of pushes gets one review, of the newest head.
   - A push while a review runs queues the next review, which waits for the running one
     to end.
   - On repositories set to skip drafts, a draft is reviewed when it is marked ready for
