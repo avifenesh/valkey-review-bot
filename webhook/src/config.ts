@@ -45,7 +45,11 @@ export interface ReviewRoute {
   readonly mentionOnly: boolean;
   /** Draft PRs wait for ready_for_review instead of reviewing on open. */
   readonly skipDrafts: boolean;
-  /** An @mention reply in a bot review thread starts a re-review of the claimed fix. */
+  /**
+   * An @mention reply in a review thread starts a run. In a thread the App
+   * started, the run answers the reply (a fix claim, a dispute or a
+   * question); in any other thread the reply is an ordinary summons.
+   */
   readonly threadReplyReview: boolean;
 }
 
