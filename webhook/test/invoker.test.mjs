@@ -123,6 +123,22 @@ test('a failed clear stops the run, and the retry runs it on the primary model',
   assert.equal(invoked().use_fallback_model, undefined);
 });
 
+test('a receive that finds its marker taken by another receive of the message does not run the review', async () => {
+  // SQS delivered the message twice: both receives read the marker, and
+  // the other one removed it first.
+  ddbAnswer = tables({ marker: 'marker-1', deleteError: conditionFailed() });
+  const dup = await run(sqsEvent({ ...review, pending_marker: 'marker-1' }));
+  assert.deepEqual(dup.result, { batchItemFailures: [{ itemIdentifier: 'm1' }] }, 'left on the queue for the next receive');
+  assert.deepEqual(ops(), ['GetCommand idempotency', 'ScanCommand heartbeat', 'DeleteCommand idempotency'], 'not invoked');
+  assert.ok(dup.lines.some((l) => /^\[pending\] review repo=Example-Org\/Valkey pr=7 head=bbb marker=marker-1 was taken by another receive of this message; not run twice$/.test(l)), dup.lines.join('\n'));
+  assert.equal(dup.lines.some((l) => /^\[(fail|invoke|abandoned)\]/.test(l)), false, 'quiet');
+
+  ddbAnswer = tables({ heartbeat: { status: 'running', last_activity: Date.now() } });
+  const next = await run(sqsEvent({ ...review, pending_marker: 'marker-1' }, 2));
+  assert.deepEqual(next.result, { batchItemFailures: [{ itemIdentifier: 'm1' }] });
+  assert.deepEqual(ops(), ['GetCommand idempotency', 'GetCommand heartbeat'], 'the next receive watches the run the other receive started');
+});
+
 test('a failed marker read leaves the message for a retry', async () => {
   ddbAnswer = async () => { throw Object.assign(new Error('throttled'), { name: 'ThrottlingException' }); };
   const { result } = await run(sqsEvent({ ...review, pending_marker: 'marker-1' }));

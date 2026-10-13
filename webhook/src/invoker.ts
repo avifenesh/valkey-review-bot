@@ -31,7 +31,8 @@ interface SqsEvent {
 
 /**
  * Thrown to leave the message on the queue without invoking: the prior
- * attempt, or another review of the pull request, is still alive.
+ * attempt, or another review of the pull request, is still alive, or
+ * another receive of the same message is starting the run.
  */
 class StillRunning extends Error {}
 
@@ -90,13 +91,17 @@ async function holdsMarker(marker: PendingMarker | undefined, tag: string): Prom
 }
 
 /**
- * Removes the marker just before the run starts. A failed delete throws,
- * so the message is retried instead of run: a marker left in place would
- * make the next receive run the review a second time.
+ * Removes the marker just before the run starts. False when it was
+ * already gone. The delete is conditioned on the marker, so it also
+ * claims the start: when SQS delivers the message twice at once, only
+ * the receive whose delete succeeds runs the review. A failed delete
+ * throws, so the message is retried instead of run: a marker left in
+ * place would make the next receive run the review a second time.
  */
-async function clearMarkerForRun(marker: PendingMarker, tag: string): Promise<void> {
+async function clearMarkerForRun(marker: PendingMarker, tag: string): Promise<boolean> {
   const cleared = await clearPendingReview(ddb, config.idempotencyTable, marker.repo, marker.prNumber, marker.markerId);
   console.log(`[pending] ${tag} marker=${marker.markerId} ${cleared ? 'cleared' : 'already gone'}`);
+  return cleared;
 }
 
 /** A review that gave up waiting lets go of its marker, so the next event can queue a review. */
@@ -172,7 +177,19 @@ async function handleOne(record: SqsRecord): Promise<void> {
     throw new StillRunning();
   }
 
-  if (marker && held) await clearMarkerForRun(marker, tag);
+  if (marker && held && !(await clearMarkerForRun(marker, tag))) {
+    // The marker was there a moment ago, so another receive of this
+    // message took it and is starting the run: a duplicate delivery.
+    // This receive does not run the review again and logs no failure.
+    // It leaves the message on the queue instead of deleting it: a
+    // delete could remove the message for the other receive too, and its
+    // redeliveries are what watch that run once it outlives its worker.
+    // The next receive finds the run's heartbeat, or, if the marker went
+    // some other way, such as expiry, runs the review as one whose
+    // attempt died.
+    console.log(`[pending] ${tag} marker=${marker.markerId} was taken by another receive of this message; not run twice`);
+    throw new StillRunning();
+  }
 
   const payload = decision.useFallbackModel ? { ...envelope, use_fallback_model: true } : envelope;
   console.log(`[invoke] ${tag} attempt=${receiveCount}${decision.useFallbackModel ? ` fallback_model=true (${decision.reason})` : ''}`);
