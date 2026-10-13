@@ -234,17 +234,18 @@ test('after waiting, a review of new commits runs on the primary model', async (
 });
 
 test('an opened, reopened or ready review waits too, then runs on the primary model', async () => {
-  const opened = { ...review, pending_marker: 'marker-1' };
-  ddbAnswer = tables({ marker: 'marker-1', pages: [[running('Example-Org/Valkey#7#aaa#push')]] });
-  const waited = await run(sqsEvent(opened));
-  assert.deepEqual(waited.result, { batchItemFailures: [{ itemIdentifier: 'm1' }] });
-  assert.deepEqual(ops(), ['GetCommand idempotency', 'ScanCommand heartbeat', 'UpdateCommand idempotency'], 'not invoked; marker kept');
+  for (const envelope of [{ ...review, pending_marker: 'marker-1' }, { ...review, run_nonce: 'ready', pending_marker: 'marker-1' }]) {
+    ddbAnswer = tables({ marker: 'marker-1', pages: [[running('Example-Org/Valkey#7#aaa#push')]] });
+    const waited = await run(sqsEvent(envelope));
+    assert.deepEqual(waited.result, { batchItemFailures: [{ itemIdentifier: 'm1' }] });
+    assert.deepEqual(ops(), ['GetCommand idempotency', 'ScanCommand heartbeat', 'UpdateCommand idempotency'], 'not invoked; marker kept');
 
-  ddbAnswer = tables({ marker: 'marker-1' });
-  const ran = await run(sqsEvent({ ...opened, run_nonce: 'ready' }, 3));
-  assert.deepEqual(ran.result, { batchItemFailures: [] });
-  assert.deepEqual(ops(), ['GetCommand idempotency', 'ScanCommand heartbeat', 'DeleteCommand idempotency', 'InvokeAgentRuntimeCommand']);
-  assert.equal(invoked().use_fallback_model, undefined);
+    ddbAnswer = tables({ marker: 'marker-1' });
+    const ran = await run(sqsEvent(envelope, 3));
+    assert.deepEqual(ran.result, { batchItemFailures: [] });
+    assert.deepEqual(ops(), ['GetCommand idempotency', 'ScanCommand heartbeat', 'DeleteCommand idempotency', 'InvokeAgentRuntimeCommand']);
+    assert.equal(invoked().use_fallback_model, undefined);
+  }
 });
 
 test('a running review on a later page of the scan is found', async () => {
