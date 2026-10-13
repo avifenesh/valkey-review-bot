@@ -111,7 +111,7 @@ from `webhook/` and `ops/`, so run the loop above first.
 
 CI runs the same commands, plus [agnix](https://github.com/agent-sh/agnix) on the
 agent configuration files and a [scrump](https://github.com/avifenesh/scrump) secret
-scan of every tracked file.
+scan of every tracked file except the npm lockfiles.
 
 Never commit real deployment values (account IDs, App IDs, registry IDs, secrets).
 They belong in `infra/deploy.config.json`, which is ignored by git.

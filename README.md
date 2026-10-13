@@ -24,8 +24,9 @@ The reviewer runs as a GitHub App. On the Valkey repositories it appears as
 
 ## How to use it
 
-- **Automatic reviews** run when a pull request is opened, reopened, or marked ready for
-  review, within a daily budget per repository.
+- **Automatic reviews** run when a pull request is opened or reopened, within a daily
+  budget per repository. On repositories set to skip drafts, a draft is reviewed when it
+  is marked ready for review instead.
 - **Ask for a review** by mentioning the bot in a pull request comment, for example
   `@valkey-review-bot please check the replica path`. Any user with write access can do
   this. The instruction becomes the main focus of that review.
@@ -36,11 +37,13 @@ The reviewer runs as a GitHub App. On the Valkey repositories it appears as
 
 ## How it learns
 
-Replies from repository owners, members and collaborators to the bot's comments are
-feedback. A curator agent records each piece of feedback as a concern. Each maintainer
-counts once per pull request, and when the same point has been made enough times the
-concern graduates into a skill that every later review loads. Feedback from other
-accounts is not used.
+Comments, review-thread replies and submitted reviews that repository owners, members and
+collaborators post on pull requests are feedback for a curator agent, whether or not they
+answer the bot. Summons, acknowledgements, very short comments and other noise are left
+out. For a reply in a thread the bot started, the curator also gets the bot's comment.
+The curator records each piece of feedback as a concern. Each maintainer counts once per
+pull request, and when the same point has been made enough times the concern graduates
+into a skill that every later review loads. Feedback from other accounts is not used.
 
 ## Architecture
 

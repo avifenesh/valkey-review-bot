@@ -156,12 +156,14 @@ ignored. Keys with a default may be left out.
 The receiver ignores bot authors. Their pull requests get no automatic
 review, their comments and reviews are not maintainer feedback, and
 their @mentions do not summon the bot. An author is a bot when GitHub
-reports the user type `Bot`, when the login is `botLogin`, or when the
-login is in the known bot list. Logins are compared case-insensitively.
+reports the user type `Bot`, when the login ends in `[bot]`, when the
+login is `botLogin`, or when the login is in the known bot list. Logins
+are compared case-insensitively.
 
 The stack passes `knownBotLogins` to the receiver as the comma-separated
 `KNOWN_BOT_LOGINS` variable. A non-empty list replaces the built-in list
-in `webhook/src/receiver.ts`, so copy any built-in logins you still want.
+(`DEFAULT_KNOWN_BOT_LOGINS` in `webhook/src/config.ts`), so copy any
+built-in logins you still want.
 Leave the key out, or set it to `[]`, to keep the built-in list. The
 variable is then not set at all, because the receiver would read an empty
 value as an empty list.
@@ -188,7 +190,7 @@ reviewer. The token broker issues tokens only for these repositories.
 | `id` | required | Route name: letters, digits and hyphens. It names the route's queue and worker, so keep it stable once deployed. Ids must stay unique after hyphens are removed. |
 | `reviewer` | required | `valkey-review` or `valkey-glide-review`. |
 | `repo` | required | `owner/name`, spelled as GitHub shows it. A repository can appear in one route only (compared case-insensitively). |
-| `threadReplyReview` | `false` | A maintainer tagging the bot in a reply inside a bot review thread starts a re-review that checks the claimed fix. |
+| `threadReplyReview` | `false` | A maintainer tagging the bot in a reply inside any review thread starts a review; in a thread the bot started, that review checks the claimed fix. When `false`, tags in review-thread replies start nothing (the replies are still feedback). |
 | `skipDrafts` | `false` | Draft pull requests are not reviewed when opened; the review runs when the draft is marked ready. |
 | `mentionOnly` | `false` | No automatic reviews. Reviews run only when a maintainer tags the bot. |
 | `authorAllowlist` | `[]` | When not empty, only pull requests by these logins get automatic reviews. |
@@ -255,7 +257,7 @@ models.
 | `curator.fallback` | `openai.gpt-6.1-sol` | Curator model after a primary failure. |
 | `curator.effort` | `medium` | Effort for `curator.primary`. |
 | `curator.fallbackEffort` | `high` | Effort for `curator.fallback`. |
-| `summarizer.primary` | `us.anthropic.claude-haiku-5-5` | Writes the one-line progress note in the status comment of a summoned review. Called through the Converse API. |
+| `summarizer.primary` | `us.anthropic.claude-haiku-5-5` | Writes the one-line progress note in the status comment of a summoned review. |
 | `summarizer.fallback` | `openai.gpt-6.1-sol` | Used when the summarizer primary fails. |
 | `safetyGate` | `us.anthropic.claude-haiku-4-5-20251001-v1:0` | Screens maintainer instructions in @mentions before a review is queued. Must be a Bedrock model; the receiver calls it through the Converse API. |
 | `profileRegions` | `["us-east-1", "us-east-2", "us-west-2"]` | Regions an inference profile may send a request to. Each gets a foundation-model grant. |
@@ -271,7 +273,7 @@ models.
 | `valkey-review.maxTokens`, `valkey-glide-review.maxTokens` | `32768` | Output token limit per model call (1024 to 200000). |
 | `valkey-review.allowBuild`, `valkey-glide-review.allowBuild` | `true` | Lets the reviewer run the repository's build and tests. |
 | `valkey-review.allowWrite`, `valkey-glide-review.allowWrite` | `true` | Lets the reviewer write files in its checkout, for example a test that checks a claim. |
-| `curator.maxIterations` | `40` | Maximum model calls per feedback event (1 to 500). |
+| `curator.maxIterations` | `40` | Maximum tool rounds per feedback event (1 to 500). |
 | `curator.maxTokens` | `16384` | Output token limit per model call (1024 to 200000). |
 | `curator.graduationThreshold` | `4` | Distinct reinforcements a concern needs before the curator may write it to a reviewer's skills registry (2 to 100). |
 
@@ -301,9 +303,16 @@ counted. `0` pauses automatic reviews.
 
 ## Operational limits
 
-These are constants in `lib/webhook-stack.ts`:
+These are constants in `lib/webhook-stack.ts`, except the session limits,
+which are in `lib/valkey-review-agent-stack.ts`:
 
 - Review workers: at most 5 concurrent per route. Curator worker: at most 2.
+- Reviewer runtime sessions: 15-minute idle timeout and 2-hour maximum
+  lifetime. While a review runs, the runtime reports `HealthyBusy` on
+  `/ping`, so the idle timeout does not stop it after the worker has
+  gone. The 2-hour limit is above the 90-minute run budget and ends a
+  session that hangs. The curator runtime keeps AgentCore's defaults and
+  does not report `HealthyBusy`.
 - Receiver: 10 reserved concurrent executions. Reserving concurrency needs
   enough unreserved account concurrency; a new account with a low Lambda
   quota may need an increase first.

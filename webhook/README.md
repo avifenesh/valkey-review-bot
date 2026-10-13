@@ -61,8 +61,9 @@ review can outlive the worker's 15-minute limit, so on each later receive
 it reads the run's heartbeat record and either deletes the message (the
 run completed), leaves it for the next visibility timeout (the run is
 alive), or runs it again on the fallback model (the run is dead). After the
-run budget it deletes the message and logs an error. Curator messages run
-on every receive and are deleted without running after more than three.
+run budget it deletes the message and logs an `[abandoned]` error, unless
+the run completed. Curator messages run on every receive and are deleted
+without running after more than three.
 
 | Variable | Default | Meaning |
 | --- | --- | --- |
