@@ -1,0 +1,31 @@
+{
+  "aws": {
+    "account": "111111111111",
+    "region": "us-west-2"
+  },
+  "github": {
+    "appId": "123456",
+    "botLogin": "your-app-slug[bot]",
+    "appSecretName": "valkey-reviewer/github-app"
+  },
+  "skillsRegistries": {
+    "valkey-review": "your-valkey-review-registry-id",
+    "valkey-glide-review": "your-valkey-glide-review-registry-id",
+    "curator": "your-curator-registry-id"
+  },
+  "routes": [
+    {
+      "id": "valkey-review",
+      "reviewer": "valkey-review",
+      "repo": "your-org/valkey"
+    },
+    {
+      "id": "valkey-glide-review",
+      "reviewer": "valkey-glide-review",
+      "repo": "your-org/valkey-glide",
+      "threadReplyReview": true
+    }
+  ],
+  "curatorOnlyRoutes": [],
+  "dailyReviewBudget": 40
+}

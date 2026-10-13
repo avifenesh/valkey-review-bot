@@ -1,0 +1,442 @@
+import * as cdk from 'aws-cdk-lib';
+import { Match } from 'aws-cdk-lib/assertions';
+import { bedrockModelArns, modelAccessStatements } from '../lib/bedrock-arns';
+import { parseDeploymentConfig } from '../lib/deployment-config';
+import { routeMaps } from '../lib/webhook-stack';
+import {
+  ACCOUNT,
+  actionsOf,
+  fixture,
+  functionEnv,
+  functionRoleId,
+  resourceStrings,
+  runtimeEnv,
+  runtimeRoleId,
+  type Statement,
+  statementsForRole,
+  synth,
+  type Synthesized,
+} from './helpers';
+
+let s: Synthesized;
+beforeAll(() => {
+  s = synth();
+});
+
+const reviewerTemplate = (id: 'valkey-review' | 'valkey-glide-review') => s.template(s.stacks.reviewers.get(id)!);
+const reviewerStatements = (id: 'valkey-review' | 'valkey-glide-review'): Statement[] => {
+  const t = reviewerTemplate(id);
+  return statementsForRole(t, runtimeRoleId(t));
+};
+const curatorStatements = (): Statement[] => {
+  const t = s.template(s.stacks.curator);
+  return statementsForRole(t, runtimeRoleId(t));
+};
+const bySid = (statements: Statement[], sid: string) => statements.filter((st) => st.Sid === sid);
+const registryArn = (id: string) => `arn:aws:agent-registry:us-west-2:${ACCOUNT}:registry/${id}`;
+
+describe('no deployment-specific literals', () => {
+  test('the only account id in any template is the configured one', () => {
+    for (const stack of s.allStacks) {
+      const json = JSON.stringify(s.template(stack).toJSON());
+      const unexpected = [...new Set(json.match(/(?<![0-9A-Za-z])\d{12}(?![0-9A-Za-z])/g) ?? [])].filter((a) => a !== ACCOUNT);
+      expect({ stack: stack.stackName, unexpected }).toEqual({ stack: stack.stackName, unexpected: [] });
+    }
+  });
+
+  test('a second account synthesizes without the first one anywhere', () => {
+    const other = synth({ ...fixture(), aws: { account: '222222222222', region: 'us-west-2' } });
+    for (const stack of other.allStacks) {
+      expect(JSON.stringify(other.template(stack).toJSON())).not.toContain(ACCOUNT);
+    }
+  });
+
+  test('no stack sets an explicit export name', () => {
+    for (const stack of s.allStacks) {
+      for (const [id, output] of Object.entries<any>(s.template(stack).toJSON().Outputs ?? {})) {
+        if (output.Export) expect(`${id}:${output.Export.Name}`).toMatch(/^ExportsOutput.*:.*:ExportsOutput/);
+      }
+    }
+  });
+
+  test('no AgentCore memory and no deprecated log retention resources', () => {
+    for (const stack of s.allStacks) {
+      const t = s.template(stack);
+      t.resourceCountIs('AWS::BedrockAgentCore::Memory', 0);
+      t.resourceCountIs('Custom::LogRetention', 0);
+    }
+  });
+});
+
+describe('reviewer role', () => {
+  test.each(['valkey-review', 'valkey-glide-review'] as const)('%s cannot read secrets, write registries or touch concerns', (id) => {
+    const statements = reviewerStatements(id);
+    expect(statements.length).toBeGreaterThan(0);
+    const actions = statements.flatMap(actionsOf);
+    expect(actions.filter((a) => a.startsWith('secretsmanager:'))).toEqual([]);
+    expect(actions.filter((a) => a.startsWith('agent-registry:'))).toEqual(['agent-registry:GetRegistryRecord', 'agent-registry:ListRegistryRecords']);
+    for (const st of statements.filter((x) => actionsOf(x).some((a) => a.startsWith('dynamodb:')))) {
+      const resources = JSON.stringify(st.Resource);
+      expect(resources).toContain('RunHeartbeatTable');
+      expect(resources).not.toContain('ConcernsTable');
+    }
+  });
+
+  test('reads only its own registry and its own asset prefix, and may invoke the broker', () => {
+    const valkey = reviewerStatements('valkey-review');
+    expect(resourceStrings(bySid(valkey, 'ReadSkillsRegistry')))
+      .toEqual([registryArn('valkeyRegistry1'), `${registryArn('valkeyRegistry1')}/record/*`]);
+    expect(JSON.stringify(valkey)).not.toContain('glideRegistry1');
+    const s3Read = valkey.find((st) => actionsOf(st).includes('s3:GetObject*'))!;
+    expect(JSON.stringify(s3Read.Resource)).toContain('/valkey-review/*');
+    const invoke = valkey.filter((st) => actionsOf(st).includes('lambda:InvokeFunction'));
+    expect(JSON.stringify(invoke)).toContain('TokenBrokerValkeyReviewFn');
+    expect(JSON.stringify(invoke)).not.toContain('TokenBrokerValkeyGlideReviewFn');
+  });
+
+  test('pulls images from the repository of the configured bootstrap qualifier', () => {
+    const custom = synth({ ...fixture(), aws: { account: ACCOUNT, region: 'us-west-2', bootstrapQualifier: 'abc123' } });
+    const t = custom.template(custom.stacks.reviewers.get('valkey-review')!);
+    const pull = statementsForRole(t, runtimeRoleId(t)).find((st) => actionsOf(st).includes('ecr:BatchGetImage'))!;
+    expect(pull.Resource).toBe(`arn:aws:ecr:us-west-2:${ACCOUNT}:repository/cdk-abc123-container-assets-${ACCOUNT}-us-west-2`);
+  });
+
+  test('runtime environment follows the configuration contract', () => {
+    const env = runtimeEnv(reviewerTemplate('valkey-glide-review'));
+    expect(Object.keys(env).sort()).toEqual([
+      'ALLOW_BUILD', 'ALLOW_WRITE', 'ASSETS_BUCKET', 'AWS_REGION', 'BEDROCK_MODEL_ID', 'FALLBACK_MODEL_ID',
+      'GITHUB_APP_ID', 'HEARTBEAT_TABLE', 'MANTLE_REGION', 'MAX_ITERATIONS', 'MAX_TOKENS', 'PROMPT_S3_KEY',
+      'REASONING_EFFORT', 'SKILLS_REGISTRY_ID', 'SKILL_S3_KEY', 'SUMMARIZER_FALLBACK_MODEL_ID', 'SUMMARIZER_MODEL_ID',
+      'TOKEN_BROKER_FUNCTION', 'UPSTREAM_REPO', 'WORKSPACE_ROOT',
+    ]);
+    expect(env).toMatchObject({
+      BEDROCK_MODEL_ID: 'us.anthropic.claude-opus-5-5',
+      FALLBACK_MODEL_ID: 'openai.gpt-6.1-sol',
+      REASONING_EFFORT: 'high',
+      MANTLE_REGION: 'us-east-1',
+      GITHUB_APP_ID: '123456',
+      SKILLS_REGISTRY_ID: 'glideRegistry1',
+      WORKSPACE_ROOT: '/workspace/valkey-glide',
+      UPSTREAM_REPO: 'valkey-io/valkey-glide',
+      ALLOW_BUILD: 'true',
+      MAX_ITERATIONS: '150',
+    });
+  });
+
+  test('the runtime is created after its role policy', () => {
+    const t = reviewerTemplate('valkey-review');
+    const runtime = Object.values<any>(t.findResources('AWS::BedrockAgentCore::Runtime'))[0];
+    expect(runtime.DependsOn).toEqual(expect.arrayContaining([expect.stringMatching(/^RuntimeRoleDefaultPolicy/)]));
+  });
+});
+
+describe('curator role', () => {
+  test('writes only the reviewer registries and only reads its own', () => {
+    const statements = curatorStatements();
+    const writers = statements.filter((st) => actionsOf(st).some((a) => /^agent-registry:(Create|Update|Delete)/.test(a)));
+    expect(resourceStrings(writers).sort()).toEqual([
+      registryArn('glideRegistry1'), `${registryArn('glideRegistry1')}/record/*`,
+      registryArn('valkeyRegistry1'), `${registryArn('valkeyRegistry1')}/record/*`,
+    ]);
+    const own = statements.filter((st) => JSON.stringify(st.Resource).includes('curatorRegistry1'));
+    expect(own.flatMap(actionsOf).sort()).toEqual(['agent-registry:GetRegistryRecord', 'agent-registry:ListRegistryRecords']);
+  });
+
+  test('reads and writes both concerns tables with their KMS key, and has no secrets', () => {
+    const statements = curatorStatements();
+    const concerns = bySid(statements, 'ConcernsReadWrite')[0]!;
+    expect(JSON.stringify(concerns.Resource)).toContain('ValkeyReviewAgent');
+    expect(JSON.stringify(concerns.Resource)).toContain('ValkeyGlideReviewAgent');
+    expect(statements.some((st) => actionsOf(st).includes('kms:GenerateDataKey*')
+      && JSON.stringify(st.Resource).includes('SubstrateKey'))).toBe(true);
+    expect(statements.flatMap(actionsOf).filter((a) => a.startsWith('secretsmanager:'))).toEqual([]);
+  });
+
+  test('each runtime uses the role defined in its own stack', () => {
+    for (const stack of [s.stacks.reviewers.get('valkey-review')!, s.stacks.reviewers.get('valkey-glide-review')!, s.stacks.curator]) {
+      const t = s.template(stack);
+      const runtime = Object.values<any>(t.findResources('AWS::BedrockAgentCore::Runtime'))[0];
+      expect(runtime.Properties.RoleArn).toEqual({ 'Fn::GetAtt': [runtimeRoleId(t), 'Arn'] });
+    }
+  });
+
+  test('outputs the registry ids the skills scripts read with --stack', () => {
+    const curatorOutputs = s.template(s.stacks.curator).toJSON().Outputs;
+    expect(curatorOutputs.CuratorSkillsRegistryId.Value).toBe('curatorRegistry1');
+    // registry-skills.mjs reads SkillsRegistryId first, so the curator stack must not have one.
+    expect(curatorOutputs).not.toHaveProperty('SkillsRegistryId');
+    expect(reviewerTemplate('valkey-review').toJSON().Outputs.SkillsRegistryId.Value).toBe('valkeyRegistry1');
+    expect(reviewerTemplate('valkey-glide-review').toJSON().Outputs.SkillsRegistryId.Value).toBe('glideRegistry1');
+  });
+
+  test('runtime environment carries the curator settings', () => {
+    expect(runtimeEnv(s.template(s.stacks.curator))).toMatchObject({
+      BEDROCK_MODEL_ID: 'us.anthropic.claude-opus-5-5',
+      FALLBACK_MODEL_ID: 'openai.gpt-6.1-sol',
+      REASONING_EFFORT: 'medium',
+      FALLBACK_REASONING_EFFORT: 'high',
+      MANTLE_REGION: 'us-east-1',
+      GRADUATION_THRESHOLD: '4',
+      CURATOR_SKILLS_REGISTRY_ID: 'curatorRegistry1',
+      SKILLS_REGISTRIES_JSON: JSON.stringify({ 'valkey-review': 'valkeyRegistry1', 'valkey-glide-review': 'glideRegistry1' }),
+      PROMPT_S3_KEY: 'curator/prompt.md',
+      SKILL_S3_KEY: 'curator/skill.md',
+    });
+  });
+});
+
+describe('token broker', () => {
+  test("each broker's allowed repositories equal its reviewer's review routes", () => {
+    const t = s.template(s.stacks.substrate);
+    for (const [reviewer, fn] of [['valkey-review', 'TokenBrokerValkeyReviewFn'], ['valkey-glide-review', 'TokenBrokerValkeyGlideReviewFn']] as const) {
+      const env = functionEnv(t, fn);
+      expect(env.ALLOWED_REPOS_JSON).toBe(JSON.stringify(s.config.routes.filter((r) => r.reviewer === reviewer).map((r) => r.repo)));
+      expect(env.GITHUB_APP_ID).toBe('123456');
+    }
+  });
+
+  test('is the only reader of the GitHub App secret outside the webhook receiver', () => {
+    for (const stack of [s.stacks.reviewers.get('valkey-review')!, s.stacks.reviewers.get('valkey-glide-review')!, s.stacks.curator, s.stacks.decay]) {
+      expect(JSON.stringify(s.template(stack).toJSON())).not.toContain('secretsmanager:');
+    }
+    const t = s.template(s.stacks.substrate);
+    for (const fn of ['TokenBrokerValkeyReviewFn', 'TokenBrokerValkeyGlideReviewFn']) {
+      const broker = statementsForRole(t, functionRoleId(t, fn));
+      expect(broker.flatMap(actionsOf)).toContain('secretsmanager:GetSecretValue');
+      expect(JSON.stringify(broker)).toContain(':secret:example/github-app-??????');
+    }
+  });
+});
+
+describe('webhook', () => {
+  test('every work queue has a dead-letter queue', () => {
+    const t = s.template(s.stacks.webhook);
+    const queues = Object.entries<any>(t.findResources('AWS::SQS::Queue'));
+    const work = queues.filter(([, q]) => q.Properties.RedrivePolicy);
+    const dlqIds = new Set(work.map(([, q]) => q.Properties.RedrivePolicy.deadLetterTargetArn['Fn::GetAtt'][0]));
+    expect(work.length).toBe(s.config.routes.length + 1);
+    expect(dlqIds.size).toBe(work.length);
+    expect(work.length + dlqIds.size).toBe(queues.length);
+    const curator = work.find(([id]) => id.startsWith('CuratorQueue'))!;
+    expect(curator[1].Properties.RedrivePolicy.maxReceiveCount).toBe(3);
+    for (const [id, q] of work.filter(([qid]) => qid.startsWith('DeliveryQueue'))) {
+      expect({ id, max: q.Properties.RedrivePolicy.maxReceiveCount }).toEqual({ id, max: 8 });
+    }
+    expect([...s.stacks.webhook.deadLetterQueues.keys()].sort())
+      .toEqual(['curator', 'valkey-glide-review', 'valkey-review', 'valkey-review-upstream']);
+  });
+
+  test('keeps the queue construct ids so updates do not replace queues', () => {
+    const ids = Object.keys(s.template(s.stacks.webhook).findResources('AWS::SQS::Queue'));
+    for (const prefix of ['DeliveryQueuevalkeyreview', 'DeliveryQueuevalkeyglidereview', 'DeliveryQueuevalkeyreviewupstream', 'CuratorQueue']) {
+      expect(ids.some((id) => id.startsWith(prefix))).toBe(true);
+    }
+  });
+
+  test('workers and receiver are concurrency-capped and the API is throttled', () => {
+    const t = s.template(s.stacks.webhook);
+    const scaling = Object.entries<any>(t.findResources('AWS::Lambda::EventSourceMapping'))
+      .map(([id, m]) => [id.startsWith('CuratorWorkerFn') ? 'curator' : 'review', m.Properties.ScalingConfig.MaximumConcurrency]);
+    expect(scaling.filter(([kind]) => kind === 'review').map(([, max]) => max)).toEqual([5, 5, 5]);
+    expect(scaling.filter(([kind]) => kind === 'curator').map(([, max]) => max)).toEqual([2]);
+    t.hasResourceProperties('AWS::Lambda::Function', Match.objectLike({
+      ReservedConcurrentExecutions: 10,
+      Environment: { Variables: Match.objectLike({ BOT_LOGIN: 'example-reviewer[bot]' }) },
+    }));
+    t.hasResourceProperties('AWS::ApiGatewayV2::Stage', {
+      StageName: '$default',
+      DefaultRouteSettings: { ThrottlingRateLimit: 20, ThrottlingBurstLimit: 40 },
+    });
+  });
+
+  test('receiver settings come from the configuration', () => {
+    const env = functionEnv(s.template(s.stacks.webhook), 'ReceiverFn');
+    expect(env).toMatchObject({
+      BOT_LOGIN: 'example-reviewer[bot]',
+      HAIKU_MODEL_ID: 'us.anthropic.claude-haiku-4-5-20251001-v1:0',
+      DAILY_REVIEW_BUDGET: '40',
+    });
+    expect(env).not.toHaveProperty('INSTALLATION_ID');
+    expect(env).not.toHaveProperty('KNOWN_BOT_LOGINS');
+
+    const custom = synth({
+      ...fixture(),
+      github: { ...fixture().github, installationId: '42', knownBotLogins: ['one[bot]', 'two'] },
+      dailyReviewBudget: 7,
+    });
+    expect(functionEnv(custom.template(custom.stacks.webhook), 'ReceiverFn')).toMatchObject({
+      INSTALLATION_ID: '42',
+      KNOWN_BOT_LOGINS: 'one[bot],two',
+      DAILY_REVIEW_BUDGET: '7',
+    });
+  });
+
+  test('an empty knownBotLogins list keeps the receiver built-in list', () => {
+    const custom = synth({ ...fixture(), github: { ...fixture().github, knownBotLogins: [] } });
+    expect(custom.config.github.knownBotLogins).toEqual([]);
+    expect(functionEnv(custom.template(custom.stacks.webhook), 'ReceiverFn')).not.toHaveProperty('KNOWN_BOT_LOGINS');
+  });
+
+  test('route maps: review routes by repository, curator map adds curator-only repositories', () => {
+    const config = parseDeploymentConfig(fixture());
+    const maps = routeMaps(config.routes, config.curatorOnlyRoutes, (id) => `https://queue/${id}`);
+    expect(maps.review).toEqual({
+      'example-org/valkey': { routeId: 'valkey-review', queueUrl: 'https://queue/valkey-review', reviewerId: 'valkey-review' },
+      'example-org/valkey-glide': {
+        routeId: 'valkey-glide-review', queueUrl: 'https://queue/valkey-glide-review', reviewerId: 'valkey-glide-review',
+        skipDrafts: true, threadReplyReview: true,
+      },
+      'upstream-org/valkey': {
+        routeId: 'valkey-review-upstream', queueUrl: 'https://queue/valkey-review-upstream', reviewerId: 'valkey-review',
+        authorAllowlist: ['some-maintainer'], mentionOnly: true,
+      },
+    });
+    expect(maps.curator).toEqual({
+      'example-org/valkey': { reviewerId: 'valkey-review' },
+      'example-org/valkey-glide': { reviewerId: 'valkey-glide-review' },
+      'upstream-org/valkey': { reviewerId: 'valkey-review' },
+      'upstream-org/valkey-glide': { reviewerId: 'valkey-glide-review' },
+    });
+    const env = functionEnv(s.template(s.stacks.webhook), 'ReceiverFn');
+    expect(JSON.parse(env.CURATOR_ROUTE_MAP_JSON as string)).toEqual(maps.curator);
+  });
+});
+
+describe('decay', () => {
+  test('may use the concerns table key, with settings from the configuration', () => {
+    const custom = synth({ ...fixture(), decay: { halfLifeDays: 10, floor: 0.1 } });
+    const t = custom.template(custom.stacks.decay);
+    const statements = statementsForRole(t, functionRoleId(t, 'DecayFn'));
+    expect(statements.some((st) => actionsOf(st).includes('kms:Decrypt') && JSON.stringify(st.Resource).includes('SubstrateKey'))).toBe(true);
+    const ddb = bySid(statements, 'ConcernsDecay')[0]!;
+    expect(actionsOf(ddb).sort()).toEqual(['dynamodb:DeleteItem', 'dynamodb:Scan', 'dynamodb:UpdateItem']);
+    expect(functionEnv(t, 'DecayFn')).toMatchObject({ DECAY_HALF_LIFE_SECONDS: String(10 * 86400), DECAY_FLOOR: '0.1' });
+  });
+});
+
+describe('model grants', () => {
+  const opusProfile = `arn:aws:bedrock:us-west-2:${ACCOUNT}:inference-profile/us.anthropic.claude-opus-5-5`;
+  const fm = (region: string, model: string) => `arn:aws:bedrock:${region}::foundation-model/${model}`;
+
+  test('reviewer: primary and summarizer profiles in every profile region, plus Mantle', () => {
+    const statements = reviewerStatements('valkey-review');
+    expect(resourceStrings(bySid(statements, 'BedrockInvoke')).sort()).toEqual([
+      fm('us-east-1', 'anthropic.claude-haiku-5-5'), fm('us-east-1', 'anthropic.claude-opus-5-5'),
+      fm('us-east-2', 'anthropic.claude-haiku-5-5'), fm('us-east-2', 'anthropic.claude-opus-5-5'),
+      `arn:aws:bedrock:us-west-2:${ACCOUNT}:inference-profile/us.anthropic.claude-haiku-5-5`, opusProfile,
+      fm('us-west-2', 'anthropic.claude-haiku-5-5'), fm('us-west-2', 'anthropic.claude-opus-5-5'),
+    ].sort());
+    expect(actionsOf(bySid(statements, 'BedrockInvoke')[0]!).sort()).toEqual(['bedrock:InvokeModel', 'bedrock:InvokeModelWithResponseStream']);
+    expect(resourceStrings(bySid(statements, 'BedrockMantleInference')))
+      .toEqual([`arn:aws:bedrock-mantle:us-east-1:${ACCOUNT}:project/default`]);
+    expect(statements.flatMap(actionsOf).filter((a) => a.startsWith('bedrock:Converse'))).toEqual([]);
+  });
+
+  test('curator: only its own models', () => {
+    const resources = resourceStrings(bySid(curatorStatements(), 'BedrockInvoke'));
+    expect(resources).toContain(opusProfile);
+    expect(resources.some((r) => r.includes('haiku'))).toBe(false);
+  });
+
+  test('safety gate: InvokeModel on the configured model only', () => {
+    const t = s.template(s.stacks.webhook);
+    const gate = bySid(statementsForRole(t, functionRoleId(t, 'ReceiverFn')), 'InvokeSafetyModel')[0]!;
+    expect(gate.Action).toBe('bedrock:InvokeModel');
+    expect(resourceStrings([gate]).sort()).toEqual([
+      `arn:aws:bedrock:us-west-2:${ACCOUNT}:inference-profile/us.anthropic.claude-haiku-4-5-20251001-v1:0`,
+      ...['us-east-1', 'us-east-2', 'us-west-2'].map((r) => fm(r, 'anthropic.claude-haiku-4-5-20251001-v1:0')),
+    ].sort());
+  });
+
+  test('no Mantle grants without an openai.* model; extra grants reach both agent roles', () => {
+    const custom = synth({
+      ...fixture(),
+      models: {
+        reviewer: { fallback: 'us.anthropic.claude-sonnet-5-5' },
+        curator: { fallback: 'us.anthropic.claude-sonnet-5-5' },
+        summarizer: { fallback: 'anthropic.claude-haiku-4-5-20251001-v1:0' },
+        mantleRegion: '',
+        profileRegions: ['us-west-2', 'us-east-1'],
+        extraGrants: ['us.anthropic.claude-opus-5'],
+      },
+    });
+    for (const stack of [custom.stacks.reviewers.get('valkey-review')!, custom.stacks.curator]) {
+      const t = custom.template(stack);
+      const statements = statementsForRole(t, runtimeRoleId(t));
+      expect(statements.flatMap(actionsOf)
+        .filter((a) => a.startsWith('bedrock-mantle:') || a.endsWith(':CallWithBearerToken'))).toEqual([]);
+      const resources = resourceStrings(bySid(statements, 'BedrockInvoke'));
+      expect(resources).toContain(`arn:aws:bedrock:us-west-2:${ACCOUNT}:inference-profile/us.anthropic.claude-opus-5`);
+      expect(resources).toContain(fm('us-east-1', 'anthropic.claude-opus-5'));
+      expect(resources.some((r) => r.includes('us-east-2'))).toBe(false);
+    }
+    const reviewer = custom.template(custom.stacks.reviewers.get('valkey-review')!);
+    // A plain foundation model ID is granted in the stack region only.
+    expect(resourceStrings(bySid(statementsForRole(reviewer, runtimeRoleId(reviewer)), 'BedrockInvoke')))
+      .toContain(fm('us-west-2', 'anthropic.claude-haiku-4-5-20251001-v1:0'));
+    expect(runtimeEnv(reviewer).MANTLE_REGION).toBe('us-west-2');
+  });
+
+  test('a profile grant always covers the stack region', () => {
+    const custom = synth({ ...fixture(), models: { profileRegions: ['us-east-1', 'us-east-2'] } });
+    const t = custom.template(custom.stacks.curator);
+    expect(resourceStrings(bySid(statementsForRole(t, runtimeRoleId(t)), 'BedrockInvoke')).sort()).toEqual([
+      fm('us-east-1', 'anthropic.claude-opus-5-5'), fm('us-east-2', 'anthropic.claude-opus-5-5'),
+      opusProfile, fm('us-west-2', 'anthropic.claude-opus-5-5'),
+    ].sort());
+  });
+
+  test('ARNs follow the stack partition', () => {
+    const app = new cdk.App({ context: { '@aws-cdk/core:enablePartitionLiterals': true } });
+    const stack = new cdk.Stack(app, 'GovStack', { env: { account: ACCOUNT, region: 'us-gov-west-1' } });
+    expect(bedrockModelArns(stack, 'anthropic.claude-haiku-4-5-20251001-v1:0', []))
+      .toEqual(['arn:aws-us-gov:bedrock:us-gov-west-1::foundation-model/anthropic.claude-haiku-4-5-20251001-v1:0']);
+    const mantle = modelAccessStatements(stack, ['openai.gpt-6.1-sol'], { profileRegions: [], mantleGrantRegions: ['us-gov-west-1'] })
+      .map((st) => st.toStatementJson());
+    expect(mantle.map((st) => st.Sid)).toEqual(['BedrockMantleBearerToken', 'BedrockMantleInference']);
+    expect(mantle[1].Resource).toBe(`arn:aws-us-gov:bedrock-mantle:us-gov-west-1:${ACCOUNT}:project/default`);
+  });
+});
+
+describe('inference profile ids', () => {
+  const stackIn = (region: string) => {
+    const app = new cdk.App({ context: { '@aws-cdk/core:enablePartitionLiterals': true } });
+    return new cdk.Stack(app, 'ModelStack', { env: { account: ACCOUNT, region } });
+  };
+  const model = 'anthropic.claude-haiku-5-5';
+
+  test.each([
+    ['us', 'us-east-1', ['us-east-1', 'us-west-2'], 'aws'],
+    ['eu', 'eu-west-1', ['eu-west-1', 'eu-central-1'], 'aws'],
+    ['apac', 'ap-southeast-1', ['ap-southeast-1', 'ap-northeast-2'], 'aws'],
+    ['jp', 'ap-northeast-1', ['ap-northeast-1', 'ap-northeast-3'], 'aws'],
+    ['au', 'ap-southeast-2', ['ap-southeast-2', 'ap-southeast-4'], 'aws'],
+    ['in', 'ap-south-1', ['ap-south-1', 'ap-south-2'], 'aws'],
+    ['ca', 'ca-central-1', ['ca-central-1', 'ca-west-1'], 'aws'],
+    ['us-gov', 'us-gov-west-1', ['us-gov-west-1', 'us-gov-east-1'], 'aws-us-gov'],
+  ])('%s.* grants the profile and the foundation model in each profile region', (group, region, profileRegions, partition) => {
+    const id = `${group}.${model}`;
+    expect(bedrockModelArns(stackIn(region), id, profileRegions)).toEqual([
+      `arn:${partition}:bedrock:${region}:${ACCOUNT}:inference-profile/${id}`,
+      ...profileRegions.map((r) => `arn:${partition}:bedrock:${r}::foundation-model/${model}`),
+    ]);
+  });
+
+  test('global.* also grants the foundation model with no region, which Bedrock checks for global routing', () => {
+    expect(bedrockModelArns(stackIn('us-west-2'), `global.${model}`, ['us-east-1'])).toEqual([
+      `arn:aws:bedrock:us-west-2:${ACCOUNT}:inference-profile/global.${model}`,
+      `arn:aws:bedrock:us-west-2::foundation-model/${model}`,
+      `arn:aws:bedrock:us-east-1::foundation-model/${model}`,
+      `arn:aws:bedrock:::foundation-model/${model}`,
+    ]);
+  });
+
+  test.each([
+    'anthropic.claude-haiku-4-5-20251001-v1:0',
+    'amazon.nova-pro-v1:0',
+    'meta.llama3-1-70b-instruct-v1:0',
+    'constructor.not-a-group',
+  ])('%s is a foundation model in the stack region', (id) => {
+    expect(bedrockModelArns(stackIn('eu-west-1'), id, ['eu-central-1'])).toEqual([`arn:aws:bedrock:eu-west-1::foundation-model/${id}`]);
+  });
+});
