@@ -183,8 +183,26 @@ export class WebhookStack extends cdk.Stack {
       const worker = workerFunction(`WorkerFn${safeId}`, {
         RUNTIME_ARN: route.runtimeArn,
         HEARTBEAT_TABLE: props.heartbeatTable.tableName,
+        IDEMPOTENCY_TABLE: idempotency.tableName,
       });
+      // Heartbeat reads on redelivery and the pull request's running
+      // reviews (GetItem, Scan), and the run's start record, which the
+      // worker writes with a conditional UpdateItem just before the invoke.
       props.heartbeatTable.grantReadData(worker);
+      props.heartbeatTable.grant(worker, 'dynamodb:UpdateItem');
+      // An automatic review's pending marker (pending#<repo>#<pr>, written
+      // by the receiver): the worker reads it, extends it while the review
+      // waits and deletes it when the run starts, each conditioned on the
+      // marker id. It touches no other item, so the grant is limited to
+      // that key prefix: no delivery keys, budget or round counters. Grant
+      // all three together: a worker that can read the marker but not
+      // delete it dead-letters every automatic review.
+      worker.addToRolePolicy(new iam.PolicyStatement({
+        sid: 'PendingReviewMarkers',
+        actions: ['dynamodb:GetItem', 'dynamodb:UpdateItem', 'dynamodb:DeleteItem'],
+        resources: [idempotency.tableArn],
+        conditions: { 'ForAllValues:StringLike': { 'dynamodb:LeadingKeys': ['pending#*'] } },
+      }));
       worker.addEventSource(new lambdaEventSources.SqsEventSource(queue, {
         batchSize: 1,
         reportBatchItemFailures: true,

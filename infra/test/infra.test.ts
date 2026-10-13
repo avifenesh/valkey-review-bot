@@ -10,8 +10,10 @@ import {
   actionsOf,
   fixture,
   functionEnv,
+  functionIds,
   functionRoleId,
   resourceStrings,
+  roleOfFunction,
   runtimeEnv,
   runtimeRoleId,
   type Statement,
@@ -353,6 +355,48 @@ describe('webhook', () => {
       KNOWN_BOT_LOGINS: 'one[bot],two',
       DAILY_REVIEW_BUDGET: '7',
     });
+  });
+
+  const idempotencyId = () => Object.keys(s.template(s.stacks.webhook).findResources('AWS::DynamoDB::Table'))
+    .find((id) => id.startsWith('IdempotencyTable'))!;
+  const reviewWorkers = () => functionIds(s.template(s.stacks.webhook), 'WorkerFn');
+  const workerStatements = (id: string) => {
+    const t = s.template(s.stacks.webhook);
+    return statementsForRole(t, roleOfFunction(t, id));
+  };
+
+  test('review workers may read, extend and delete pending markers, and no other idempotency item', () => {
+    expect(reviewWorkers()).toHaveLength(s.config.routes.length);
+    const t = s.template(s.stacks.webhook);
+    for (const id of reviewWorkers()) {
+      expect((t.findResources('AWS::Lambda::Function')[id] as any).Properties.Environment.Variables.IDEMPOTENCY_TABLE)
+        .toEqual({ Ref: idempotencyId() });
+      const onTable = workerStatements(id).filter((st) => JSON.stringify(st.Resource).includes(idempotencyId()));
+      expect(onTable).toEqual([{
+        Sid: 'PendingReviewMarkers',
+        Effect: 'Allow',
+        Action: ['dynamodb:DeleteItem', 'dynamodb:GetItem', 'dynamodb:UpdateItem'],
+        Resource: { 'Fn::GetAtt': [idempotencyId(), 'Arn'] },
+        Condition: { 'ForAllValues:StringLike': { 'dynamodb:LeadingKeys': ['pending#*'] } },
+      }]);
+    }
+  });
+
+  test('review workers write only through UpdateItem in the heartbeat table, for the start record', () => {
+    for (const id of reviewWorkers()) {
+      const onHeartbeat = workerStatements(id).filter((st) => JSON.stringify(st.Resource).includes('RunHeartbeatTable'));
+      const actions = onHeartbeat.flatMap(actionsOf);
+      expect(actions).toEqual(expect.arrayContaining(['dynamodb:GetItem', 'dynamodb:Scan', 'dynamodb:UpdateItem']));
+      expect(actions.filter((a) => /^dynamodb:(Put|Delete|BatchWrite|Update)/.test(a))).toEqual(['dynamodb:UpdateItem']);
+    }
+  });
+
+  test('the curator worker reads no table and has no pending markers', () => {
+    const t = s.template(s.stacks.webhook);
+    const env = functionEnv(t, 'CuratorWorkerFn');
+    expect(Object.keys(env)).toEqual(['RUNTIME_ARN']);
+    const statements = statementsForRole(t, functionRoleId(t, 'CuratorWorkerFn'));
+    expect(statements.flatMap(actionsOf).filter((a) => a.startsWith('dynamodb:'))).toEqual([]);
   });
 
   test('outputs what the operator scripts read, and exposes the curator queue', () => {

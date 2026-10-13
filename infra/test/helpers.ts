@@ -89,6 +89,20 @@ export function functionRoleId(template: Template, prefix: string): string {
   return (fns[0]![1] as any).Properties.Role['Fn::GetAtt'][0];
 }
 
+/**
+ * Logical ids of the Lambda functions whose logical id starts with
+ * `prefix`, for prefixes that match several (WorkerFnvalkeyreview also
+ * matches WorkerFnvalkeyreviewupstream).
+ */
+export function functionIds(template: Template, prefix: string): string[] {
+  return Object.keys(template.findResources('AWS::Lambda::Function')).filter((id) => id.startsWith(prefix)).sort();
+}
+
+/** Logical id of the role of the Lambda function with logical id `functionId`. */
+export function roleOfFunction(template: Template, functionId: string): string {
+  return (template.findResources('AWS::Lambda::Function')[functionId] as any).Properties.Role['Fn::GetAtt'][0];
+}
+
 export function functionEnv(template: Template, prefix: string): Record<string, unknown> {
   const fn = Object.entries(template.findResources('AWS::Lambda::Function')).find(([id]) => id.startsWith(prefix));
   if (!fn) throw new Error(`no function ${prefix}`);
