@@ -3,7 +3,8 @@ import test from 'node:test';
 import './support/ts-resolve.mjs';
 
 const {
-  decayedScore, decayTable, loadDecayConfig, MAINTENANCE_RETRY_DAYS, parseDecayEvent, releaseTags, summaryLine,
+  decayedScore, decayTable, isReservedBucket, loadDecayConfig, MAINTENANCE_RETRY_DAYS, parseDecayEvent, releaseTags,
+  REPO_SKILL_KEY, RESERVED_BUCKET_PREFIX, summaryLine,
 } = await import('../src/decay.ts');
 
 const DAY = 24 * 3600;
@@ -792,6 +793,28 @@ test('the repo skill check takes a slot of checksPerDay', async (t) => {
   const stats = await decayTable(ddb, 'concerns', { ...FULL, checksPerDay: 1 }, NOW, ctx);
   assert.deepEqual(bodies(ctx.sqs).map((b) => b.reason), ['repo_check']);
   assert.equal(stats.deferred, 1);
+});
+
+test('items in reserved buckets are never scored, deleted or queued as records', async (t) => {
+  quietLogs(t);
+  assert.equal(RESERVED_BUCKET_PREFIX, '#');
+  assert.ok(REPO_SKILL_KEY.area_bucket.startsWith(RESERVED_BUCKET_PREFIX), 'the repo skill item is in a reserved bucket');
+  assert.ok(isReservedBucket('#maintenance') && isReservedBucket('#'));
+  assert.ok(!isReservedBucket('src') && !isReservedBucket('src/#x') && !isReservedBucket(undefined));
+
+  const { ctx } = maintenance();
+  const ddb = table([
+    // Below the floor, never graduated: a concern record like this is deleted.
+    { area_bucket: '#maintenance', record_id: 'other', decay_score: 1, updated_at: daysAgo(400) },
+    { area_bucket: '#future', record_id: 'state', decay_score: 1, updated_at: daysAgo(10) },
+    // Shaped like graduated records that are due for retirement and a check.
+    faded('gone', { area_bucket: '#maintenance' }),
+    live('unchecked', { area_bucket: '#x', verified_at: undefined }),
+  ]);
+  const stats = await decayTable(ddb, 'concerns', FULL, NOW, ctx);
+  assert.equal(ddb.writes.length, 0);
+  assert.equal(ctx.sqs.sent.length, 0);
+  assert.deepEqual(stats, { table: 'concerns', scanned: 5, decayed: 0, deleted: 0, skipped: 0, errors: 0, ...NOTHING_QUEUED });
 });
 
 test('no repo skill check without an upstream or with checks off, and the item is left alone', async (t) => {

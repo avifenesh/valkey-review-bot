@@ -39,7 +39,9 @@ import { isRepoName, latestReleaseTag, RELEASE_TAG_RE } from './releases.js';
  * Once per reviewer and GA release the pass also queues a "repo_check"
  * of the reviewer's skill.md in this repository. The item at
  * REPO_SKILL_KEY in the reviewer's concerns table holds that claim and
- * the release the file was last checked at.
+ * the release the file was last checked at. Its area_bucket starts with
+ * RESERVED_BUCKET_PREFIX: such items are not concern records, and the
+ * pass never scores, deletes or queues them as records.
  *
  * Writes are conditioned on the updated_at, decayed_at and decay_score
  * the scan saw, so a record reinforced, or re-scored by the curator,
@@ -220,9 +222,22 @@ export interface RetireMessage {
 }
 
 /**
+ * area_bucket values that start with this are reserved for items the
+ * skill lifecycle keeps in a concerns table, such as REPO_SKILL_KEY. They
+ * are not concern records: the decay pass never scores, deletes or
+ * queues them as records, and the curator's feedback tools refuse such
+ * buckets and never show their items to the model.
+ */
+export const RESERVED_BUCKET_PREFIX = '#';
+
+/** Whether an area_bucket is reserved (RESERVED_BUCKET_PREFIX). */
+export const isReservedBucket = (areaBucket: unknown): boolean =>
+  typeof areaBucket === 'string' && areaBucket.startsWith(RESERVED_BUCKET_PREFIX);
+
+/**
  * Key of the item that tracks the reviewer's repo skill.md check in its
- * concerns table. Concern records have random UUID ids, so it cannot
- * collide with one, and the decay pass never scores or deletes it.
+ * concerns table. Its bucket is reserved, so no concern record can share
+ * it, and the decay pass never scores or deletes it.
  */
 export const REPO_SKILL_KEY = { area_bucket: '#maintenance', record_id: 'repo-skill' } as const;
 
@@ -599,6 +614,8 @@ export async function decayTable(
         repoSkill = item;
         continue;
       }
+      // Any other item in a reserved bucket is not a concern record either.
+      if (isReservedBucket(areaBucket)) continue;
       const updatedAt = stringOrEmpty(item.updated_at);
       const decayedAt = stringOrEmpty(item.decayed_at);
       const updatedMs = Date.parse(updatedAt);
