@@ -22,6 +22,11 @@ import { heartbeatRunKey } from './review-envelope.js';
  * infra/lib/webhook-stack.ts sizes maxReceiveCount from the 90-minute
  * default and the 16-minute visibility timeout.
  *
+ * A review of new commits holds its pull request's pending marker until
+ * the worker removes it, just before the run starts. While the message
+ * still holds it, the review has never run: any receive is its first
+ * attempt, on the primary model, and its heartbeat is not read.
+ *
  * Curator messages, feedback or maintenance, have no heartbeat. Each
  * receive runs the curator; the curator queue dead-letters after three
  * receives, and a message seen more often than that (a queue without its
@@ -49,6 +54,8 @@ export interface WatchdogInput {
   readonly runBudgetMs: number;
   readonly staleMs: number;
   readonly readHeartbeat: (runKey: string) => Promise<HeartbeatRecord | undefined>;
+  /** True while the message still holds its pull request's pending marker. */
+  readonly holdsMarker?: boolean;
 }
 
 /**
@@ -83,6 +90,7 @@ export async function decide(input: WatchdogInput): Promise<Decision> {
   }
 
   if (receiveCount <= 1) return { action: 'invoke', useFallbackModel: false, reason: 'first attempt' };
+  if (input.holdsMarker) return { action: 'invoke', useFallbackModel: false, reason: 'first attempt, still holding the pending marker' };
 
   const record = await input.readHeartbeat(heartbeatRunKey(input.envelope));
   if (record?.status === 'completed') return { action: 'delete', reason: 'prior attempt completed' };

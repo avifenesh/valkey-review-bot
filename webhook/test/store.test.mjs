@@ -4,7 +4,7 @@ import './support/ts-resolve.mjs';
 import { fakeDdb } from './support/fakes.mjs';
 
 const {
-  autoReviewKey, budgetKey, clearPendingReview, createDeliveryStore, pendingReviewKey, releaseQuietly,
+  autoReviewKey, budgetKey, clearPendingReview, createDeliveryStore, holdsPendingReview, pendingReviewKey, releaseQuietly,
 } = await import('../src/store.ts');
 
 const TABLE = 'idempotency';
@@ -204,6 +204,28 @@ test('a pending review is seen until its marker is cleared or expires', async ()
   now = new Date('2026-10-13T08:00:00Z');
   await store.clearReviewPending('o/r', 7, marker);
   assert.equal(await store.reviewPending('o/r', 7), false);
+});
+
+test('a worker holds the pending marker while it is still its own, expired or not', async () => {
+  const ddb = fakeDdb();
+  let now = new Date('2026-10-13T08:00:00Z');
+  const store = createDeliveryStore(ddb, TABLE, () => now);
+  const marker = await store.markReviewPending('o/r', 7, 300);
+  assert.equal(await holdsPendingReview(ddb, TABLE, 'O/R', 7, marker), true);
+  assert.equal(await holdsPendingReview(ddb, TABLE, 'o/r', 7, 'some-other-marker'), false);
+  assert.equal(await holdsPendingReview(ddb, TABLE, 'o/r', 8, marker), false);
+  const get = ddb.calls.findLast((c) => c.op === 'GetCommand').input;
+  assert.deepEqual(get, { TableName: TABLE, Key: { key: 'pending#o/r#8' }, ConsistentRead: true });
+
+  now = new Date('2026-10-13T10:00:00Z');
+  assert.equal(await holdsPendingReview(ddb, TABLE, 'o/r', 7, marker), true, 'expired, but no later push replaced it');
+  const later = await store.markReviewPending('o/r', 7, 300);
+  assert.equal(await holdsPendingReview(ddb, TABLE, 'o/r', 7, marker), false, 'replaced');
+  await store.clearReviewPending('o/r', 7, later);
+  assert.equal(await holdsPendingReview(ddb, TABLE, 'o/r', 7, later), false, 'cleared');
+
+  const throttled = { send: async () => { throw Object.assign(new Error('slow down'), { name: 'ThrottlingException' }); } };
+  await assert.rejects(holdsPendingReview(throttled, TABLE, 'o/r', 7, marker), /slow down/);
 });
 
 test('releaseQuietly logs a failed release instead of throwing', async () => {

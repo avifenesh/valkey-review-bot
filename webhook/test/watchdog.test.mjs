@@ -40,6 +40,16 @@ test('the first receive of a review invokes the primary model without reading th
   assert.equal(reads.length, 0);
 });
 
+test('a review that still holds its pending marker has never run: any receive is a first attempt', async () => {
+  for (const receiveCount of [1, 2, 5]) {
+    const { value, reads } = input({ receiveCount, holdsMarker: true, envelope: { ...review, pending_marker: 'm-1' } });
+    const decision = await decide(value);
+    assert.equal(decision.action, 'invoke');
+    assert.equal(decision.useFallbackModel, false);
+    assert.equal(reads.length, 0, 'its heartbeat is not read');
+  }
+});
+
 test('a completed run is not repeated', async () => {
   const { value } = input(withHeartbeat({ status: 'completed', last_activity: NOW - 30 * MIN }));
   assert.equal((await decide(value)).action, 'delete');

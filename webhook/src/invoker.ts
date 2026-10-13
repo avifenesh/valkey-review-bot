@@ -3,7 +3,7 @@ import { DynamoDBClient } from '@aws-sdk/client-dynamodb';
 import { DynamoDBDocumentClient, GetCommand } from '@aws-sdk/lib-dynamodb';
 import { loadInvokerConfig } from './config.js';
 import { pendingMarkerOf, type PendingMarker } from './review-envelope.js';
-import { clearPendingReview } from './store.js';
+import { clearPendingReview, holdsPendingReview } from './store.js';
 import { decide, isCuratorMessage, messageTag, type HeartbeatRecord } from './watchdog.js';
 
 /**
@@ -11,8 +11,8 @@ import { decide, isCuratorMessage, messageTag, type HeartbeatRecord } from './wa
  * route's AgentCore runtime (a reviewer or the curator). The receiver
  * shaped each envelope for its runtime, so this code stays agnostic of
  * the payload. src/watchdog.ts decides whether a message runs at all.
- * Before it runs a review of new commits, it removes the pull request's
- * pending marker.
+ * Just before it runs a review of new commits, it removes the pull
+ * request's pending marker.
  */
 
 const config = loadInvokerConfig(process.env);
@@ -40,20 +40,27 @@ async function readHeartbeat(runKey: string): Promise<HeartbeatRecord | undefine
 /**
  * A review of new commits holds its pull request's pending marker until
  * its run starts (src/store.ts); from then on a push can queue the next
- * round. A failure is logged and the run goes ahead: the marker then
- * expires on its own.
+ * round. A message that still holds it has never run. Without
+ * IDEMPOTENCY_TABLE the worker cannot tell: it runs the message like any
+ * review and the marker expires on its own.
  */
-async function clearPendingMarker(marker: PendingMarker, tag: string): Promise<void> {
+async function holdsMarker(marker: PendingMarker | undefined, tag: string): Promise<boolean> {
+  if (!marker) return false;
   if (!config.idempotencyTable) {
     console.warn(`[pending] ${tag} IDEMPOTENCY_TABLE is not set; the pending marker stays until it expires`);
-    return;
+    return false;
   }
-  try {
-    const cleared = await clearPendingReview(ddb, config.idempotencyTable, marker.repo, marker.prNumber, marker.markerId);
-    console.log(`[pending] ${tag} marker=${marker.markerId} ${cleared ? 'cleared' : 'already gone'}`);
-  } catch (err) {
-    console.error(`[pending] ${tag} could not clear marker=${marker.markerId}; new commits are skipped until it expires`, err);
-  }
+  return holdsPendingReview(ddb, config.idempotencyTable, marker.repo, marker.prNumber, marker.markerId);
+}
+
+/**
+ * Removes the marker just before the run starts. A failed delete throws,
+ * so the message is retried instead of run: a marker left in place would
+ * make the next receive run the review a second time.
+ */
+async function clearMarkerForRun(marker: PendingMarker, tag: string): Promise<void> {
+  const cleared = await clearPendingReview(ddb, config.idempotencyTable, marker.repo, marker.prNumber, marker.markerId);
+  console.log(`[pending] ${tag} marker=${marker.markerId} ${cleared ? 'cleared' : 'already gone'}`);
 }
 
 async function handleOne(record: SqsRecord): Promise<void> {
@@ -68,6 +75,8 @@ async function handleOne(record: SqsRecord): Promise<void> {
     throw new Error(`HEARTBEAT_TABLE is not set; refusing to run ${tag}`);
   }
 
+  const marker = pendingMarkerOf(envelope);
+  const held = await holdsMarker(marker, tag);
   const decision = await decide({
     envelope,
     receiveCount,
@@ -76,6 +85,7 @@ async function handleOne(record: SqsRecord): Promise<void> {
     runBudgetMs: config.runBudgetMs,
     staleMs: config.staleMs,
     readHeartbeat,
+    holdsMarker: held,
   });
   if (decision.action === 'delete') {
     if (decision.error) console.error(`[abandoned] ${tag} attempt=${receiveCount}: ${decision.reason}`);
@@ -87,11 +97,10 @@ async function handleOne(record: SqsRecord): Promise<void> {
     throw new StillRunning();
   }
 
+  if (marker && held) await clearMarkerForRun(marker, tag);
+
   const payload = decision.useFallbackModel ? { ...envelope, use_fallback_model: true } : envelope;
   console.log(`[invoke] ${tag} attempt=${receiveCount}${decision.useFallbackModel ? ` fallback_model=true (${decision.reason})` : ''}`);
-
-  const marker = pendingMarkerOf(envelope);
-  if (marker) await clearPendingMarker(marker, tag);
 
   const resp = await client.send(new InvokeAgentRuntimeCommand({
     agentRuntimeArn: config.runtimeArn,

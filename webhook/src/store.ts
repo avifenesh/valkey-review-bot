@@ -116,6 +116,28 @@ export async function clearPendingReview(
   }
 }
 
+/**
+ * True while the pull request's pending marker is still `markerId`. The
+ * worker removes its marker just before it starts the review, so a
+ * message that finds its marker still there has never run. Expiry is not
+ * checked: a marker that is still this one was not replaced by a later
+ * push's.
+ */
+export async function holdsPendingReview(
+  ddb: DocumentClient,
+  tableName: string,
+  repo: string,
+  prNumber: number,
+  markerId: string,
+): Promise<boolean> {
+  const resp = await ddb.send(new GetCommand({
+    TableName: tableName,
+    Key: { key: pendingReviewKey(repo, prNumber) },
+    ConsistentRead: true,
+  }));
+  return (resp.Item as { marker?: unknown } | undefined)?.marker === markerId;
+}
+
 export function createDeliveryStore(ddb: DocumentClient, tableName: string, now: () => Date = () => new Date()): DeliveryStore {
   const epochSeconds = (): number => Math.floor(now().getTime() / 1000);
   return {
