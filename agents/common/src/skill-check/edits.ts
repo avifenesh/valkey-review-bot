@@ -95,11 +95,17 @@ export interface EditOutcome {
   readonly skillMd: string | null;
 }
 
-export const MAX_EDITS = 10;
-/** Cap on how much the live text may grow over all edits of one check. */
-export const MAX_EDIT_GROWTH_CHARS = 2_000;
-export const MAX_PIECE_LINES = 20;
-export const MAX_PIECE_CHARS = 2_000;
+export const MAX_EDITS = 6;
+/**
+ * Cap on how much one check's edits may grow the skill, measured on the
+ * rendered markdown: markers, citations, kept originals and replacements.
+ * Reviewers share one 80,000-character window across their skills.
+ */
+export const MAX_GROWTH_CHARS = 4_000;
+/** Lines of a piece; the replacement has as many. */
+export const MAX_PIECE_LINES = 5;
+/** Characters of the original and of the replacement. */
+export const MAX_PIECE_CHARS = 800;
 export const MAX_CITATIONS_PER_EDIT = 5;
 const MAX_REASON_CHARS = 300;
 const DEFAULT_MAX_CHARS = 40_000;
@@ -670,7 +676,6 @@ function plan(skillMd: string, edits: readonly SuppressEdit[], ctx: EditContext)
   for (const p of doc.problems) whole(`the skill's suppression markers are malformed (${p}), so it cannot be edited automatically`);
   if (doc.problems.length > 0) return { doc, problems, planned, checkable };
 
-  let growth = 0;
   edits.forEach((edit, index) => {
     const before = problems.length;
     const fail = (message: string) => problems.push({ edit: index, message });
@@ -683,6 +688,7 @@ function plan(skillMd: string, edits: readonly SuppressEdit[], ctx: EditContext)
     if (original.trim() === '') fail('the original is empty');
     else if (want.length > MAX_PIECE_LINES) fail(`the original has ${want.length} lines; at most ${MAX_PIECE_LINES}`);
     else if (original.length > MAX_PIECE_CHARS) fail(`the original has ${original.length} characters; at most ${MAX_PIECE_CHARS}`);
+    else if (replacement.length > MAX_PIECE_CHARS) fail(`the replacement has ${replacement.length} characters; at most ${MAX_PIECE_CHARS}`);
     else {
       const at = locate(doc, want);
       if (typeof at === 'string') fail(at);
@@ -722,13 +728,15 @@ function plan(skillMd: string, edits: readonly SuppressEdit[], ctx: EditContext)
       if (bad) fail(`the generated reason is malformed: ${bad}`);
     }
     if (problems.length > before || !('changes' in diff)) return;
-    growth += replacement.length - original.length;
     planned.push({ index, start, count: want.length, replacementLines, changes: diff.changes, reason, evidence });
   });
-  if (growth > MAX_EDIT_GROWTH_CHARS) whole(`the edits grow the skill by ${growth} characters; at most ${MAX_EDIT_GROWTH_CHARS}`);
-
+  // Rendered growth of the edits that passed so far, so the cap is reported with their other problems.
+  const out = render(doc, planned, ctx);
+  const growth = out.length - skillMd.length;
+  if (growth > MAX_GROWTH_CHARS) {
+    whole(`the edits grow the skill by ${growth} characters, markers, citations and kept originals included; at most ${MAX_GROWTH_CHARS}`);
+  }
   if (problems.length === 0) {
-    const out = render(doc, planned, ctx);
     const maxChars = ctx.maxChars ?? DEFAULT_MAX_CHARS;
     if (out.length > maxChars) whole(`the edited skill would be ${out.length} characters; at most ${maxChars}`);
     const back = parseDoc(out);

@@ -288,19 +288,39 @@ test('overlapping edits are refused', async () => {
   assert.deepEqual((await validateEdits(SKILL, both, ctx(), resolver())).problems, ['edit 2: it overlaps edit 1']);
 });
 
-test('growth over the cap is refused', async () => {
-  // Ten lines, each with long names swapped in for short ones.
-  const lines = Array.from({ length: 10 }, (_, i) => `- \`emptyDB\` ${'`a_bc` '.repeat(10).trim()} line_${i}`);
-  const skillMd = `---\nname: g\ndescription: "x"\n---\n${lines.join('\n')}\n`;
-  const long = `a_${'b'.repeat(110)}`;
-  const table = { 'src/long.c:1': `${long} ${long}` };
-  const edits = lines.map((l) => ({ original: l, replacement: l.replaceAll('`a_bc`', `\`${long}\``), evidence: [cite('src/long.c', 1)] }));
-  const growth = edits.reduce((n, e) => n + e.replacement.length - e.original.length, 0);
-  assert.ok(growth > 2000);
+test('rendered growth over the cap is refused, even when the live text keeps its length', async () => {
+  // Six five-line pieces of about 700 characters; each edit swaps names of equal length.
+  const piece = (p) => Array.from({ length: 5 }, (_, l) => `- \`emptyDB\` and \`name_p${p}_l${l}\` ${'filler words here '.repeat(6).trim()}.`);
+  const pieces = Array.from({ length: 6 }, (_, p) => piece(p));
+  const skillMd = `---\nname: g\ndescription: "x"\n---\n${pieces.map((ls) => ls.join('\n')).join('\n\n')}\n`;
+  const table = { 'src/db.c:1': 'void emptyDa(void);' };
+  const edits = pieces.map((ls) => ({ original: ls.join('\n'), replacement: ls.join('\n').replaceAll('`emptyDB`', '`emptyDa`'), evidence: [cite('src/db.c', 1)] }));
+  assert.ok(edits.every((e) => e.original.length <= 800 && e.replacement.length === e.original.length));
   const problems = (await validateEdits(skillMd, edits, ctx(), resolver(table))).problems;
-  assert.deepEqual(problems, [`the edits grow the skill by ${growth} characters; at most 2000`]);
-  // The same edits within the cap pass.
-  assert.deepEqual((await validateEdits(skillMd, edits.slice(0, 1), ctx(), resolver(table))).problems, []);
+  assert.equal(problems.length, 1, JSON.stringify(problems));
+  const growth = Number(/^the edits grow the skill by (\d+) characters, markers, citations and kept originals included; at most 4000$/.exec(problems[0])?.[1]);
+  assert.ok(growth > 4000, problems[0]);
+  // Four of them fit.
+  const four = await validateEdits(skillMd, edits.slice(0, 4), ctx(), resolver(table));
+  assert.deepEqual(four.problems, []);
+  assert.ok(four.skillMd.length - skillMd.length <= 4000);
+});
+
+test('pieces of more than 5 lines or 800 characters, and more than 6 edits, are refused', async () => {
+  const lines = Array.from({ length: 7 }, (_, i) => `- \`emptyDB\` line_${i}`);
+  const skillMd = `---\nname: g\ndescription: "x"\n---\n${lines.join('\n')}\n- \`emptyDB\` ${'w '.repeat(400).trim()}\n`;
+  const swap = (original) => ({ original, replacement: original.replaceAll('`emptyDB`', '`emptyData`'), evidence: [cite('src/db.c', 120)] });
+  assert.deepEqual(await problemsFor(swap(lines.slice(0, 6).join('\n')), {}, UPSTREAM, skillMd), ['edit 1: the original has 6 lines; at most 5']);
+  assert.deepEqual(await problemsFor(swap(lines.slice(0, 5).join('\n')), {}, UPSTREAM, skillMd), []);
+  const long = skillMd.split('\n').at(-2);
+  assert.equal(long.length, 811);
+  assert.deepEqual(await problemsFor(swap(long), {}, UPSTREAM, skillMd), ['edit 1: the original has 811 characters; at most 800']);
+  const short = `- \`emptyDB\` \`a_bc\` ${'w '.repeat(380).trim()}`;
+  const grown = { original: short, replacement: short.replace('`a_bc`', `\`a_${'b'.repeat(100)}\``), evidence: [cite('src/db.c', 120)] };
+  assert.deepEqual(checkEdits(`${skillMd}${short}\n`, [grown], ctx()), [`edit 1: the replacement has ${short.length + 98} characters; at most 800`]);
+  const seven = lines.map(swap);
+  assert.deepEqual((await validateEdits(skillMd, seven, ctx(), resolver())).problems, ['at most 6 edits per check, got 7']);
+  assert.deepEqual((await validateEdits(skillMd, seven.slice(0, 6), ctx(), resolver())).problems, []);
 });
 
 test('a result over maxChars is refused', async () => {
