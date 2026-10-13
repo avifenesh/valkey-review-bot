@@ -453,7 +453,7 @@ test('a pull request title or body changed since is brought back to the proposal
   assert.deepEqual({ title: gh.pulls[0].title, body: gh.pulls[0].body }, text);
 });
 
-test('content of a pull request maintainers closed without merging is not proposed again', async () => {
+test('nothing more is proposed from a branch whose pull request maintainers closed without merging', async () => {
   const gh = fakeGitHub();
   const p = proposal({ baseSha: gh.tip() });
   await proposeRepoSkillChange(p, deps(gh));
@@ -462,7 +462,7 @@ test('content of a pull request maintainers closed without merging is not propos
     action: 'rejected',
     branch: BRANCH,
     url: `https://github.com/${REPO}/pull/1`,
-    reason: 'maintainers closed #1 without merging, and it held this content',
+    reason: 'maintainers closed #1 without merging',
   };
   const before = gh.writes().length;
   assert.deepEqual(await proposeRepoSkillChange(p, deps(gh)), rejected);
@@ -473,25 +473,19 @@ test('content of a pull request maintainers closed without merging is not propos
   assert.equal(gh.pulls.length, 1);
 });
 
-test('other content after a closed pull request opens a new one that names it', async () => {
+test('other content after a closed pull request is not proposed either, as runs never match byte for byte', async () => {
   const gh = fakeGitHub();
   const tip = gh.tip();
   await proposeRepoSkillChange(proposal({ baseSha: tip }), deps(gh));
   gh.closePull(1);
   const more = edited(NEW, '`rdbLoad*` caller', '`rdbLoadAll*` caller', { ...CTX, flagged: ['rdbLoad*'] });
   const p = proposal({ baseSha: tip, newContent: more, summary: '`emptyDB` is now `emptyData`; `rdbLoad*` is now `rdbLoadAll*`.' });
-  assert.deepEqual(await proposeRepoSkillChange(p, deps(gh)), { action: 'opened', branch: BRANCH, url: `https://github.com/${REPO}/pull/2` });
-  assert.equal(gh.filesAt(gh.tip(BRANCH))[PATH], more);
-  assert.match(gh.pulls[1].body, /\nMaintainers closed #1 from this branch without merging\. The content proposed here differs from what it held;/);
-  // The note is part of the text, so a retry finds nothing to change.
   const before = gh.writes().length;
-  assert.equal((await proposeRepoSkillChange(p, deps(gh))).action, 'unchanged');
+  assert.deepEqual(await proposeRepoSkillChange(p, deps(gh)), {
+    action: 'rejected', branch: BRANCH, url: `https://github.com/${REPO}/pull/1`, reason: 'maintainers closed #1 without merging',
+  });
   assert.equal(gh.writes().length, before);
-  // The closed content stays rejected while the new pull request is open.
-  const head = gh.tip(BRANCH);
-  assert.equal((await proposeRepoSkillChange(proposal({ baseSha: tip }), deps(gh))).action, 'rejected');
-  assert.equal(gh.tip(BRANCH), head);
-  assert.equal(gh.writes().length, before);
+  assert.equal(gh.pulls.length, 1);
 });
 
 test('a merged pull request is not a rejection', async () => {

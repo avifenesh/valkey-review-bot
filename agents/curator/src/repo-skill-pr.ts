@@ -42,9 +42,9 @@ import {
  *   is finished by its retry. The text is built from the proposal alone
  *   (dated by its markers), so a retry finds nothing to change;
  * - respects maintainers who closed a pull request from the branch
- *   without merging: content one of those held is never proposed again
- *   (rejected), and a new pull request for other content says which
- *   were closed;
+ *   without merging: nothing more is proposed from that branch
+ *   (rejected). The branch is per reviewer and release, so the next
+ *   release proposes again on a new branch;
  * - never writes the base branch: the only ref it writes is the
  *   skill-check branch.
  * A retry after any partial run converges on the same branch and pull
@@ -91,8 +91,7 @@ export interface RepoSkillPrDeps {
  * - base-moved: the skill changed on the base branch since baseSha; nothing was written.
  * - refused: this module will not write the proposal (reason); nothing was written.
  * - rejected: maintainers closed a pull request from this branch without
- *   merging, and its head held this same content; nothing was written, and
- *   url is that pull request.
+ *   merging; nothing was written, and url is that pull request.
  */
 export type RepoSkillPrResult = {
   action: 'opened' | 'updated' | 'unchanged' | 'base-moved' | 'refused' | 'rejected';
@@ -199,14 +198,7 @@ function evidenceItem(entry: string): string {
   return `- [${codeSpan(shown)}](${url})`;
 }
 
-/** `closed`: pull requests from the branch that maintainers closed without merging, all with other content. */
-function prBody(p: RepoSkillProposal, date: string, closed: readonly number[]): string {
-  const earlier = closed.length === 0 ? [] : [
-    `Maintainers closed ${pullList(closed)} from this branch without merging. `
-      + `The content proposed here differs from what ${closed.length === 1 ? 'it' : 'each of them'} held; `
-      + 'the same content is never proposed again.',
-    '',
-  ];
+function prBody(p: RepoSkillProposal, date: string): string {
   return [
     `The release check found facts in \`${p.path}\` that ${p.releaseLabel} superseded. `
       + 'It does not rewrite them: each stale piece stays, byte for byte, between suppression markers '
@@ -215,7 +207,6 @@ function prBody(p: RepoSkillProposal, date: string, closed: readonly number[]): 
     '',
     'Check the evidence before merging. Close this pull request to reject the change.',
     '',
-    ...earlier,
     '### Changes',
     '',
     p.summary.trim(),
@@ -530,22 +521,9 @@ function pull(pr: PullJson): Pull {
   return typeof pr.html_url === 'string' && pr.html_url ? { number, url: pr.html_url, ...rest } : { number, ...rest };
 }
 
-/** "#1", "#1 and #3", "#1, #3 and #5". */
-function pullList(numbers: readonly number[]): string {
-  const refs = numbers.map((n) => `#${n}`);
-  return refs.length <= 1 ? refs.join('') : `${refs.slice(0, -1).join(', ')} and ${refs.at(-1)}`;
-}
-
-/**
- * Pull requests from the branch that maintainers closed without merging,
- * oldest first, each with the blob id its head held at `path` (null when
- * that commit or file is gone).
- */
-async function closedUnmerged(gh: SkillsRepo, branch: string, path: string): Promise<(Pull & { blob: string | null })[]> {
-  const closed = (await gh.pulls(branch, 'closed')).filter((pr) => !pr.merged).sort((a, b) => a.number - b.number);
-  const out: (Pull & { blob: string | null })[] = [];
-  for (const pr of closed) out.push({ ...pr, blob: pr.headSha ? await gh.fileBlob(path, pr.headSha) : null });
-  return out;
+/** Pull requests from the branch that maintainers closed without merging, oldest first. */
+async function closedUnmerged(gh: SkillsRepo, branch: string): Promise<Pull[]> {
+  return (await gh.pulls(branch, 'closed')).filter((pr) => !pr.merged).sort((a, b) => a.number - b.number);
 }
 
 /** Whether the pull request shows this title and body; GitHub may store a body edited on the web with CRLF. */
@@ -644,15 +622,16 @@ export async function proposeRepoSkillChange(p: RepoSkillProposal, deps: RepoSki
     };
   }
 
-  // Closing a pull request without merging rejects its content: the same
-  // content is not proposed again from this branch, open pull request or not.
-  const closed = await closedUnmerged(gh, branch, p.path);
-  const declined = [...closed].reverse().find((pr) => pr.blob === gitBlobSha(p.newContent));
+  // Closing a pull request without merging rejects this release's change.
+  // Comparing content would not do: each run dates its markers and cites
+  // the current upstream tip, so the next proposal never matches byte for
+  // byte. The next release proposes again, on its own branch.
+  const declined = (await closedUnmerged(gh, branch)).at(-1);
   if (declined) {
     return withUrl({
       action: 'rejected',
       branch,
-      reason: `maintainers closed #${declined.number} without merging, and it held this content`,
+      reason: `maintainers closed #${declined.number} without merging`,
     }, declined);
   }
 
@@ -661,7 +640,7 @@ export async function proposeRepoSkillChange(p: RepoSkillProposal, deps: RepoSki
   if ('refused' in pointed) return { action: 'refused', branch, reason: pointed.refused };
   const rebuilt = pointed.moved;
 
-  const body = prBody(p, checked.date, closed.map((pr) => pr.number));
+  const body = prBody(p, checked.date);
   let open = await gh.openPull(branch);
   if (!open) {
     const created = await gh.createPull(branch, title, body);
