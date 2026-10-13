@@ -651,7 +651,7 @@ settings:
 | Variable | From | Meaning |
 | --- | --- | --- |
 | `UPSTREAM_REPOS_JSON` | `upstreamRepos` | As for the decay Lambda. |
-| `CHECK_PROMPT_S3_KEY` | the stack | `curator/skill-check.md`, which the stack uploads. A missing object stops the runtime at boot; an unset key makes every flagged skill end inconclusive. |
+| `CHECK_PROMPT_S3_KEY` | the stack | `curator/skill-check.md`, which the stack uploads. A missing object stops the runtime at boot; an unset key makes every flagged skill end inconclusive. The stack does not order the runtime update after the upload, so on the first deploy a message can reach the new runtime before the object exists; that receive fails and SQS delivers the message again after the 16-minute visibility timeout. |
 | `CHECK_MAX_ROUNDS`, `CHECK_APPLY_EDITS`, `RETIRE_SKILLS`, `CHECK_OPEN_PULL_REQUESTS` | `skillLifecycle` | Unset: 25 and `false`. |
 | `SKILLS_REPO`, `SKILLS_REPO_BASE_BRANCH`, `SKILLS_REPO_SIGN_OFF`, `SKILLS_REPO_TOKEN_FUNCTION` | `skillsRepo` and the broker | Set only with `skillsRepo` (`SKILLS_REPO_SIGN_OFF` only with `signOff`). With `CHECK_OPEN_PULL_REQUESTS=true` and `SKILLS_REPO` set, a missing token function stops the runtime at boot. |
 | `SKILL_CHECK_DIR` | not set | Where checkouts are made; default `/tmp/skill-check`. |
