@@ -94,8 +94,13 @@ import type { SkillPublisher } from './tools/submit-skill.js';
  * on: no tombstone, no outcome, verification, names or standing. It
  * records only the audit's result for the operator (pending_revision,
  * reason "dry run", never in place of a real check's), and releases
- * the claim, so the next real pass checks again. Its decision is
- * would-<outcome>: what a real run would record.
+ * the claim, so the next real pass checks again. Its decision says
+ * what a real run would do: would-<outcome> after an audit,
+ * would-retire, or would-record-retirement.
+ *
+ * Partial checks. A result whose diff was examined only in part never
+ * confirms by itself; partial_checks counts such checks, once per
+ * message, so that check.ts can let one past (see confirm below).
  */
 
 const RECORD_NAME_RE = /^[a-z0-9][a-z0-9-]{0,99}$/;
