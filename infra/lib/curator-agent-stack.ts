@@ -6,6 +6,7 @@ import * as ecr_assets from 'aws-cdk-lib/aws-ecr-assets';
 import * as s3deploy from 'aws-cdk-lib/aws-s3-deployment';
 import * as s3 from 'aws-cdk-lib/aws-s3';
 import * as dynamodb from 'aws-cdk-lib/aws-dynamodb';
+import * as lambda from 'aws-cdk-lib/aws-lambda';
 import * as agentcore from 'aws-cdk-lib/aws-bedrockagentcore';
 import { modelAccessStatements } from './bedrock-arns';
 import {
@@ -13,6 +14,7 @@ import {
   type ModelsConfig,
   type ReviewerId,
   type SkillLifecycleConfig,
+  type SkillsRepoConfig,
   upstreamReposJson,
 } from './deployment-config';
 import { createRuntimeRole, grantTableKeyUse, registryResources } from './grants';
@@ -39,14 +41,23 @@ export interface CuratorAgentStackProps extends cdk.StackProps {
   /** Per reviewer, the public upstream "owner/name" whose default branch the release check reads; empty for none. */
   readonly upstreamRepos: Readonly<Record<ReviewerId, string>>;
   readonly skillLifecycle: SkillLifecycleConfig;
+  /**
+   * The bot's own repository and the broker that issues tokens for it.
+   * Absent: repo skill findings are only reported.
+   */
+  readonly skillsRepo?: {
+    readonly config: Pick<SkillsRepoConfig, 'repo' | 'baseBranch' | 'signOff'>;
+    readonly tokenBroker: lambda.IFunction;
+  };
 }
 
 /**
  * Curator runtime. It records maintainer feedback in the reviewers'
  * concerns tables and graduates reinforced concerns into the reviewers'
  * skills registries. It also runs the skill maintenance messages the
- * decay job queues: release checks against the public upstreams, and
- * edits and retirements of registry skills.
+ * decay job queues: release checks against the public upstreams, edits
+ * and retirements of registry skills, and pull requests that propose
+ * edits to the repo skill files.
  */
 export class CuratorAgentStack extends cdk.Stack {
   readonly runtime: agentcore.CfnRuntime;
@@ -119,8 +130,12 @@ export class CuratorAgentStack extends cdk.Stack {
       actions: ['agent-registry:GetRegistryRecord', 'agent-registry:ListRegistryRecords'],
       resources: registryResources(this, props.curatorSkillsRegistry),
     }));
+    // Tokens for pull requests against the bot's own repository. The
+    // curator holds no GitHub credentials of its own.
+    props.skillsRepo?.tokenBroker.grantInvoke(this.role);
 
     const lifecycle = props.skillLifecycle;
+    const skillsRepo = props.skillsRepo;
 
     this.runtime = new agentcore.CfnRuntime(this, 'CuratorRuntime', {
       agentRuntimeName: CURATOR_RUNTIME_NAME,
@@ -155,6 +170,12 @@ export class CuratorAgentStack extends cdk.Stack {
         CHECK_APPLY_EDITS: String(lifecycle.applyEdits),
         RETIRE_SKILLS: String(lifecycle.retireSkills),
         CHECK_OPEN_PULL_REQUESTS: String(lifecycle.openPullRequests),
+        ...(skillsRepo ? {
+          SKILLS_REPO: skillsRepo.config.repo,
+          SKILLS_REPO_BASE_BRANCH: skillsRepo.config.baseBranch,
+          ...(skillsRepo.config.signOff ? { SKILLS_REPO_SIGN_OFF: skillsRepo.config.signOff } : {}),
+          SKILLS_REPO_TOKEN_FUNCTION: skillsRepo.tokenBroker.functionName,
+        } : {}),
       },
     });
     // The service checks image access when it creates the runtime, so the

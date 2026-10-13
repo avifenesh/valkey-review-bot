@@ -45,6 +45,7 @@ export function addValkeyReviewerStacks(
     description: 'valkey-reviewer shared resources: assets bucket, KMS key, GitHub token broker and run heartbeat table.',
     github: config.github,
     allowedRepos: Object.fromEntries(REVIEWER_IDS.map((r) => [r, tokenBrokerRepos(config, r)])) as Record<ReviewerId, string[]>,
+    ...(config.skillsRepo ? { skillsRepo: config.skillsRepo } : {}),
   });
 
   const reviewers = new Map<ReviewerId, ValkeyReviewAgentStack>();
@@ -90,6 +91,9 @@ export function addValkeyReviewerStacks(
     models: config.models,
     upstreamRepos: config.upstreamRepos,
     skillLifecycle: config.skillLifecycle,
+    ...(config.skillsRepo && substrate.skillsRepoTokenBroker
+      ? { skillsRepo: { config: config.skillsRepo, tokenBroker: substrate.skillsRepoTokenBroker } }
+      : {}),
   });
 
   const webhook = new WebhookStack(app, 'ValkeyReviewWebhook', {

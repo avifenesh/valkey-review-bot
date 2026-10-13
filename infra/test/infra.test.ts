@@ -271,6 +271,108 @@ describe('curator role', () => {
   });
 });
 
+describe('skills repository', () => {
+  // Defaults: the main App's secret, base branch main, no sign-off.
+  let plain: Synthesized;
+  // Everything set, with a separate App and pull requests on.
+  let custom: Synthesized;
+  beforeAll(() => {
+    plain = synth({ ...fixture(), skillsRepo: { repo: 'example-org/valkey-review-bot' } });
+    custom = synth({
+      ...fixture(),
+      skillsRepo: {
+        repo: 'example-org/valkey-review-bot',
+        baseBranch: 'trunk',
+        appSecretName: 'example/skills-app',
+        signOff: 'Bot Owner <owner@example.com>',
+      },
+      skillLifecycle: { openPullRequests: true },
+    });
+  });
+
+  const brokerOf = (x: Synthesized) => {
+    const t = x.template(x.stacks.substrate);
+    const ids = functionIds(t, 'SkillsRepoTokenBrokerFn');
+    return { t, ids, statements: () => statementsForRole(t, roleOfFunction(t, ids[0]!)) };
+  };
+  const mentionsBroker = (st: Statement) => JSON.stringify(st.Resource).includes('SkillsRepoTokenBrokerFn');
+
+  test('its token broker exists only when skillsRepo is configured', () => {
+    expect(brokerOf(s).ids).toEqual([]);
+    expect(s.stacks.substrate.skillsRepoTokenBroker).toBeUndefined();
+    expect(s.template(s.stacks.substrate).toJSON().Outputs).not.toHaveProperty('SkillsRepoTokenBrokerFunctionName');
+
+    const { t, ids } = brokerOf(plain);
+    expect(ids).toHaveLength(1);
+    const fn = (t.findResources('AWS::Lambda::Function')[ids[0]!] as any).Properties;
+    expect(fn).toMatchObject({ Runtime: 'nodejs24.x', Architectures: ['arm64'], Timeout: 15, MemorySize: 256 });
+    expect(fn.Environment.Variables).toEqual({ SKILLS_REPO: 'example-org/valkey-review-bot', SKILLS_REPO_APP_SECRET_NAME: 'example/github-app' });
+    expect(t.toJSON().Outputs.SkillsRepoTokenBrokerFunctionName.Value).toEqual({ Ref: ids[0] });
+    expect(functionEnv(custom.template(custom.stacks.substrate), 'SkillsRepoTokenBrokerFn'))
+      .toEqual({ SKILLS_REPO: 'example-org/valkey-review-bot', SKILLS_REPO_APP_SECRET_NAME: 'example/skills-app' });
+  });
+
+  test('the broker may read its App secret and nothing else', () => {
+    const secretArn = (name: string) => `arn:aws:secretsmanager:us-west-2:${ACCOUNT}:secret:${name}-??????`;
+    expect(brokerOf(plain).statements()).toEqual([{
+      Sid: 'ReadSkillsRepoAppSecret', Effect: 'Allow', Action: 'secretsmanager:GetSecretValue', Resource: secretArn('example/github-app'),
+    }]);
+    expect(brokerOf(custom).statements()).toEqual([{
+      Sid: 'ReadSkillsRepoAppSecret', Effect: 'Allow', Action: 'secretsmanager:GetSecretValue', Resource: secretArn('example/skills-app'),
+    }]);
+    // Agent roles and the decay job still hold no secrets.
+    for (const stack of [...custom.stacks.reviewers.values(), custom.stacks.curator, custom.stacks.decay]) {
+      expect(JSON.stringify(custom.template(stack).toJSON())).not.toContain('secretsmanager:');
+    }
+  });
+
+  test('only the curator role may invoke the broker', () => {
+    for (const x of [plain, custom]) {
+      const holders = allStatements(x).filter(({ statement }) => mentionsBroker(statement));
+      const curatorRole = runtimeRoleId(x.template(x.stacks.curator));
+      expect(holders.map(({ stack, roles }) => ({ stack, roles }))).toEqual([{ stack: x.stacks.curator.stackName, roles: [curatorRole] }]);
+      expect(holders.flatMap(({ statement }) => actionsOf(statement))).toEqual(['lambda:InvokeFunction']);
+      // The function itself and its versions, nothing else.
+      const resources = resourceStrings(holders.map(({ statement }) => statement));
+      expect(resources).toHaveLength(2);
+      for (const r of resources) expect(r).toContain('SkillsRepoTokenBrokerFn');
+      // No resource policy lets another principal in.
+      for (const stack of x.allStacks) {
+        const permissions = Object.values<any>(x.template(stack).findResources('AWS::Lambda::Permission'));
+        expect(permissions.filter((p) => JSON.stringify(p).includes('SkillsRepoTokenBroker'))).toEqual([]);
+      }
+      // The reviewer runtimes keep invoke on their own brokers only, and
+      // their brokers do not cover the bot repository.
+      for (const id of ['valkey-review', 'valkey-glide-review'] as const) {
+        const t = x.template(x.stacks.reviewers.get(id)!);
+        expect(JSON.stringify(statementsForRole(t, runtimeRoleId(t)))).not.toContain('SkillsRepoTokenBroker');
+      }
+      const substrate = x.template(x.stacks.substrate);
+      for (const fn of ['TokenBrokerValkeyReviewFn', 'TokenBrokerValkeyGlideReviewFn']) {
+        expect(functionEnv(substrate, fn).ALLOWED_REPOS_JSON).not.toContain('valkey-review-bot');
+      }
+    }
+  });
+
+  test('the curator gets the repository settings and the broker name', () => {
+    const plainEnv = runtimeEnv(plain.template(plain.stacks.curator));
+    expect(plainEnv).toMatchObject({
+      SKILLS_REPO: 'example-org/valkey-review-bot',
+      SKILLS_REPO_BASE_BRANCH: 'main',
+      CHECK_OPEN_PULL_REQUESTS: 'false',
+    });
+    expect(plainEnv).not.toHaveProperty('SKILLS_REPO_SIGN_OFF');
+    expect(JSON.stringify(plainEnv.SKILLS_REPO_TOKEN_FUNCTION)).toMatch(/ExportsOutputRefSkillsRepoTokenBrokerFn/);
+
+    expect(runtimeEnv(custom.template(custom.stacks.curator))).toMatchObject({
+      SKILLS_REPO: 'example-org/valkey-review-bot',
+      SKILLS_REPO_BASE_BRANCH: 'trunk',
+      SKILLS_REPO_SIGN_OFF: 'Bot Owner <owner@example.com>',
+      CHECK_OPEN_PULL_REQUESTS: 'true',
+    });
+  });
+});
+
 describe('token broker', () => {
   test("each broker's allowed repositories equal its reviewer's review routes", () => {
     const t = s.template(s.stacks.substrate);

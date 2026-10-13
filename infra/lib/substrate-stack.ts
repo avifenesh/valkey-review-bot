@@ -1,5 +1,6 @@
 import * as cdk from 'aws-cdk-lib';
 import { Construct } from 'constructs';
+import * as iam from 'aws-cdk-lib/aws-iam';
 import * as s3 from 'aws-cdk-lib/aws-s3';
 import * as kms from 'aws-cdk-lib/aws-kms';
 import * as secretsmanager from 'aws-cdk-lib/aws-secretsmanager';
@@ -8,19 +9,22 @@ import * as lambda from 'aws-cdk-lib/aws-lambda';
 import * as nodelambda from 'aws-cdk-lib/aws-lambda-nodejs';
 import * as logs from 'aws-cdk-lib/aws-logs';
 import * as path from 'node:path';
-import type { GitHubConfig, ReviewerId } from './deployment-config';
+import type { GitHubConfig, ReviewerId, SkillsRepoConfig } from './deployment-config';
 
 export interface SubstrateStackProps extends cdk.StackProps {
   readonly github: Pick<GitHubConfig, 'appId' | 'appSecretName'>;
   /** Per reviewer, the repositories ("owner/name") its token broker may issue tokens for. */
   readonly allowedRepos: Readonly<Record<ReviewerId, readonly string[]>>;
+  /** The bot's own repository. When set, a token broker for it is created for the curator. */
+  readonly skillsRepo?: Pick<SkillsRepoConfig, 'repo' | 'appSecretName'>;
 }
 
 /**
  * Resources shared by every agent in one account and region: the KMS key,
  * the prompt and skill bucket, the GitHub App secret, one token broker per
- * reviewer and the run heartbeat table. Each agent stack creates its own execution role
- * and grants it only what that agent uses.
+ * reviewer, the skills-repo token broker when configured, and the run
+ * heartbeat table. Each agent stack creates its own execution role and
+ * grants it only what that agent uses.
  */
 export class SubstrateStack extends cdk.Stack {
   readonly key: kms.Key;
@@ -28,6 +32,8 @@ export class SubstrateStack extends cdk.Stack {
   readonly githubAppSecret: secretsmanager.ISecret;
   readonly heartbeatTable: dynamodb.Table;
   readonly tokenBrokers: ReadonlyMap<ReviewerId, lambda.IFunction>;
+  /** Issues tokens for the bot's own repository; set only when skillsRepo is configured. */
+  readonly skillsRepoTokenBroker?: lambda.IFunction;
 
   constructor(scope: Construct, id: string, props: SubstrateStackProps) {
     super(scope, id, props);
@@ -92,6 +98,48 @@ export class SubstrateStack extends cdk.Stack {
       new cdk.CfnOutput(this, `TokenBroker${name}FunctionName`, { value: broker.functionName });
     }
     this.tokenBrokers = brokers;
+
+    // The curator's maintenance mode proposes edits to the reviewers' repo
+    // skill files as pull requests against the bot's own repository. This
+    // broker (webhook/src/skills-repo-broker.ts) issues it tokens limited
+    // to that one repository, with contents and pull request write. The
+    // repository comes from its environment, never from the payload. Only
+    // the curator role may invoke it (curator-agent-stack.ts); no reviewer
+    // runtime or reviewer broker can reach it.
+    if (props.skillsRepo) {
+      const secretName = props.skillsRepo.appSecretName;
+      const broker = new nodelambda.NodejsFunction(this, 'SkillsRepoTokenBrokerFn', {
+        entry: path.join(webhookRoot, 'src', 'skills-repo-broker.ts'),
+        depsLockFilePath: path.join(webhookRoot, 'package-lock.json'),
+        runtime: lambda.Runtime.NODEJS_24_X,
+        architecture: lambda.Architecture.ARM_64,
+        timeout: cdk.Duration.seconds(15),
+        memorySize: 256,
+        description: 'Issues contents/pull-request tokens for the bot repository to the curator.',
+        environment: {
+          SKILLS_REPO: props.skillsRepo.repo,
+          // Passed as the SecretId.
+          SKILLS_REPO_APP_SECRET_NAME: secretName,
+        },
+        logGroup: new logs.LogGroup(this, 'SkillsRepoTokenBrokerLogs', { retention: logs.RetentionDays.ONE_MONTH }),
+        bundling: { externalModules: ['@aws-sdk/*'], target: 'node24', minify: false, sourceMap: true },
+      });
+      // The broker only calls GetSecretValue, on this one secret (the main
+      // App's when skillsRepo.appSecretName is not set). The six-character
+      // wildcard matches the suffix Secrets Manager adds to the name.
+      broker.addToRolePolicy(new iam.PolicyStatement({
+        sid: 'ReadSkillsRepoAppSecret',
+        actions: ['secretsmanager:GetSecretValue'],
+        resources: [this.formatArn({
+          service: 'secretsmanager',
+          resource: 'secret',
+          resourceName: `${secretName}-??????`,
+          arnFormat: cdk.ArnFormat.COLON_RESOURCE_NAME,
+        })],
+      }));
+      this.skillsRepoTokenBroker = broker;
+      new cdk.CfnOutput(this, 'SkillsRepoTokenBrokerFunctionName', { value: broker.functionName });
+    }
 
     // Liveness record for long reviews. The runtime updates last_activity
     // on every agent event; on SQS redelivery the worker reads it to tell a
