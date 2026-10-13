@@ -29,10 +29,12 @@ away from it:
   GitHub, token and secret variables removed, and start in the checked-out
   workspace. They are not otherwise sandboxed inside the container. They run as
   the same user as the runtime, so assume code from a pull request can obtain
-  the run's installation token (`pull_requests: write` and `metadata: read` on
-  one routed repository, valid for up to an hour): the token's scope, not its
-  secrecy, is what limits it. The same code can use the runtime's own AWS role,
-  which allows:
+  the run's installation token, and, through the runtime role, new tokens from
+  the reviewer's broker for as long as the session lives (at most two hours).
+  Those tokens carry only `pull_requests: write` and `metadata: read`, for one
+  of the repositories routed to that reviewer at a time. Their scope and the
+  broker's repository list, not their secrecy, are what limit them. The same
+  code can use the runtime's own AWS role, which allows:
   - its models;
   - `s3:GetObject` on its own prefix in the assets bucket (no bucket listing),
     and `kms:Decrypt` on the substrate key, which also encrypts the concerns

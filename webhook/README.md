@@ -24,8 +24,8 @@ What happens to a delivery:
   `ready_for_review` instead; other routes ignore `ready_for_review`. The
   route gates (bot authors, `mentionOnly`, `skipDrafts`, `authorAllowlist`)
   come first, then an idempotency check on
-  `repo#pr#head_sha` and the route's daily budget. New commits do not start
-  a review.
+  `repo#pr#head_sha` (with `#ready` appended for `ready_for_review`) and the
+  route's daily budget. New commits do not start a review.
 - A comment that tags the bot (`@your-app-slug`) from a user with push
   access starts a review with the rest of the comment as its instruction,
   after a safety check by a Bedrock model. Tags inside quotes or code and

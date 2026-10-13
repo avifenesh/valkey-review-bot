@@ -369,7 +369,9 @@ strings, so a file name cannot close the sentence around it: the inline
 tag's path in `mentionBlock`, and the path in the re-review instruction that
 `webhook/src/mention.ts` builds. The base branch stays unfenced, because only
 maintainers create branches in the base repository. The previous state
-comment is shown unfenced too: the App wrote it, from validated tool input.
+comment is shown unfenced too. The App wrote it, and each finding in it is
+folded onto one line with no backticks in its location, so a file name the
+model copied cannot start a heading there.
 
 ### Loop limits
 
@@ -401,9 +403,9 @@ comment is shown unfenced too: the App wrote it, from validated tool input.
   The heartbeat also beats from agent hooks (before each model call and
   after each tool call), so the watchdog still sees a live run. When the
   handler exits, the run is recorded as `completed` if a terminal tool
-  succeeded and `failed` otherwise. A run that ends without one after its
-  stream closed logs its model call count and the first 400 characters of
-  its final text.
+  succeeded and `failed` otherwise. A drained run that ends without one
+  logs its model call count and the first 400 characters of its final
+  text; one that ends in an error logs the error.
 - While a run is in progress, `asBusyTask` keeps it registered as an async
   task of the `BedrockAgentCoreApp`, so the runtime's `/ping` reports
   `HealthyBusy` and AgentCore does not stop the session at its 15-minute
