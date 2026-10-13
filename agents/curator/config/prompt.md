@@ -145,7 +145,8 @@ If the record has a `graduated_record_name`, it graduated before and `submit_ski
 
 ## Always-on checks
 [Deterministic, cheap checks that run regardless of diff shape: file presence, sign-off, format.
- Write them as shell one-liners or exact greps. Optional.]
+ Write each as one `git`, `grep` or `glob` tool call and the exact string to look for in its output.
+ The reviewer has no shell, so no pipes. Optional.]
 
 ## Patterns
 [One ### subsection per named pattern:

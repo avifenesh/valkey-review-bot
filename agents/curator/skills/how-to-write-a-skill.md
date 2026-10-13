@@ -87,7 +87,8 @@ Write sections in this order. Omit any that don't apply.
 
 ## Always-on checks
 [Deterministic, cheap gates that run regardless of diff shape: file presence, sign-off, format.
- Express them as shell one-liners or exact greps, not pattern-match guidance. Optional.]
+ Express each as one `git`, `grep` or `glob` tool call and the exact string to look for in its output,
+ not pattern-match guidance. The reviewer has no shell, so no pipes. Optional.]
 
 ## Patterns
 [One ### subsection per named pattern. Every pattern follows this template:
@@ -138,7 +139,7 @@ Failure to follow any of these produces a skill that misfires:
 
 **Contradictory patterns.** Two patterns overlap on the same diff shape but prescribe different actions. Fix: make each pattern's `Skip unless:` mutually exclusive; if they can't be, merge them.
 
-**Non-deterministic always-on guidance.** "Check for missing DCO" is sometimes followed, sometimes not. Fix: express deterministic checks as shell one-liners (`git log --format='%B' -1 | grep -q 'Signed-off-by'`), not pattern-match guidance.
+**Non-deterministic always-on guidance.** "Check for missing DCO" is sometimes followed, sometimes not. Fix: express each deterministic check as one reviewer tool call and the exact string to look for, not pattern-match guidance. For example: run the `git` tool with `["log","--format=%B","<mergeBase>..<head>"]` and check that every commit message has a `Signed-off-by:` line. The reviewer has no shell, so a pipe such as `git log | grep` cannot run.
 
 **Stylistic-rule contamination.** A "do not cite PR numbers" rule ends up as a graduated skill. Fix: stylistic rules are curator-level; never graduate them. They live in the curator's prompt and skill, not in the reviewer's registry.
 
