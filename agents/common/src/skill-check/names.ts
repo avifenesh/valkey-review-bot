@@ -1,0 +1,239 @@
+/**
+ * The code names a skill cites: file paths, symbols and config names a
+ * release check looks up in the upstream tree.
+ *
+ * Skills put every code name in backticks (the curator's authoring
+ * rule), so only inline code spans count, plus path-like and `A::b`
+ * words in the frontmatter description. Fenced blocks hold placeholders
+ * and are skipped. So are suppressed pieces (see edits.ts): they
+ * describe code before a release on purpose, and checking their names
+ * would flag the same superseded names at every check.
+ *
+ * No runtime imports, so scripts can load this file directly under
+ * Node's type stripping.
+ */
+
+export type NameKind = 'path' | 'dir' | 'glob' | 'prefix' | 'qualified' | 'symbol' | 'config';
+
+export interface CitedName {
+  readonly token: string;
+  readonly kind: NameKind;
+}
+
+/** Most names kept per skill, in document order. */
+export const MAX_NAMES = 300;
+
+const SPAN_MIN_CHARS = 2;
+const SPAN_MAX_CHARS = 120;
+
+/** An all-capitals name needs this many characters; shorter ones (`HSET`, `NULL`) are ordinary words. */
+const ALL_CAPS_MIN_CHARS = 5;
+
+const SOURCE_EXTENSIONS: ReadonlySet<string> = new Set([
+  'c', 'h', 'cc', 'cpp', 'cxx', 'hh', 'hpp', 'hxx', 'rs', 'go', 'py', 'pyi', 'java', 'kt', 'kts', 'scala',
+  'cs', 'swift', 'ts', 'tsx', 'js', 'jsx', 'mjs', 'cjs', 'rb', 'lua', 'tcl', 'sh', 'bash', 'zsh', 'pl',
+  'php', 'proto', 'def', 'json', 'yaml', 'yml', 'toml', 'ini', 'cfg', 'conf', 'xml', 'gradle', 'cmake',
+  'mk', 'md', 'rst', 'txt', 'sql', 'html', 'css', 'lock',
+]);
+
+const IDENT = '[A-Za-z_][A-Za-z0-9_]*';
+const IDENT_RE = new RegExp(`^${IDENT}$`);
+const QUALIFIED_RE = new RegExp(`^${IDENT}(?:(?:::|\\.|->)${IDENT})+$`);
+const PREFIX_RE = /^[A-Za-z_][A-Za-z0-9_]{2,}\*$/;
+const CONFIG_RE = /^[a-z0-9]+(?:-[a-z0-9]+)+$/;
+const PATH_CHARS_RE = /^[A-Za-z0-9_.\/@+-]+$/;
+const GLOB_CHARS_RE = /^[A-Za-z0-9_.\/@+*?-]+$/;
+
+function hasSourceExtension(token: string): boolean {
+  const dot = token.lastIndexOf('.');
+  if (dot <= 0 || dot === token.length - 1) return false;
+  return SOURCE_EXTENSIONS.has(token.slice(dot + 1).toLowerCase());
+}
+
+/** A repository-relative path: no leading '/', no '.' or '..' component, no empty component. */
+function isRelativePath(token: string): boolean {
+  const parts = token.replace(/\/$/, '').split('/');
+  return !token.startsWith('/') && parts.every((p) => p !== '' && p !== '.' && p !== '..');
+}
+
+function isStrongIdentifier(token: string): boolean {
+  if (token.length < 4 || !IDENT_RE.test(token)) return false;
+  if (token.includes('_') && /[A-Za-z0-9]/.test(token)) return true;
+  if (/[a-z]/.test(token) && /[A-Z]/.test(token.slice(1))) return true;
+  return /^[A-Z][A-Z0-9]*$/.test(token) && token.length >= ALL_CAPS_MIN_CHARS;
+}
+
+/**
+ * The kind of a code-span token, or null for a weak word (prose, short
+ * all-capitals words, numbers, punctuation). The same rules decide which
+ * tokens a release-check edit may change (edits.ts keeps a copy).
+ */
+export function classifyToken(token: string): NameKind | null {
+  if (token.length < SPAN_MIN_CHARS || token.length > SPAN_MAX_CHARS) return null;
+  if (PREFIX_RE.test(token)) return 'prefix';
+  if (/[*?]/.test(token)) {
+    const pathLike = GLOB_CHARS_RE.test(token) && /[\/.]/.test(token) && /[A-Za-z0-9]/.test(token);
+    return pathLike && isRelativePath(token) ? 'glob' : null;
+  }
+  if (token.includes('/') || hasSourceExtension(token)) {
+    if (!PATH_CHARS_RE.test(token) || !/[A-Za-z0-9]/.test(token) || !isRelativePath(token)) return null;
+    return token.endsWith('/') ? 'dir' : 'path';
+  }
+  if (QUALIFIED_RE.test(token)) return 'qualified';
+  if (isStrongIdentifier(token)) return 'symbol';
+  if (CONFIG_RE.test(token)) return 'config';
+  return null;
+}
+
+/**
+ * The token a code span names: a call or index suffix (`foo(...)`,
+ * `table[]`), a `:<line>` suffix and a leading `&` or `./` removed.
+ * Null for spans that are not a single name: whitespace, URLs,
+ * placeholders, shell or assignment syntax, quotes.
+ */
+function normalizeSpan(span: string): string | null {
+  let t = span.trim();
+  for (let prev = ''; prev !== t;) {
+    prev = t;
+    t = t.replace(/(?:\([^()]*\)|\[[^[\]]*\])$/, '').replace(/[,;]$/, '');
+  }
+  t = t.replace(/:\d+(?:-\d+)?$/, '').replace(/^&/, '').replace(/^\.\//, '');
+  if (/\s|:\/\/|[<$='"`]/.test(t)) return null;
+  // `->` is a member access (`ht->safe_iterators`); any other '>' is markup or a shell redirect.
+  if (t.replace(/->/g, '').includes('>')) return null;
+  return t;
+}
+
+/** Inline code spans on one line, CommonMark style: matching backtick runs, one padding space trimmed. */
+function codeSpans(line: string): string[] {
+  const out: string[] = [];
+  for (const m of line.matchAll(/(?<!`)(`+)(?!`)(.+?)(?<!`)\1(?!`)/g)) {
+    const inner = m[2]!;
+    out.push(inner.length > 2 && inner.startsWith(' ') && inner.endsWith(' ') ? inner.slice(1, -1) : inner);
+  }
+  return out;
+}
+
+/** Index of the closing '---' of a leading frontmatter block, or -1 when there is none. */
+function frontmatterEnd(lines: readonly string[]): number {
+  if (lines[0]?.trimEnd() !== '---') return -1;
+  for (let i = 1; i < lines.length; i++) {
+    if (lines[i]!.trimEnd() === '---') return i;
+  }
+  return -1;
+}
+
+/** The frontmatter `description` value, unquoted, with folded continuation lines joined. */
+function frontmatterDescription(lines: readonly string[]): string {
+  const at = lines.findIndex((l) => /^description\s*:/.test(l));
+  if (at < 0) return '';
+  let value = lines[at]!.replace(/^description\s*:\s*/, '').trim();
+  const continued: string[] = [];
+  for (let i = at + 1; i < lines.length && /^\s+\S/.test(lines[i]!); i++) continued.push(lines[i]!.trim());
+  if (/^[>|][+-]?$/.test(value)) return continued.join(' ');
+  if (value.startsWith('"')) {
+    try {
+      value = JSON.parse(value) as string;
+    } catch {
+      value = value.replace(/^"|"$/g, '');
+    }
+  } else if (value.startsWith("'")) {
+    value = value.replace(/^'|'$/g, '').replace(/''/g, "'");
+  }
+  return [value, ...continued].join(' ');
+}
+
+const FENCE_OPEN_RE = /^ {0,3}(`{3,}|~{3,})/;
+const FENCE_CLOSE_RE = /^ {0,3}(`{3,}|~{3,})\s*$/;
+
+/** For each line, whether it is part of a fenced code block, fence lines included. */
+function fencedLines(lines: readonly string[]): boolean[] {
+  const out: boolean[] = [];
+  let open: string | null = null;
+  for (const line of lines) {
+    if (open === null) {
+      const m = FENCE_OPEN_RE.exec(line);
+      if (m) open = m[1]!;
+      out.push(open !== null);
+      continue;
+    }
+    out.push(true);
+    const m = FENCE_CLOSE_RE.exec(line);
+    if (m && m[1]![0] === open[0] && m[1]!.length >= open.length) open = null;
+  }
+  return out;
+}
+
+const SUPPRESSED_OPEN_RE = /^<!--\s*suppressed\b/;
+const SUPPRESSED_CLOSE_RE = /^<!--\s*\/\s*suppressed\b/;
+
+/**
+ * For each line, whether it belongs to a suppressed block (markers
+ * included). An opening marker with no closing one hides only itself.
+ */
+function suppressedLines(lines: readonly string[], fenced: readonly boolean[]): boolean[] {
+  const out = lines.map(() => false);
+  for (let i = 0; i < lines.length; i++) {
+    if (fenced[i] || !SUPPRESSED_OPEN_RE.test(lines[i]!.trim())) continue;
+    out[i] = true;
+    const close = lines.findIndex((l, j) => j > i && !fenced[j] && SUPPRESSED_CLOSE_RE.test(l.trim()));
+    if (close < 0) continue;
+    for (let j = i; j <= close; j++) out[j] = true;
+    i = close;
+  }
+  return out;
+}
+
+/**
+ * Words of the description that name code without backticks: paths
+ * with a source extension or a trailing '/', globs with a '/', and
+ * `A::b` names. Other bare words are prose ("Node.js", "owner/name").
+ */
+function bareDescriptionName(word: string): CitedName | null {
+  const t = word.replace(/^[("'[]+/, '').replace(/[)"'\],;:.!?]+$/, '');
+  const kind = classifyToken(t);
+  if (kind === 'qualified') return t.includes('::') ? { token: t, kind } : null;
+  if (kind === 'glob' && t.includes('/')) return { token: t, kind };
+  if (kind === 'dir' || (kind === 'path' && t.includes('/') && hasSourceExtension(t))) return { token: t, kind };
+  return null;
+}
+
+/**
+ * The code names a skill cites, first-seen order, at most MAX_NAMES.
+ * Body names come from inline code spans outside fenced blocks and
+ * suppressed pieces; the frontmatter description adds its code spans
+ * and its bare path-like and `A::b` words.
+ */
+export function extractNames(skillMd: string): CitedName[] {
+  const lines = skillMd.split('\n').map((l) => l.replace(/\r$/, ''));
+  const fmEnd = frontmatterEnd(lines);
+  const out: CitedName[] = [];
+  const seen = new Set<string>();
+  const add = (name: CitedName | null) => {
+    if (!name || seen.has(name.token) || out.length >= MAX_NAMES) return;
+    seen.add(name.token);
+    out.push(name);
+  };
+  const fromSpan = (span: string): CitedName | null => {
+    if (span.length < SPAN_MIN_CHARS || span.length > SPAN_MAX_CHARS) return null;
+    const token = normalizeSpan(span);
+    const kind = token === null ? null : classifyToken(token);
+    return kind ? { token: token!, kind } : null;
+  };
+
+  if (fmEnd > 0) {
+    const description = frontmatterDescription(lines.slice(1, fmEnd));
+    for (const m of description.matchAll(/`([^`]+)`|[^\s`]+/g)) {
+      add(m[1] !== undefined ? fromSpan(m[1]) : bareDescriptionName(m[0]));
+    }
+  }
+
+  const body = lines.slice(fmEnd + 1);
+  const fenced = fencedLines(body);
+  const suppressed = suppressedLines(body, fenced);
+  body.forEach((line, i) => {
+    if (fenced[i] || suppressed[i]) return;
+    for (const span of codeSpans(line)) add(fromSpan(span));
+  });
+  return out;
+}
