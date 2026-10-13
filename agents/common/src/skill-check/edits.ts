@@ -1,0 +1,758 @@
+/**
+ * Release-check edits to a skill, in suppress-and-add form.
+ *
+ * A stale piece of the skill body (one or more whole lines) is never
+ * overwritten. It stays byte for byte between markers that name the
+ * upstream release that superseded it and cite the upstream lines that
+ * prove the change, and the replacement follows the closing marker:
+ *
+ *   <!-- suppressed: superseded in <release>, <YYYY-MM-DD>; <reason>; evidence: <repo>@<sha>:<path>:<line> -->
+ *   <the original piece>
+ *   <!-- /suppressed -->
+ *   <the replacement piece>
+ *
+ * Several citations are separated by ", ". The replacement may differ
+ * from the original only where a cited line supports it: both are split
+ * on the token class [A-Za-z0-9_./:*>-]+, the text between tokens must
+ * be identical and the token count equal, and every changed token must
+ * be a code name replacing a code name, or a number replacing a number,
+ * that appears on one of the edit's cited lines. So an edit cannot add
+ * or remove a word, a sentence or punctuation, and the replacement has
+ * as many lines as the original. The frontmatter, fenced blocks and
+ * already-suppressed pieces are never edited, and suppressed blocks do
+ * not nest.
+ *
+ * No runtime imports, so scripts can load this file directly under
+ * Node's type stripping. The token rules repeat names.ts's
+ * classifyToken; the tests keep the two in step.
+ */
+
+export interface Citation {
+  /** "owner/name". */
+  readonly repo: string;
+  /** Full commit SHA. */
+  readonly sha: string;
+  /** Repository-relative file path. */
+  readonly path: string;
+  /** 1-based line number. */
+  readonly line: number;
+}
+
+export interface SuppressEdit {
+  /** One or more whole lines of the skill body, exactly as written, joined with '\n'. */
+  readonly original: string;
+  /** The same lines with only code names or numbers changed. */
+  readonly replacement: string;
+  /** The upstream lines that support the changes: 1 to MAX_CITATIONS_PER_EDIT. */
+  readonly evidence: readonly Citation[];
+  /** One line for the marker. Default: generated from the changed names. */
+  readonly reason?: string;
+}
+
+export interface EditContext {
+  /** Names the check flagged (lost, new_absent or touched). Every piece must contain one. */
+  readonly flagged: readonly string[];
+  /** The release named in the marker: a tag, or "<branch>@<sha12>" when no tag is known. */
+  readonly release: string;
+  /** YYYY-MM-DD of the check. */
+  readonly date: string;
+  /** The checked commit. Every citation must name this repository and commit. */
+  readonly upstream: { readonly repo: string; readonly sha: string };
+  /** Cap on the edited markdown. Default 40,000 (GRADUATED_SKILL_MAX_CHARS). */
+  readonly maxChars?: number;
+}
+
+/** Line `citation.line` of the file at the cited commit, without its line ending; null when there is none. */
+export type LineResolver = (citation: Citation) => Promise<string | null>;
+
+export interface SuppressedBlock {
+  readonly release: string;
+  readonly date: string;
+  readonly reason: string;
+  readonly evidence: readonly Citation[];
+  /** The suppressed piece, exactly as written. */
+  readonly original: string;
+  /**
+   * The live text that stands in its place: as many lines as the
+   * original, read after the closing marker and skipping any later
+   * suppressed block.
+   */
+  readonly replacement: string;
+  /** 1-based line numbers of the opening and closing markers in the whole markdown. */
+  readonly startLine: number;
+  readonly endLine: number;
+}
+
+export interface EditOutcome {
+  /** Why the edits were refused; empty when they are valid. */
+  readonly problems: readonly string[];
+  /** The edited markdown when there are no problems, else null. */
+  readonly skillMd: string | null;
+}
+
+export const MAX_EDITS = 10;
+/** Cap on how much the live text may grow over all edits of one check. */
+export const MAX_EDIT_GROWTH_CHARS = 2_000;
+export const MAX_PIECE_LINES = 20;
+export const MAX_PIECE_CHARS = 2_000;
+export const MAX_CITATIONS_PER_EDIT = 5;
+export const MAX_REASON_CHARS = 300;
+const DEFAULT_MAX_CHARS = 40_000;
+const NAME_MAX_CHARS = 120;
+
+export const SUPPRESSED_CLOSE = '<!-- /suppressed -->';
+const HEADER_RE = /^<!-- suppressed: superseded in ([^\s,;]+), (\d{4}-\d{2}-\d{2}); (.+); evidence: (\S+(?:, \S+)*) -->$/;
+const OPEN_LIKE_RE = /^<!--\s*suppressed\b/;
+const CLOSE_LIKE_RE = /^<!--\s*\/\s*suppressed\b/;
+
+const RELEASE_RE = /^[A-Za-z0-9][A-Za-z0-9._\/@+-]{0,99}$/;
+const REPO_RE = /^[A-Za-z0-9_.-]{1,100}\/[A-Za-z0-9_.-]{1,100}$/;
+const SHA_RE = /^(?:[0-9a-f]{40}|[0-9a-f]{64})$/;
+const CITATION_RE = /^([A-Za-z0-9_.-]{1,100}\/[A-Za-z0-9_.-]{1,100})@([0-9a-f]{40}|[0-9a-f]{64}):(.+):([1-9][0-9]{0,6})$/;
+const PATH_MAX_CHARS = 400;
+
+const TOKEN_RE = /[A-Za-z0-9_.\/:*>-]+/g;
+const WORD_CHAR_RE = /[A-Za-z0-9_]/;
+const NUMBER_RE = /^[0-9]+(?:\.[0-9]+)*$/;
+
+const FENCE_OPEN_RE = /^ {0,3}(`{3,}|~{3,})/;
+const FENCE_CLOSE_RE = /^ {0,3}(`{3,}|~{3,})\s*$/;
+
+// Token rules, copied from names.ts classifyToken.
+
+const SOURCE_EXTENSIONS: ReadonlySet<string> = new Set([
+  'c', 'h', 'cc', 'cpp', 'cxx', 'hh', 'hpp', 'hxx', 'rs', 'go', 'py', 'pyi', 'java', 'kt', 'kts', 'scala',
+  'cs', 'swift', 'ts', 'tsx', 'js', 'jsx', 'mjs', 'cjs', 'rb', 'lua', 'tcl', 'sh', 'bash', 'zsh', 'pl',
+  'php', 'proto', 'def', 'json', 'yaml', 'yml', 'toml', 'ini', 'cfg', 'conf', 'xml', 'gradle', 'cmake',
+  'mk', 'md', 'rst', 'txt', 'sql', 'html', 'css', 'lock',
+]);
+const IDENT = '[A-Za-z_][A-Za-z0-9_]*';
+const IDENT_RE = new RegExp(`^${IDENT}$`);
+const QUALIFIED_RE = new RegExp(`^${IDENT}(?:(?:::|\\.|->)${IDENT})+$`);
+const PREFIX_RE = /^[A-Za-z_][A-Za-z0-9_]{2,}\*$/;
+const CONFIG_RE = /^[a-z0-9]+(?:-[a-z0-9]+)+$/;
+const PATH_CHARS_RE = /^[A-Za-z0-9_.\/@+-]+$/;
+const GLOB_CHARS_RE = /^[A-Za-z0-9_.\/@+*?-]+$/;
+
+type NameKind = 'path' | 'dir' | 'glob' | 'prefix' | 'qualified' | 'symbol' | 'config';
+
+/** Which sort of name a kind is. An edit may only swap names of one sort. */
+function nameSort(kind: NameKind): 'file' | 'code' | 'config' {
+  if (kind === 'path' || kind === 'dir' || kind === 'glob') return 'file';
+  return kind === 'config' ? 'config' : 'code';
+}
+
+function hasSourceExtension(token: string): boolean {
+  const dot = token.lastIndexOf('.');
+  if (dot <= 0 || dot === token.length - 1) return false;
+  return SOURCE_EXTENSIONS.has(token.slice(dot + 1).toLowerCase());
+}
+
+function isRelativePath(token: string): boolean {
+  const parts = token.replace(/\/$/, '').split('/');
+  return !token.startsWith('/') && parts.every((p) => p !== '' && p !== '.' && p !== '..');
+}
+
+function isStrongIdentifier(token: string): boolean {
+  if (token.length < 4 || !IDENT_RE.test(token)) return false;
+  if (token.includes('_') && /[A-Za-z0-9]/.test(token)) return true;
+  if (/[a-z]/.test(token) && /[A-Z]/.test(token.slice(1))) return true;
+  return /^[A-Z][A-Z0-9]*$/.test(token) && token.length >= 5;
+}
+
+function nameKind(token: string): NameKind | null {
+  if (token.length < 2 || token.length > NAME_MAX_CHARS) return null;
+  if (PREFIX_RE.test(token)) return 'prefix';
+  if (/[*?]/.test(token)) {
+    const pathLike = GLOB_CHARS_RE.test(token) && /[\/.]/.test(token) && /[A-Za-z0-9]/.test(token);
+    return pathLike && isRelativePath(token) ? 'glob' : null;
+  }
+  if (token.includes('/') || hasSourceExtension(token)) {
+    if (!PATH_CHARS_RE.test(token) || !/[A-Za-z0-9]/.test(token) || !isRelativePath(token)) return null;
+    return token.endsWith('/') ? 'dir' : 'path';
+  }
+  if (QUALIFIED_RE.test(token)) return 'qualified';
+  if (isStrongIdentifier(token)) return 'symbol';
+  if (CONFIG_RE.test(token)) return 'config';
+  return null;
+}
+
+/** A citation path: repository-relative, no '.' or '..' component, nothing that would break the marker line. */
+function isCitablePath(p: string): boolean {
+  if (p.length === 0 || p.length > PATH_MAX_CHARS || p.startsWith('/')) return false;
+  if (/[\s,;<>"'`\\\x00-\x1f\x7f]/.test(p)) return false;
+  return p.split('/').every((part) => part !== '' && part !== '.' && part !== '..');
+}
+
+export function formatCitation(c: Citation): string {
+  return `${c.repo}@${c.sha}:${c.path}:${c.line}`;
+}
+
+/** Parse "<repo>@<sha>:<path>:<line>"; null when it is not one. */
+export function parseCitation(text: string): Citation | null {
+  const m = CITATION_RE.exec(text);
+  if (!m || !isCitablePath(m[3]!)) return null;
+  return { repo: m[1]!, sha: m[2]!, path: m[3]!, line: Number(m[4]) };
+}
+
+function citationProblem(c: Citation, upstream: EditContext['upstream']): string | null {
+  const shown = typeof c?.path === 'string' ? formatCitation(c) : JSON.stringify(c);
+  if (!c || typeof c.repo !== 'string' || typeof c.sha !== 'string' || typeof c.path !== 'string' || !Number.isInteger(c.line)) {
+    return `evidence ${shown} is not a citation of {repo, sha, path, line}`;
+  }
+  if (!isCitablePath(c.path)) return `evidence ${shown}: the path must be relative, without '..', '.', NUL, spaces, commas or quotes`;
+  if (c.line < 1 || c.line > 9_999_999) return `evidence ${shown}: the line must be a positive number`;
+  if (c.repo.toLowerCase() !== upstream.repo.toLowerCase() || c.sha !== upstream.sha) {
+    return `evidence ${shown}: cite the checked commit, ${upstream.repo}@${upstream.sha}`;
+  }
+  if (parseCitation(formatCitation(c)) === null) return `evidence ${shown} is not a valid citation`;
+  return null;
+}
+
+interface Header {
+  readonly release: string;
+  readonly date: string;
+  readonly reason: string;
+  readonly evidence: readonly Citation[];
+}
+
+interface Block {
+  /** Line index of the opening marker. */
+  readonly start: number;
+  /** Line index of the closing marker. */
+  readonly end: number;
+  readonly header: Header;
+}
+
+interface Doc {
+  /** The markdown split on '\n'; a '\r' stays on its line. */
+  readonly lines: readonly string[];
+  /** The lines without a trailing '\r'. */
+  readonly plain: readonly string[];
+  /** Index of the first body line (after the frontmatter). */
+  readonly bodyStart: number;
+  readonly fenced: readonly boolean[];
+  /** Per line, whether it belongs to a suppressed block, markers included. */
+  readonly inBlock: readonly boolean[];
+  readonly blocks: readonly Block[];
+  readonly problems: readonly string[];
+}
+
+function stripCr(line: string): string {
+  return line.endsWith('\r') ? line.slice(0, -1) : line;
+}
+
+function parseHeader(text: string): Header | null {
+  const m = HEADER_RE.exec(text);
+  if (!m || !isValidDate(m[2]!)) return null;
+  const evidence = m[4]!.split(', ').map(parseCitation);
+  if (evidence.some((c) => c === null)) return null;
+  return { release: m[1]!, date: m[2]!, reason: m[3]!, evidence: evidence as Citation[] };
+}
+
+function parseDoc(skillMd: string): Doc {
+  const lines = skillMd.split('\n');
+  const plain = lines.map(stripCr);
+  let bodyStart = 0;
+  if (plain[0]?.trimEnd() === '---') {
+    const end = plain.findIndex((l, i) => i > 0 && l.trimEnd() === '---');
+    if (end > 0) bodyStart = end + 1;
+  }
+
+  const fenced = plain.map(() => false);
+  let fence: string | null = null;
+  for (let i = bodyStart; i < plain.length; i++) {
+    const line = plain[i]!;
+    if (fence === null) {
+      const m = FENCE_OPEN_RE.exec(line);
+      if (m) fence = m[1]!;
+      fenced[i] = fence !== null;
+      continue;
+    }
+    fenced[i] = true;
+    const m = FENCE_CLOSE_RE.exec(line);
+    if (m && m[1]![0] === fence[0] && m[1]!.length >= fence.length) fence = null;
+  }
+
+  const blocks: Block[] = [];
+  const problems: string[] = [];
+  let open: { start: number; header: Header | null } | null = null;
+  for (let i = bodyStart; i < plain.length; i++) {
+    if (fenced[i]) continue;
+    const text = plain[i]!.trim();
+    if (OPEN_LIKE_RE.test(text)) {
+      if (open) {
+        problems.push(`line ${i + 1} opens a suppressed block inside the one opened at line ${open.start + 1}`);
+        continue;
+      }
+      const header = parseHeader(text);
+      if (!header) problems.push(`line ${i + 1} is not a well-formed suppression marker`);
+      open = { start: i, header };
+    } else if (CLOSE_LIKE_RE.test(text)) {
+      if (!open) {
+        problems.push(`line ${i + 1} closes a suppressed block that was never opened`);
+      } else {
+        if (text !== SUPPRESSED_CLOSE) problems.push(`line ${i + 1} is not a well-formed closing marker`);
+        else if (i === open.start + 1) problems.push(`the suppressed block at line ${open.start + 1} is empty`);
+        else if (open.header) blocks.push({ start: open.start, end: i, header: open.header });
+        open = null;
+      }
+    }
+  }
+  if (open) problems.push(`the suppressed block opened at line ${open.start + 1} is never closed`);
+
+  const inBlock = plain.map(() => false);
+  for (const b of blocks) for (let i = b.start; i <= b.end; i++) inBlock[i] = true;
+  return { lines, plain, bodyStart, fenced, inBlock, blocks, problems };
+}
+
+/** The live lines after a block's closing marker, as many as it suppresses. */
+function replacementOf(doc: Doc, block: Block): string {
+  const want = block.end - block.start - 1;
+  const out: string[] = [];
+  for (let i = block.end + 1; i < doc.lines.length && out.length < want; i++) {
+    if (!doc.inBlock[i]) out.push(doc.lines[i]!);
+  }
+  return out.join('\n');
+}
+
+/** Parse the suppressed blocks of a skill, with any problems in the markers. */
+export function parseSuppressed(skillMd: string): { blocks: SuppressedBlock[]; problems: string[] } {
+  const doc = parseDoc(skillMd);
+  const blocks = doc.blocks.map((b) => ({
+    ...b.header,
+    original: doc.lines.slice(b.start + 1, b.end).join('\n'),
+    replacement: replacementOf(doc, b),
+    startLine: b.start + 1,
+    endLine: b.end + 1,
+  }));
+  return { blocks, problems: [...doc.problems] };
+}
+
+/** The well-formed suppressed blocks of a skill, in document order. */
+export function listSuppressedBlocks(skillMd: string): SuppressedBlock[] {
+  return parseSuppressed(skillMd).blocks;
+}
+
+interface Change {
+  readonly from: string;
+  readonly to: string;
+}
+
+function splitTokens(text: string): { tokens: string[]; seps: string[] } {
+  const tokens: string[] = [];
+  const seps: string[] = [];
+  let last = 0;
+  for (const m of text.matchAll(TOKEN_RE)) {
+    seps.push(text.slice(last, m.index));
+    tokens.push(m[0]);
+    last = m.index + m[0].length;
+  }
+  seps.push(text.slice(last));
+  return { tokens, seps };
+}
+
+/** A token without its markdown emphasis (`**512**`) and trailing punctuation or `:<line>`. */
+function unwrap(token: string): { pre: string; core: string; post: string } {
+  let pre = '';
+  let post = '';
+  let core = token;
+  const lead = /^\*+/.exec(core)?.[0] ?? '';
+  const trail = /\*+$/.exec(core)?.[0] ?? '';
+  if (lead && trail && lead.length + trail.length < core.length) {
+    pre = lead;
+    post = trail;
+    core = core.slice(lead.length, core.length - trail.length);
+  }
+  const tail = /(?::\d+(?:-\d+)?|[.:]+)$/.exec(core)?.[0] ?? '';
+  if (tail && tail.length < core.length) {
+    post = tail + post;
+    core = core.slice(0, core.length - tail.length);
+  }
+  return { pre, core, post };
+}
+
+function snippet(text: string): string {
+  return JSON.stringify(text.length > 60 ? `${text.slice(0, 57)}...` : text);
+}
+
+/** The changed names of an edit, or why the replacement changes more than names. */
+function diffTokens(original: string, replacement: string): { changes: Change[] } | { problem: string } {
+  const a = splitTokens(original);
+  const b = splitTokens(replacement);
+  if (a.tokens.length !== b.tokens.length) {
+    return { problem: `the replacement has ${b.tokens.length} words and the original ${a.tokens.length}; only code names and numbers may change, none added or removed` };
+  }
+  for (let i = 0; i < a.seps.length; i++) {
+    if (a.seps[i] !== b.seps[i]) {
+      return { problem: `the replacement changes the text between words (spacing, punctuation, markup or line breaks): ${snippet(a.seps[i]!)} became ${snippet(b.seps[i]!)}` };
+    }
+  }
+  const changes: Change[] = [];
+  for (let i = 0; i < a.tokens.length; i++) {
+    if (a.tokens[i] === b.tokens[i]) continue;
+    const x = unwrap(a.tokens[i]!);
+    const y = unwrap(b.tokens[i]!);
+    if (x.pre !== y.pre || x.post !== y.post) {
+      return { problem: `"${b.tokens[i]}" changes the markup or punctuation around "${a.tokens[i]}"` };
+    }
+    const numbers = NUMBER_RE.test(x.core) && NUMBER_RE.test(y.core);
+    const kx = nameKind(x.core);
+    const ky = nameKind(y.core);
+    if (!numbers && !(kx && ky && nameSort(kx) === nameSort(ky))) {
+      return { problem: `"${b.tokens[i]}" replaces "${a.tokens[i]}", but only a code name can replace a code name of the same sort (file, identifier or config), or a number a number` };
+    }
+    changes.push({ from: x.core, to: y.core });
+  }
+  if (changes.length === 0) return { problem: 'the replacement is the same as the original' };
+  return { changes };
+}
+
+/** Whether `word` occurs in `text` with no identifier character joined to its identifier-character ends. */
+function containsWord(text: string, word: string): boolean {
+  if (!word) return false;
+  const checkBefore = WORD_CHAR_RE.test(word[0]!);
+  const checkAfter = WORD_CHAR_RE.test(word[word.length - 1]!);
+  for (let i = text.indexOf(word); i >= 0; i = text.indexOf(word, i + 1)) {
+    const before = i > 0 ? text[i - 1]! : '';
+    const after = text[i + word.length] ?? '';
+    if ((!checkBefore || !WORD_CHAR_RE.test(before)) && (!checkAfter || !WORD_CHAR_RE.test(after))) return true;
+  }
+  return false;
+}
+
+/** Whether some word in `text` starts with `stem`. */
+function containsWordStart(text: string, stem: string): boolean {
+  for (let i = text.indexOf(stem); i >= 0; i = text.indexOf(stem, i + 1)) {
+    if (i === 0 || !WORD_CHAR_RE.test(text[i - 1]!)) return true;
+  }
+  return false;
+}
+
+function globToRegExp(glob: string): RegExp {
+  let re = '';
+  for (let i = 0; i < glob.length; i++) {
+    const c = glob[i]!;
+    if (c === '*' && glob[i + 1] === '*') {
+      i++;
+      if (glob[i + 1] === '/') {
+        i++;
+        re += '(?:.*/)?';
+      } else {
+        re += '.*';
+      }
+    } else if (c === '*') {
+      re += '[^/]*';
+    } else if (c === '?') {
+      re += '[^/]';
+    } else {
+      re += c.replace(/[.+^${}()|[\]\\]/g, '\\$&');
+    }
+  }
+  return new RegExp(`^${re}$`);
+}
+
+/** The components of a qualified name that differ from the one it replaces, or null when the shapes differ. */
+function changedComponents(from: string, to: string): string[] | null {
+  const a = from.split(/(::|\.|->)/);
+  const b = to.split(/(::|\.|->)/);
+  if (a.length !== b.length) return null;
+  const out: string[] = [];
+  for (let i = 0; i < a.length; i++) {
+    if (i % 2 === 1 && a[i] !== b[i]) return null;
+    if (i % 2 === 0 && a[i] !== b[i]) out.push(b[i]!);
+  }
+  return out;
+}
+
+/**
+ * Whether a cited line supports a changed name: the line has the new
+ * name as a word. A new path is also supported by any line of that file
+ * (or of a file whose path ends with it, as the check matches tails),
+ * a new directory or glob by a line of a file in or matching it, and a
+ * new qualified name by a line that has each component that changed.
+ */
+function supports(change: Change, c: Citation, line: string): boolean {
+  const to = change.to;
+  if (containsWord(line, to)) return true;
+  switch (nameKind(to)) {
+    case 'prefix': return containsWordStart(line, to.slice(0, -1));
+    case 'path': return c.path === to || c.path.endsWith(`/${to}`);
+    case 'dir': return c.path.startsWith(to) || c.path.includes(`/${to}`);
+    case 'glob': return globToRegExp(to).test(to.includes('/') ? c.path : c.path.slice(c.path.lastIndexOf('/') + 1));
+    case 'qualified': {
+      const parts = changedComponents(change.from, to);
+      return parts !== null && parts.length > 0 && parts.every((p) => containsWord(line, p));
+    }
+    default: return false;
+  }
+}
+
+function isValidDate(date: string): boolean {
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(date)) return false;
+  const d = new Date(`${date}T00:00:00Z`);
+  return !Number.isNaN(d.getTime()) && d.toISOString().slice(0, 10) === date;
+}
+
+function assertContext(ctx: EditContext): void {
+  if (!RELEASE_RE.test(ctx.release)) throw new Error(`release ${JSON.stringify(ctx.release)} is not a tag or ref the marker can name`);
+  if (!isValidDate(ctx.date)) throw new Error(`date ${JSON.stringify(ctx.date)} is not YYYY-MM-DD`);
+  if (!REPO_RE.test(ctx.upstream.repo) || !SHA_RE.test(ctx.upstream.sha)) {
+    throw new Error(`upstream ${ctx.upstream.repo}@${ctx.upstream.sha} is not "owner/name" and a full commit SHA`);
+  }
+}
+
+function reasonProblem(reason: string): string | null {
+  if (reason.length === 0 || reason.length > MAX_REASON_CHARS) return `the reason must be 1-${MAX_REASON_CHARS} characters`;
+  if (reason !== reason.trim() || /[\x00-\x1f\x7f]/.test(reason)) return 'the reason must be one line without surrounding spaces';
+  if (reason.includes('-->') || reason.includes('<!--')) return 'the reason must not contain "<!--" or "-->"';
+  return null;
+}
+
+/** "`a` is now `b`, ..." for the marker when the edit gives no reason. */
+function defaultReason(changes: readonly Change[]): string {
+  const parts = [...new Set(changes.map((c) => `\`${c.from}\` is now \`${c.to}\``))];
+  let out = '';
+  let used = 0;
+  for (const part of parts) {
+    const next = out ? `${out}, ${part}` : part;
+    if (next.length > MAX_REASON_CHARS - 20) break;
+    out = next;
+    used++;
+  }
+  if (!out) return 'code names changed upstream';
+  return used < parts.length ? `${out} and ${parts.length - used} more` : out;
+}
+
+export function suppressionHeader(release: string, date: string, reason: string, evidence: readonly Citation[]): string {
+  return `<!-- suppressed: superseded in ${release}, ${date}; ${reason}; evidence: ${evidence.map(formatCitation).join(', ')} -->`;
+}
+
+interface Planned {
+  readonly index: number;
+  readonly start: number;
+  readonly count: number;
+  readonly replacementLines: readonly string[];
+  readonly changes: readonly Change[];
+  readonly reason: string;
+  readonly evidence: readonly Citation[];
+}
+
+interface Plan {
+  readonly doc: Doc;
+  /** Problems, each with the edit it belongs to (-1 for the whole set). */
+  readonly problems: { readonly edit: number; readonly message: string }[];
+  readonly planned: Planned[];
+  /** Edits whose changes and citations are well formed, so their evidence can be looked up. */
+  readonly checkable: Map<number, { readonly changes: readonly Change[]; readonly evidence: readonly Citation[] }>;
+}
+
+function trimFinalNewline(text: string): string {
+  return text.replace(/\r?\n$/, '');
+}
+
+/** Where the piece is: the index of its first line, or why it cannot be edited. */
+function locate(doc: Doc, want: readonly string[]): number | string {
+  const live: number[] = [];
+  let inFrontmatter = 0;
+  let suppressed = 0;
+  let fencedHits = 0;
+  for (let s = 0; s + want.length <= doc.plain.length; s++) {
+    let match = true;
+    for (let k = 0; k < want.length && match; k++) match = doc.plain[s + k] === want[k];
+    if (!match) continue;
+    const span = Array.from({ length: want.length }, (_, k) => s + k);
+    if (s < doc.bodyStart) inFrontmatter++;
+    else if (span.some((i) => doc.inBlock[i])) suppressed++;
+    else if (span.some((i) => doc.fenced[i])) fencedHits++;
+    else live.push(s);
+  }
+  if (live.length === 1) return live[0]!;
+  if (live.length > 1) return `the original occurs ${live.length} times in the body; include neighbouring lines so it matches once`;
+  if (inFrontmatter > 0) return 'the frontmatter is never edited';
+  if (suppressed > 0) return 'that piece is already suppressed and is never edited again';
+  if (fencedHits > 0) return 'pieces inside fenced code blocks are not edited';
+  const joined = want.join('\n');
+  if (joined && doc.plain.join('\n').includes(joined)) return 'the original must be whole lines; quote each line in full';
+  return 'the original does not occur in the skill body';
+}
+
+function plan(skillMd: string, edits: readonly SuppressEdit[], ctx: EditContext): Plan {
+  assertContext(ctx);
+  const doc = parseDoc(skillMd);
+  const problems: Plan['problems'] = [];
+  const planned: Planned[] = [];
+  const checkable: Plan['checkable'] = new Map();
+  const whole = (message: string) => problems.push({ edit: -1, message });
+  if (edits.length === 0) whole('no edits given');
+  if (edits.length > MAX_EDITS) {
+    whole(`at most ${MAX_EDITS} edits per check, got ${edits.length}`);
+    return { doc, problems, planned, checkable };
+  }
+  for (const p of doc.problems) whole(`the skill's suppression markers are malformed (${p}), so it cannot be edited automatically`);
+  if (doc.problems.length > 0) return { doc, problems, planned, checkable };
+
+  let growth = 0;
+  edits.forEach((edit, index) => {
+    const before = problems.length;
+    const fail = (message: string) => problems.push({ edit: index, message });
+    const original = trimFinalNewline(String(edit.original ?? ''));
+    const replacement = trimFinalNewline(String(edit.replacement ?? ''));
+    const want = original.split('\n').map(stripCr);
+    const replacementLines = replacement.split('\n').map(stripCr);
+
+    let start = -1;
+    if (original.trim() === '') fail('the original is empty');
+    else if (want.length > MAX_PIECE_LINES) fail(`the original has ${want.length} lines; at most ${MAX_PIECE_LINES}`);
+    else if (original.length > MAX_PIECE_CHARS) fail(`the original has ${original.length} characters; at most ${MAX_PIECE_CHARS}`);
+    else {
+      const at = locate(doc, want);
+      if (typeof at === 'string') fail(at);
+      else start = at;
+    }
+    if (start >= 0) {
+      const end = start + want.length - 1;
+      const overlap = planned.find((p) => start <= p.start + p.count - 1 && p.start <= end);
+      if (overlap) fail(`it overlaps edit ${overlap.index + 1}`);
+      if (!ctx.flagged.some((name) => containsWord(original, name))) {
+        fail('the original contains none of the flagged names');
+      }
+    }
+    if (replacementLines.some((l) => OPEN_LIKE_RE.test(l.trim()) || CLOSE_LIKE_RE.test(l.trim()))) {
+      fail('the replacement must not contain suppression markers');
+    }
+
+    const diff = diffTokens(want.join('\n'), replacementLines.join('\n'));
+    if ('problem' in diff) fail(diff.problem);
+    const evidence = Array.isArray(edit.evidence) ? edit.evidence : [];
+    if (evidence.length === 0) fail('give at least one cited upstream line as evidence');
+    if (evidence.length > MAX_CITATIONS_PER_EDIT) fail(`at most ${MAX_CITATIONS_PER_EDIT} citations per edit`);
+    const citationProblems = evidence.slice(0, MAX_CITATIONS_PER_EDIT).map((c) => citationProblem(c, ctx.upstream)).filter((p) => p !== null);
+    citationProblems.forEach(fail);
+
+    let reason = '';
+    if ('changes' in diff) {
+      if (citationProblems.length === 0 && evidence.length > 0 && evidence.length <= MAX_CITATIONS_PER_EDIT) {
+        checkable.set(index, { changes: diff.changes, evidence });
+      }
+      reason = edit.reason === undefined ? defaultReason(diff.changes) : String(edit.reason);
+      const bad = reasonProblem(reason);
+      if (bad) fail(bad);
+    }
+    if (problems.length > before || !('changes' in diff)) return;
+    growth += replacement.length - original.length;
+    planned.push({ index, start, count: want.length, replacementLines, changes: diff.changes, reason, evidence });
+  });
+  if (growth > MAX_EDIT_GROWTH_CHARS) whole(`the edits grow the skill by ${growth} characters; at most ${MAX_EDIT_GROWTH_CHARS}`);
+
+  if (problems.length === 0) {
+    const out = render(doc, planned, ctx);
+    const maxChars = ctx.maxChars ?? DEFAULT_MAX_CHARS;
+    if (out.length > maxChars) whole(`the edited skill would be ${out.length} characters; at most ${maxChars}`);
+    const back = parseDoc(out);
+    const sameFrontmatter = back.bodyStart === doc.bodyStart
+      && back.lines.slice(0, back.bodyStart).join('\n') === doc.lines.slice(0, doc.bodyStart).join('\n');
+    if (back.problems.length > 0 || back.blocks.length !== doc.blocks.length + planned.length || !sameFrontmatter) {
+      whole('the edited skill does not parse back to the same frontmatter plus one suppressed block per edit');
+    }
+  }
+  return { doc, problems, planned, checkable };
+}
+
+function render(doc: Doc, planned: readonly Planned[], ctx: EditContext): string {
+  const lines = [...doc.lines];
+  for (const p of [...planned].sort((a, b) => b.start - a.start)) {
+    const piece = lines.slice(p.start, p.start + p.count);
+    const eol = (line: string | undefined) => (line?.endsWith('\r') ? '\r' : '');
+    const header = suppressionHeader(ctx.release, ctx.date, p.reason, p.evidence) + eol(piece[0]);
+    const close = SUPPRESSED_CLOSE + eol(piece[piece.length - 1]);
+    const replacement = p.replacementLines.map((line, k) => line + eol(piece[k]));
+    lines.splice(p.start, p.count, header, ...piece, close, ...replacement);
+  }
+  return lines.join('\n');
+}
+
+function formatProblems(problems: Plan['problems']): string[] {
+  return [...problems]
+    .sort((a, b) => a.edit - b.edit)
+    .map((p) => (p.edit < 0 ? p.message : `edit ${p.edit + 1}: ${p.message}`));
+}
+
+/**
+ * The structural checks, without reading any upstream line: where each
+ * piece is, what changed, and whether the citations are well formed.
+ * Empty when the edits pass.
+ */
+export function checkEdits(skillMd: string, edits: readonly SuppressEdit[], ctx: EditContext): string[] {
+  return formatProblems(plan(skillMd, edits, ctx).problems);
+}
+
+async function evidenceProblems(
+  checkable: Plan['checkable'],
+  resolveLine: LineResolver,
+): Promise<{ edit: number; message: string }[]> {
+  const problems: { edit: number; message: string }[] = [];
+  const cache = new Map<string, Promise<string | null>>();
+  const lineOf = (c: Citation) => {
+    const key = formatCitation(c);
+    if (!cache.has(key)) cache.set(key, resolveLine(c));
+    return cache.get(key)!;
+  };
+  for (const [edit, { changes, evidence }] of checkable) {
+    const lines = await Promise.all(evidence.map(lineOf));
+    evidence.forEach((c, j) => {
+      const line = lines[j];
+      if (line === null || line === undefined) {
+        problems.push({ edit, message: `evidence ${formatCitation(c)}: no such line at that commit` });
+      } else if (!changes.some((ch) => supports(ch, c, line))) {
+        problems.push({ edit, message: `evidence ${formatCitation(c)}: the line supports none of the changed names` });
+      }
+    });
+    const unsupported = changes.filter((ch) => !evidence.some((c, j) => typeof lines[j] === 'string' && supports(ch, c, lines[j]!)));
+    for (const to of new Set(unsupported.map((ch) => ch.to))) problems.push({ edit, message: `no cited line contains \`${to}\`` });
+  }
+  return problems;
+}
+
+/**
+ * Check every citation against upstream: each cited line must exist,
+ * each changed name must appear on one of its edit's cited lines, and
+ * each cited line must support one of them. Edits whose changes or
+ * citations are malformed are left to checkEdits.
+ */
+export async function verifyEvidence(
+  skillMd: string,
+  edits: readonly SuppressEdit[],
+  ctx: EditContext,
+  resolveLine: LineResolver,
+): Promise<string[]> {
+  return formatProblems(await evidenceProblems(plan(skillMd, edits, ctx).checkable, resolveLine));
+}
+
+/**
+ * Validate the edits, structure and evidence together, and render the
+ * edited markdown when they all pass. All or nothing: one bad edit
+ * refuses the set.
+ */
+export async function validateEdits(
+  skillMd: string,
+  edits: readonly SuppressEdit[],
+  ctx: EditContext,
+  resolveLine: LineResolver,
+): Promise<EditOutcome> {
+  const p = plan(skillMd, edits, ctx);
+  const problems = formatProblems([...p.problems, ...(await evidenceProblems(p.checkable, resolveLine))]);
+  if (problems.length > 0) return { problems, skillMd: null };
+  return { problems, skillMd: render(p.doc, p.planned, ctx) };
+}
+
+/**
+ * Render the edits in suppress-and-add form. Throws when checkEdits
+ * finds a problem. It does not read upstream: call validateEdits (or
+ * verifyEvidence) first.
+ */
+export function applyEdits(skillMd: string, edits: readonly SuppressEdit[], ctx: EditContext): string {
+  const p = plan(skillMd, edits, ctx);
+  if (p.problems.length > 0) throw new Error(`edits refused: ${formatProblems(p.problems).join('; ')}`);
+  return render(p.doc, p.planned, ctx);
+}
