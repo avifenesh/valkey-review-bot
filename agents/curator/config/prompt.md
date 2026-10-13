@@ -110,7 +110,7 @@ Call `list_skill_authoring()` before writing any markdown. It returns the full r
 
 #### 2. Write the skill markdown
 
-**Length**: 50 to 250 lines, never more than 500. Most land at 80 to 150.
+**Length**: 50 to 250 lines, never more than 500 lines or 40,000 characters. Most land at 80 to 150.
 
 **Frontmatter (always)**:
 

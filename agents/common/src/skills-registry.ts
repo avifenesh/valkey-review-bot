@@ -23,6 +23,15 @@ import {
 /** Service limit on descriptor payload data. */
 export const SKILL_MD_MAX_CHARS = 102_400;
 
+/** Combined markdown budget for the graduated skills a reviewer loads into its system prompt. */
+export const GRADUATED_SKILLS_MAX_CHARS = 80_000;
+
+/**
+ * Largest skill markdown the curator may publish. It is half the
+ * reviewers' budget, so every published skill can be loaded.
+ */
+export const GRADUATED_SKILL_MAX_CHARS = 40_000;
+
 /** Statuses whose content must not reach a reviewer: still writing, failed, or retired. */
 const UNUSABLE_STATUSES: ReadonlySet<string> = new Set([
   'CREATING', 'CREATE_FAILED', 'UPDATE_FAILED', 'DEPRECATED', 'REJECTED',

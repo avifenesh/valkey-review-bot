@@ -2,6 +2,7 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 import { buildSubmitSkillTool, slugify, suffixedName, withRecordName } from '../dist/curator/src/tools/submit-skill.js';
 import { buildListSkillAuthoringTool } from '../dist/curator/src/tools/skill-authoring.js';
+import { GRADUATED_SKILL_MAX_CHARS, GRADUATED_SKILLS_MAX_CHARS } from '../dist/common/src/skills-registry.js';
 import { assertPlaceholdersMatch, conditionFailed, fakeDdb, newRun, parse } from './helpers.mjs';
 
 const INPUT = {
@@ -150,6 +151,19 @@ test('a failed registry lookup frees the slot', async () => {
   assert.match(out.error, /AccessDeniedException: denied/);
   assert.equal(published.length, 0);
   assert.equal(run.take('skill_submit', 'retry'), null);
+});
+
+test('submit_skill rejects markdown a reviewer could not load, before any store or registry call', async () => {
+  assert.ok(GRADUATED_SKILL_MAX_CHARS * 2 <= GRADUATED_SKILLS_MAX_CHARS, 'a submitted skill fits in the reviewers\' budget');
+  const { submit, ddb, published } = setup({ item: { area_bucket: 'src', record_id: 'r1', reinforcement_count: 4 } });
+  const head = INPUT.skill_md;
+  await assert.rejects(submit.invoke({ ...INPUT, skill_md: head + 'x'.repeat(GRADUATED_SKILL_MAX_CHARS - head.length + 1) }), /too_big|Too big/);
+  assert.equal(ddb.calls.length, 0);
+  assert.equal(published.length, 0);
+
+  const out = parse(await submit.invoke({ ...INPUT, skill_md: head + 'x'.repeat(GRADUATED_SKILL_MAX_CHARS - head.length) }));
+  assert.equal(out.ok, true);
+  assert.equal(published.length, 1);
 });
 
 test('withRecordName sets the frontmatter name and leaves the rest alone', () => {

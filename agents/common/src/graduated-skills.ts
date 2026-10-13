@@ -1,4 +1,4 @@
-import { createRegistryClient, loadSkills } from './skills-registry.js';
+import { createRegistryClient, GRADUATED_SKILLS_MAX_CHARS, loadSkills } from './skills-registry.js';
 
 /**
  * Load the reviewer's graduated skills from its AWS Agent Registry
@@ -34,9 +34,9 @@ export async function loadGraduatedSkills(opts: LoadGraduatedOpts): Promise<read
   // cannot hold up the review.
   const abortSignal = AbortSignal.timeout(timeoutMs);
   try {
-    const maxChars = opts.maxChars ?? 80_000;
+    const maxChars = opts.maxChars ?? GRADUATED_SKILLS_MAX_CHARS;
     const { skills, skipped } = await loadSkills(client, opts.registryId, limit, abortSignal, maxChars);
-    if (skipped > 0) console.warn(`[graduated-skills] loaded ${skills.length}; ${skipped} older skill(s) left out by the limits (${limit} skills, ${maxChars} characters)`);
+    if (skipped > 0) console.warn(`[graduated-skills] loaded ${skills.length}; ${skipped} skill(s) left out by the limits (${limit} skills, ${maxChars} characters)`);
     return skills;
   } catch (err) {
     console.warn(`[graduated-skills] registry load failed: ${err instanceof Error ? err.message : String(err)}`);

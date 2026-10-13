@@ -2,7 +2,7 @@ import { createHash } from 'node:crypto';
 import { z } from 'zod';
 import { tool } from '@strands-agents/sdk';
 import { UpdateCommand } from '@aws-sdk/lib-dynamodb';
-import { SKILL_MD_MAX_CHARS, type UpsertSkillInput } from '../../../common/src/skills-registry.js';
+import { GRADUATED_SKILL_MAX_CHARS, type UpsertSkillInput } from '../../../common/src/skills-registry.js';
 import { getRecord, type ConcernsDeps } from './concerns-ddb.js';
 import { errorText, fail, ok } from './run.js';
 
@@ -102,7 +102,7 @@ Inputs:
 - \`area_bucket\`, \`source_record_id\`: the record being graduated.
 - \`subject\`: 3-8 word title. If the record graduated before, its graduated_record_name is kept and that skill is updated. Otherwise the subject's slug becomes the registry record name, with a short suffix when another record's skill already has that name.
 - \`description\`: the imperative trigger sentence(s), the same text as the skill_md frontmatter description.
-- \`skill_md\`: the full SKILL.md, frontmatter included. The tool sets the frontmatter \`name\` to the record name it returns.
+- \`skill_md\`: the full SKILL.md, frontmatter included, at most ${GRADUATED_SKILL_MAX_CHARS} characters. The tool sets the frontmatter \`name\` to the record name it returns.
 
 Do not delete the source record afterwards; it stays as the skill's provenance.`,
     inputSchema: z.object({
@@ -110,7 +110,7 @@ Do not delete the source record afterwards; it stays as the skill's provenance.`
       source_record_id: z.string().min(1).max(100),
       subject: z.string().min(3).max(120),
       description: z.string().min(1).max(512),
-      skill_md: z.string().min(20).max(SKILL_MD_MAX_CHARS),
+      skill_md: z.string().min(20).max(GRADUATED_SKILL_MAX_CHARS),
     }),
     callback: async (input) => {
       const { run } = deps;

@@ -120,6 +120,7 @@ Failure to follow any of these produces a skill that misfires:
 
 - Target: 50 to 250 lines. Most graduations land at 80 to 150.
 - Hard ceiling: 500 lines. Above that, instructions get buried mid-body and the model ignores them.
+- `submit_skill` rejects markdown over 40,000 characters, frontmatter included.
 - A long skill earns its length only through institutional-memory density across many subsystems.
 
 ## Voice and citation
