@@ -1,10 +1,22 @@
 import assert from 'node:assert/strict';
 import { createHash } from 'node:crypto';
 import test from 'node:test';
-import { fetchRepoFile, gitBlobSha } from '../dist/curator/src/repo-skill-pr.js';
+import {
+  fetchRepoFile,
+  gitBlobSha,
+  insertionProblem,
+  proposeRepoSkillChange,
+  repoSkillBranch,
+} from '../dist/curator/src/repo-skill-pr.js';
+import { applyEdits } from '../dist/common/src/skill-check/edits.js';
 
 const REPO = 'valkey-io/valkey-review-bot';
 const PATH = 'agents/valkey-review/config/skill.md';
+const BRANCH = 'skill-check/valkey-review/9.1.2';
+const TOKEN = 'ghs_skills_repo_token_never_shown';
+const UPSTREAM_SHA = 'a'.repeat(40);
+const BOT = { name: 'skills-bot[bot]', email: '41898282+skills-bot[bot]@users.noreply.github.com' };
+
 const BASE = [
   '# Valkey PR Reviewer Skill',
   '',
@@ -15,21 +27,47 @@ const BASE = [
   '',
 ].join('\n');
 
+const CITATION = { repo: 'valkey-io/valkey', sha: UPSTREAM_SHA, path: 'src/server.h', line: 10 };
+const CTX = { flagged: ['emptyDB'], release: '9.1.2', date: '2026-10-13', upstream: { repo: 'valkey-io/valkey', sha: UPSTREAM_SHA } };
+
+function edited(base = BASE, from = '`emptyDB` must', to = '`emptyData` must', ctx = CTX) {
+  const original = base.split('\n').find((l) => l.includes(from));
+  return applyEdits(base, [{ original, replacement: original.replace(from, to), evidence: [CITATION] }], ctx);
+}
+
+const NEW = edited();
+
+function proposal(over = {}) {
+  return {
+    reviewerId: 'valkey-review',
+    releaseLabel: '9.1.2',
+    path: PATH,
+    baseSha: '',
+    baseContent: BASE,
+    newContent: NEW,
+    summary: '`emptyDB` is now `emptyData`.',
+    evidence: [`valkey-io/valkey@${UPSTREAM_SHA}:src/server.h:10`],
+    ...over,
+  };
+}
+
 const bytes = (content) => (Buffer.isBuffer(content) ? content : Buffer.from(content, 'utf8'));
 const blobId = (content) => {
   const b = bytes(content);
   return createHash('sha1').update(`blob ${b.length}\0`).update(b).digest('hex');
 };
-const json = (status, body) => new Response(JSON.stringify(body), { status });
+const json = (status, body) => new Response(body === undefined ? null : JSON.stringify(body), { status });
 
 /**
- * An in-memory GitHub repository behind fetch: the commits/{ref} SHA
- * lookup and raw.githubusercontent. Unknown calls fail the test.
+ * An in-memory GitHub repository behind fetch: refs, commits, trees,
+ * pull requests, the commits/{ref} SHA lookup and raw.githubusercontent.
+ * Unknown calls fail the test.
  */
 function fakeGitHub(files = { [PATH]: BASE, 'README.md': '# bot\n' }) {
   const trees = new Map();
   const commits = new Map();
   const refs = new Map();
+  const pulls = [];
   const calls = [];
   let seq = 0;
   const id = (kind) => createHash('sha1').update(`${kind}:${seq++}`).digest('hex');
@@ -41,8 +79,25 @@ function fakeGitHub(files = { [PATH]: BASE, 'README.md': '# bot\n' }) {
     commits.set(sha, { tree, parents, message });
     return sha;
   };
+  const ancestors = (sha) => {
+    const seen = new Set();
+    const stack = [sha];
+    while (stack.length) {
+      const s = stack.pop();
+      if (seen.has(s)) continue;
+      seen.add(s);
+      stack.push(...commits.get(s).parents);
+    }
+    return seen;
+  };
+
   const gh = {
     calls,
+    refs,
+    commits,
+    pulls,
+    filesAt,
+    beforeCreatePull: null,
     tip: (branch = 'main') => refs.get(`heads/${branch}`),
     /** Commit `changes` on `branch` and move the branch. */
     commitOn(branch, changes, { message = 'Change something' } = {}) {
@@ -52,10 +107,12 @@ function fakeGitHub(files = { [PATH]: BASE, 'README.md': '# bot\n' }) {
       refs.set(`heads/${branch}`, sha);
       return sha;
     },
+    writes: () => calls.filter((c) => c.method !== 'GET'),
     async fetch(url, init = {}) {
       const method = init.method ?? 'GET';
+      const body = init.body ? JSON.parse(init.body) : undefined;
       const u = new URL(url);
-      calls.push({ method, host: u.host, path: u.pathname + u.search, headers: init.headers ?? {} });
+      calls.push({ method, host: u.host, path: u.pathname + u.search, headers: init.headers ?? {}, body });
       if (u.host === 'raw.githubusercontent.com') {
         const [, owner, name, sha, ...rest] = u.pathname.split('/');
         const file = `${owner}/${name}` === REPO && commits.has(sha) ? filesAt(sha)[rest.map(decodeURIComponent).join('/')] : undefined;
@@ -71,11 +128,100 @@ function fakeGitHub(files = { [PATH]: BASE, 'README.md': '# bot\n' }) {
         const sha = refs.get(`heads/${m[1]}`) ?? (commits.has(m[1]) ? m[1] : null);
         return sha ? new Response(sha, { status: 200 }) : json(404, { message: 'No commit found' });
       }
+      if (method === 'GET' && (m = /^git\/ref\/heads\/(.+)$/.exec(rest))) {
+        const sha = refs.get(`heads/${m[1]}`);
+        return sha ? json(200, { ref: `refs/heads/${m[1]}`, object: { sha, type: 'commit' } }) : json(404, { message: 'Not Found' });
+      }
+      if (method === 'GET' && (m = /^contents\/(.+)$/.exec(rest))) {
+        const at = u.searchParams.get('ref');
+        const file = commits.has(at) ? filesAt(at)[m[1]] : undefined;
+        return file === undefined ? json(404, { message: 'Not Found' }) : json(200, { type: 'file', path: m[1], sha: blobId(file) });
+      }
+      if (method === 'GET' && (m = /^git\/commits\/([0-9a-f]{40})$/.exec(rest))) {
+        const c = commits.get(m[1]);
+        return c ? json(200, { sha: m[1], tree: { sha: c.tree } }) : json(404, { message: 'Not Found' });
+      }
+      if (method === 'POST' && rest === 'git/trees') {
+        const tree = new Map(trees.get(body.base_tree));
+        for (const entry of body.tree) {
+          assert.deepEqual([entry.mode, entry.type], ['100644', 'blob']);
+          tree.set(entry.path, entry.content);
+        }
+        const sha = id('tree');
+        trees.set(sha, tree);
+        return json(201, { sha });
+      }
+      if (method === 'POST' && rest === 'git/commits') {
+        assert.ok(trees.has(body.tree));
+        const sha = id('commit');
+        commits.set(sha, { tree: body.tree, parents: body.parents, message: body.message });
+        return json(201, { sha, message: body.message, author: { ...BOT, date: '2026-10-13T00:00:00Z' } });
+      }
+      if (method === 'POST' && rest === 'git/refs') {
+        const ref = body.ref.replace(/^refs\//, '');
+        if (refs.has(ref)) return json(422, { message: 'Reference already exists' });
+        refs.set(ref, body.sha);
+        return json(201, { ref: body.ref, object: { sha: body.sha } });
+      }
+      if (method === 'PATCH' && (m = /^git\/refs\/(heads\/.+)$/.exec(rest))) {
+        if (!refs.has(m[1])) return json(422, { message: 'Reference does not exist' });
+        assert.equal(body.force, true);
+        refs.set(m[1], body.sha);
+        return json(200, { ref: `refs/${m[1]}`, object: { sha: body.sha } });
+      }
+      if (method === 'GET' && (m = /^compare\/([0-9a-f]{40})\.\.\.([0-9a-f]{40})$/.exec(rest))) {
+        const inBase = ancestors(m[1]);
+        const ahead = [...ancestors(m[2])].filter((s) => !inBase.has(s));
+        const mergeBase = [...ancestors(m[2])].find((s) => inBase.has(s));
+        const from = mergeBase ? filesAt(mergeBase) : {};
+        const to = filesAt(m[2]);
+        const changed = [...new Set([...Object.keys(from), ...Object.keys(to)])].filter((f) => from[f] !== to[f]);
+        return json(200, {
+          ahead_by: ahead.length,
+          commits: ahead.reverse().map((s) => ({ sha: s, commit: { message: commits.get(s).message } })),
+          files: changed.map((filename) => ({ filename })),
+        });
+      }
+      if (method === 'GET' && rest === 'pulls') {
+        assert.equal(u.searchParams.get('state'), 'open');
+        const [owner, branch] = u.searchParams.get('head').split(/:(.*)/s);
+        assert.equal(owner, 'valkey-io');
+        return json(200, pulls.filter((p) => p.state === 'open' && p.head.ref === branch));
+      }
+      if (method === 'POST' && rest === 'pulls') {
+        gh.beforeCreatePull?.();
+        if (pulls.some((p) => p.state === 'open' && p.head.ref === body.head)) {
+          return json(422, { message: 'Validation Failed', errors: [{ message: `A pull request already exists for valkey-io:${body.head}.` }] });
+        }
+        const number = pulls.length + 1;
+        const pr = { number, state: 'open', html_url: `https://github.com/${REPO}/pull/${number}`, head: { ref: body.head }, base: { ref: body.base }, title: body.title, body: body.body };
+        pulls.push(pr);
+        return json(201, pr);
+      }
+      if (method === 'PATCH' && (m = /^pulls\/(\d+)$/.exec(rest))) {
+        const pr = pulls.find((p) => p.number === Number(m[1]));
+        Object.assign(pr, body);
+        return json(200, pr);
+      }
       throw new Error(`unexpected GitHub call ${method} ${rest}`);
     },
   };
   gh.commitOn('main', files, { message: 'Initial commit' });
   return gh;
+}
+
+function deps(gh, over = {}) {
+  let tokens = 0;
+  const d = {
+    repo: REPO,
+    baseBranch: 'main',
+    getToken: async () => { tokens++; return TOKEN; },
+    fetch: gh.fetch,
+    now: () => new Date('2026-10-13T08:00:00Z'),
+    ...over,
+  };
+  Object.defineProperty(d, 'tokens', { get: () => tokens });
+  return d;
 }
 
 const NO_GITHUB = { async fetch(url) { throw new Error(`unexpected fetch ${url}`); } };
@@ -84,6 +230,291 @@ test('gitBlobSha is git\'s blob id', () => {
   assert.equal(gitBlobSha(''), 'e69de29bb2d1d6434b8b29ae775ad8c2e48c5391');
   assert.equal(gitBlobSha('hello\n'), 'ce013625030ba8dba906f756967f9e9ca394464a');
   assert.equal(gitBlobSha('é\n'), blobId('é\n'));
+});
+
+test('the branch is skill-check/<reviewer>/<release>, with the release made safe for a ref', () => {
+  assert.equal(repoSkillBranch('valkey-review', '9.1.2'), BRANCH);
+  assert.equal(repoSkillBranch('valkey-glide-review', 'v2.5.3'), 'skill-check/valkey-glide-review/v2.5.3');
+  assert.equal(repoSkillBranch('valkey-review', 'unstable@0123456789ab'), 'skill-check/valkey-review/unstable-0123456789ab');
+  assert.equal(repoSkillBranch('valkey-review', 'release/9.0@0123456789ab'), 'skill-check/valkey-review/release-9.0-0123456789ab');
+});
+
+test('opens a pull request with one signed-off commit on the base tip', async () => {
+  const gh = fakeGitHub();
+  const tip = gh.tip();
+  const d = deps(gh);
+  const result = await proposeRepoSkillChange(proposal({ baseSha: tip }), d);
+  assert.deepEqual(result, { action: 'opened', branch: BRANCH, url: `https://github.com/${REPO}/pull/1` });
+
+  const head = gh.tip(BRANCH);
+  const commit = gh.commits.get(head);
+  assert.deepEqual(commit.parents, [tip]);
+  assert.deepEqual(gh.filesAt(head), { [PATH]: NEW, 'README.md': '# bot\n' });
+  assert.equal(gh.tip(), tip);
+  const lines = commit.message.split('\n');
+  assert.equal(lines[0], 'Supersede stale facts in the valkey-review skill for 9.1.2');
+  assert.equal(lines[1], '');
+  assert.ok(lines.every((l) => l.length <= 72 || /^(- |Signed-off-by: )/.test(l)), commit.message);
+  assert.match(commit.message, /\n\n`emptyDB` is now `emptyData`\.\n\nEvidence:\n- valkey-io\/valkey@a{40}:src\/server\.h:10\n\n/);
+  // No signOff configured: the DCO line is the App bot GitHub authors the commit as.
+  assert.equal(lines.at(-1), `Signed-off-by: ${BOT.name} <${BOT.email}>`);
+
+  assert.equal(gh.pulls.length, 1);
+  const pr = gh.pulls[0];
+  assert.deepEqual([pr.title, pr.head.ref, pr.base.ref], [lines[0], BRANCH, 'main']);
+  assert.match(pr.body, /`emptyDB` is now `emptyData`\./);
+  assert.match(pr.body, new RegExp(`- \\[\`valkey-io/valkey@a{12}:src/server\\.h:10\`\\]\\(https://github\\.com/valkey-io/valkey/blob/a{40}/src/server\\.h#L10\\)`));
+  assert.match(pr.body, /release check of 2026-10-13/);
+
+  // Every GitHub call carries the broker's token; it is fetched once.
+  assert.equal(d.tokens, 1);
+  assert.ok(gh.calls.every((c) => c.headers.Authorization === `Bearer ${TOKEN}`));
+  assert.ok(gh.writes().every((c) => !JSON.stringify(c).includes('heads/main')));
+});
+
+test('evidence that is not a citation is shown as code, whatever backticks it holds', async () => {
+  const gh = fakeGitHub();
+  const evidence = [`valkey-io/valkey@${UPSTREAM_SHA}:src/server.h:10`, 'src/server.h: `emptyData(int dbnum, int flags)`'];
+  await proposeRepoSkillChange(proposal({ baseSha: gh.tip(), evidence }), deps(gh));
+  const body = gh.pulls[0].body;
+  assert.match(body, /\n- \[`valkey-io\/valkey@a{12}:src\/server\.h:10`\]\(/);
+  // CommonMark strips one space from each end of a padded span.
+  assert.ok(body.includes('\n- `` src/server.h: `emptyData(int dbnum, int flags)` ``\n'), body);
+  assert.ok(gh.commits.get(gh.tip(BRANCH)).message.includes('\n- src/server.h: `emptyData(int dbnum, int flags)`\n'));
+});
+
+test('a configured signOff is the DCO line, and no probe commit is made', async () => {
+  const gh = fakeGitHub();
+  await proposeRepoSkillChange(proposal({ baseSha: gh.tip() }), deps(gh, { signOff: 'Valkey Bot Operator <ops@example.com>' }));
+  assert.equal(gh.writes().filter((c) => c.path.endsWith('/git/commits')).length, 1);
+  assert.equal(gh.commits.get(gh.tip(BRANCH)).message.split('\n').at(-1), 'Signed-off-by: Valkey Bot Operator <ops@example.com>');
+});
+
+test('a retry after success changes nothing', async () => {
+  const gh = fakeGitHub();
+  const p = proposal({ baseSha: gh.tip() });
+  await proposeRepoSkillChange(p, deps(gh));
+  const before = gh.writes().length;
+  const head = gh.tip(BRANCH);
+  assert.deepEqual(await proposeRepoSkillChange(p, deps(gh)), { action: 'unchanged', branch: BRANCH, url: `https://github.com/${REPO}/pull/1` });
+  assert.equal(gh.writes().length, before);
+  assert.equal(gh.tip(BRANCH), head);
+  assert.equal(gh.pulls.length, 1);
+});
+
+test('a retry after the branch was pushed but no pull request opened only opens it', async () => {
+  const gh = fakeGitHub();
+  const p = proposal({ baseSha: gh.tip() });
+  gh.beforeCreatePull = () => { throw new Error('crash before the pull request'); };
+  await assert.rejects(proposeRepoSkillChange(p, deps(gh)), /crash before the pull request/);
+  gh.beforeCreatePull = null;
+  const head = gh.tip(BRANCH);
+  const before = gh.writes().length;
+  assert.equal((await proposeRepoSkillChange(p, deps(gh))).action, 'opened');
+  assert.equal(gh.tip(BRANCH), head);
+  assert.deepEqual(gh.writes().slice(before).map((c) => `${c.method} ${c.path}`), [`POST /repos/${REPO}/pulls`]);
+});
+
+test('a pull request another attempt opened meanwhile is reused', async () => {
+  const gh = fakeGitHub();
+  gh.beforeCreatePull = () => {
+    gh.pulls.push({ number: 7, state: 'open', html_url: `https://github.com/${REPO}/pull/7`, head: { ref: BRANCH }, base: { ref: 'main' } });
+  };
+  const result = await proposeRepoSkillChange(proposal({ baseSha: gh.tip() }), deps(gh));
+  // This attempt pushed the branch, so it also brings the pull request's text up to date.
+  assert.deepEqual(result, { action: 'updated', branch: BRANCH, url: `https://github.com/${REPO}/pull/7` });
+  assert.equal(gh.pulls.length, 1);
+  assert.equal(gh.pulls[0].title, 'Supersede stale facts in the valkey-review skill for 9.1.2');
+});
+
+test('new edits for the same release rebuild the branch and update the open pull request', async () => {
+  const gh = fakeGitHub();
+  const tip = gh.tip();
+  await proposeRepoSkillChange(proposal({ baseSha: tip }), deps(gh));
+  const more = edited(NEW, '`rdbLoad*` caller', '`rdbLoadAll*` caller', { ...CTX, flagged: ['rdbLoad*'] });
+  const result = await proposeRepoSkillChange(proposal({
+    baseSha: tip,
+    newContent: more,
+    summary: '`emptyDB` is now `emptyData`; `rdbLoad*` is now `rdbLoadAll*`.',
+  }), deps(gh));
+  assert.deepEqual(result, { action: 'updated', branch: BRANCH, url: `https://github.com/${REPO}/pull/1` });
+  const head = gh.tip(BRANCH);
+  // Still one commit on the base tip, now with both edits.
+  assert.deepEqual(gh.commits.get(head).parents, [tip]);
+  assert.equal(gh.filesAt(head)[PATH], more);
+  assert.equal(gh.pulls.length, 1);
+  assert.match(gh.pulls[0].body, /`rdbLoad\*` is now `rdbLoadAll\*`/);
+  assert.deepEqual(gh.writes().filter((c) => c.method === 'PATCH').map((c) => c.path),
+    [`/repos/${REPO}/git/refs/heads/skill-check/valkey-review/9.1.2`, `/repos/${REPO}/pulls/1`]);
+});
+
+test('commits a maintainer added to the branch are never overwritten', async () => {
+  const more = edited(NEW, '`rdbLoad*` caller', '`rdbLoadAll*` caller', { ...CTX, flagged: ['rdbLoad*'] });
+  const cases = {
+    'a fixup commit on top': (gh) => gh.commitOn(BRANCH, { [PATH]: `${NEW}fixup\n` }),
+    'a commit with another title': (gh) => {
+      gh.refs.set(`heads/${BRANCH}`, gh.tip());
+      gh.commitOn(BRANCH, { [PATH]: `${NEW}x\n` }, { message: 'Hand-written skill update' });
+    },
+    'a commit that touches another file': (gh) => {
+      gh.refs.set(`heads/${BRANCH}`, gh.tip());
+      gh.commitOn(BRANCH, { [PATH]: `${NEW}x\n`, 'README.md': 'changed\n' }, { message: 'Supersede stale facts in the valkey-review skill for 9.1.2' });
+    },
+  };
+  for (const [name, arrange] of Object.entries(cases)) {
+    const gh = fakeGitHub();
+    const p = proposal({ baseSha: gh.tip() });
+    if (name === 'a fixup commit on top') await proposeRepoSkillChange(p, deps(gh));
+    arrange(gh);
+    const head = gh.tip(BRANCH);
+    const before = gh.writes().length;
+    const result = await proposeRepoSkillChange({ ...p, newContent: more }, deps(gh));
+    assert.equal(result.action, 'refused', name);
+    assert.match(result.reason, /has commits the release check did not make/, name);
+    assert.equal(gh.tip(BRANCH), head, name);
+    assert.equal(gh.writes().length, before, name);
+  }
+});
+
+test('a stale branch the check left behind is rebuilt on the base tip', async () => {
+  const gh = fakeGitHub();
+  // A branch at an old base commit with nothing of its own, as after a merge.
+  gh.refs.set(`heads/${BRANCH}`, gh.tip());
+  gh.commitOn('main', { 'README.md': 'newer\n' });
+  const tip = gh.tip();
+  assert.equal((await proposeRepoSkillChange(proposal({ baseSha: tip }), deps(gh))).action, 'opened');
+  assert.deepEqual(gh.commits.get(gh.tip(BRANCH)).parents, [tip]);
+});
+
+test('when the base moved but the skill did not, the commit is built on the new tip', async () => {
+  const gh = fakeGitHub();
+  const baseSha = gh.tip();
+  const tip = gh.commitOn('main', { 'README.md': 'newer\n' });
+  assert.equal((await proposeRepoSkillChange(proposal({ baseSha }), deps(gh))).action, 'opened');
+  const head = gh.tip(BRANCH);
+  assert.deepEqual(gh.commits.get(head).parents, [tip]);
+  assert.deepEqual(gh.filesAt(head), { [PATH]: NEW, 'README.md': 'newer\n' });
+});
+
+test('when the skill changed on the base since baseSha, nothing is written', async () => {
+  const gh = fakeGitHub();
+  const baseSha = gh.tip();
+  const tip = gh.commitOn('main', { [PATH]: `${BASE}- A maintainer's new rule.\n` });
+  const result = await proposeRepoSkillChange(proposal({ baseSha }), deps(gh));
+  assert.deepEqual(result, {
+    action: 'base-moved',
+    branch: BRANCH,
+    reason: `main moved from ${baseSha.slice(0, 12)} to ${tip.slice(0, 12)} and ${PATH} changed since`,
+  });
+  assert.deepEqual(gh.writes(), []);
+});
+
+test('base content that is not the file at baseSha is refused', async () => {
+  const gh = fakeGitHub();
+  const result = await proposeRepoSkillChange(proposal({ baseSha: gh.tip(), baseContent: `${BASE}\n`, newContent: `${NEW}\n` }), deps(gh));
+  assert.deepEqual(result, { action: 'refused', branch: BRANCH, reason: `the base content is not ${PATH} at ${gh.tip()}` });
+  assert.deepEqual(gh.writes(), []);
+});
+
+test('only the reviewer\'s own repo skill file can be proposed', async () => {
+  const paths = [
+    'agents/valkey-glide-review/config/skill.md',
+    'agents/valkey-review/config/prompt.md',
+    'agents/valkey-review/config/../config/skill.md',
+    '/agents/valkey-review/config/skill.md',
+    'agents/valkey-review/config/skill.md/',
+    '.github/workflows/ci.yml',
+    'README.md',
+  ];
+  for (const path of paths) {
+    const d = deps(NO_GITHUB);
+    const result = await proposeRepoSkillChange(proposal({ baseSha: 'b'.repeat(40), path }), d);
+    assert.equal(result.action, 'refused', path);
+    assert.match(result.reason, /only agents\/valkey-review\/config\/skill\.md can be proposed/, path);
+    assert.equal(d.tokens, 0, path);
+  }
+  for (const reviewerId of ['../valkey-review', 'Valkey-Review', '', 'a/b']) {
+    const result = await proposeRepoSkillChange(proposal({ baseSha: 'b'.repeat(40), reviewerId, path: `agents/${reviewerId}/config/skill.md` }), deps(NO_GITHUB));
+    assert.deepEqual([result.action, result.branch], ['refused', ''], reviewerId);
+  }
+});
+
+test('anything but suppress-and-add insertions for the release is refused before GitHub is called', async () => {
+  const inPlace = BASE.replace('`emptyDB` must', '`emptyData` must');
+  const cases = {
+    'an in-place change': [inPlace, /line 5 of the new content is neither in the base content/],
+    'a dropped line': [`${NEW.replace('Skip unless: the PR touches an `rdbLoad*` caller.\n', '')}`, /drops lines of the base content|neither in the base/],
+    'the same content': [BASE, /the same as the base content/],
+    'a marker for another release': [edited(BASE, '`emptyDB` must', '`emptyData` must', { ...CTX, release: '9.0.6' }), /names 9\.0\.6, not 9\.1\.2/],
+    'an unclosed marker': [NEW.replace('<!-- /suppressed -->\n', ''), /malformed suppression markers/],
+    'a changed suppressed piece': [NEW.replace('Reviewer memory: `emptyDB` must respect', 'Reviewer memory: `emptyDB` should respect'), /does not keep the base content's lines|neither in the base/],
+    'an added line after the replacement': [NEW.replace('Skip unless:', 'Always flag everything.\nSkip unless:'), /neither in the base content/],
+    'a dropped last line': [NEW.replace(/\n$/, ''), /drops lines of the base content/],
+  };
+  for (const [name, [newContent, reason]] of Object.entries(cases)) {
+    const d = deps(NO_GITHUB);
+    const result = await proposeRepoSkillChange(proposal({ baseSha: 'b'.repeat(40), newContent }), d);
+    assert.equal(result.action, 'refused', name);
+    assert.match(result.reason, reason, name);
+    assert.equal(d.tokens, 0, name);
+  }
+});
+
+test('a malformed summary, evidence, release or base SHA is refused', async () => {
+  const cases = {
+    'no evidence': [{ evidence: [] }, /evidence must hold 1 to 100 entries/],
+    'evidence on two lines': [{ evidence: ['a\nb'] }, /not one line/],
+    'an empty summary': [{ summary: '  ' }, /the summary is empty/],
+    'a summary with a control character': [{ summary: 'x\u001b[31m' }, /control characters/],
+    'a release that is not a label': [{ releaseLabel: 'latest' }, /is not a GA tag/],
+    'a short base SHA': [{ baseSha: 'abc123' }, /baseSha is not a full commit SHA/],
+  };
+  for (const [name, [over, reason]] of Object.entries(cases)) {
+    const result = await proposeRepoSkillChange(proposal({ baseSha: 'b'.repeat(40), ...over }), deps(NO_GITHUB));
+    assert.equal(result.action, 'refused', name);
+    assert.match(result.reason, reason, name);
+  }
+});
+
+test('the base branch is never the branch written', async () => {
+  const result = await proposeRepoSkillChange(proposal({ baseSha: 'b'.repeat(40) }), deps(NO_GITHUB, { baseBranch: BRANCH }));
+  assert.deepEqual([result.action, result.reason], ['refused', `cannot use branch "${BRANCH}"`]);
+});
+
+test('malformed configuration throws', async () => {
+  for (const over of [{ repo: 'valkey-review-bot' }, { repo: 'a/b/c' }, { baseBranch: '' }, { baseBranch: 'a..b' }, { signOff: 'no email' }, { signOff: 'Name <a@b>\nSigned-off-by: x <y@z>' }]) {
+    await assert.rejects(proposeRepoSkillChange(proposal({ baseSha: 'b'.repeat(40) }), deps(NO_GITHUB, over)), /skills repo|base branch|signOff/, JSON.stringify(over));
+  }
+});
+
+test('a GitHub error fails the proposal with its status and message, never the token', async () => {
+  const gh = fakeGitHub();
+  const inner = gh.fetch;
+  const fetch = async (url, init = {}) => (String(url).endsWith('/git/trees')
+    ? json(403, { message: 'Resource not accessible by integration' })
+    : inner(url, init));
+  await assert.rejects(proposeRepoSkillChange(proposal({ baseSha: gh.tip() }), deps(gh, { fetch })), (err) => {
+    assert.equal(err.message, 'POST git/trees returned 403: Resource not accessible by integration');
+    assert.ok(!err.message.includes(TOKEN));
+    return true;
+  });
+  assert.equal(gh.tip(BRANCH), undefined);
+});
+
+test('applyEdits output, also next to an earlier suppressed block, passes the insertion check', () => {
+  assert.equal(insertionProblem(BASE, NEW, '9.1.2'), null);
+  const later = edited(NEW, '`rdbLoad*` caller', '`rdbLoadAll*` caller', { ...CTX, release: '9.2.0', flagged: ['rdbLoad*'] });
+  assert.equal(insertionProblem(NEW, later, '9.2.0'), null);
+  const crlf = BASE.replaceAll('\n', '\r\n');
+  assert.equal(insertionProblem(crlf, edited(crlf), '9.1.2'), null);
+  assert.match(insertionProblem(BASE, later, '9.1.2'), /names 9\.2\.0, not 9\.1\.2|names 9\.1\.2/);
+});
+
+test('a replacement that is itself a suppressed block is refused', () => {
+  const open = NEW.split('\n').find((l) => l.startsWith('<!-- suppressed:'));
+  const base = ['# T', '', 'a `emptyDB`', 'b `emptyDB`', 'c `emptyDB`', ''].join('\n');
+  const next = ['# T', '', open, 'a `emptyDB`', 'b `emptyDB`', 'c `emptyDB`', '<!-- /suppressed -->', open, 'x `emptyData`', '<!-- /suppressed -->', ''].join('\n');
+  assert.match(insertionProblem(base, next, '9.1.2'), /the replacement after the suppressed block at line 3 holds a marker/);
 });
 
 test('fetchRepoFile resolves a branch to its commit anonymously and reads the file there', async () => {
