@@ -1,0 +1,29 @@
+# Keep the build context small so CDK asset hashing is tight and
+# `docker build` doesn't stream the whole repo to the daemon.
+*
+!agents/common/package.json
+!agents/common/package-lock.json
+!agents/common/tsconfig.json
+!agents/common/src
+!agents/common/src/**
+
+!agents/valkey-review/Dockerfile
+!agents/valkey-review/package.json
+!agents/valkey-review/package-lock.json
+!agents/valkey-review/tsconfig.json
+!agents/valkey-review/src
+!agents/valkey-review/src/**
+
+!agents/valkey-glide-review/Dockerfile
+!agents/valkey-glide-review/package.json
+!agents/valkey-glide-review/package-lock.json
+!agents/valkey-glide-review/tsconfig.json
+!agents/valkey-glide-review/src
+!agents/valkey-glide-review/src/**
+
+!agents/curator/Dockerfile
+!agents/curator/package.json
+!agents/curator/package-lock.json
+!agents/curator/tsconfig.json
+!agents/curator/src
+!agents/curator/src/**
