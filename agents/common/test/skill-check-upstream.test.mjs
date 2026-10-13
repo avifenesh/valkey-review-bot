@@ -45,9 +45,43 @@ function makeUpstream() {
   w('add', '-A');
   w('commit', '-q', '-m', 'tip');
   const tipSha = w('rev-parse', 'HEAD');
+  // A commit the checkout never fetches.
+  w('checkout', '-q', '-b', 'side', baseSha);
+  writeFileSync(path.join(work, 'src', 'side.c'), 'int side;\n');
+  w('add', '-A');
+  w('commit', '-q', '-m', 'side');
+  const sideSha = w('rev-parse', 'HEAD');
   w('remote', 'add', 'origin', bare);
-  w('push', '-q', 'origin', 'unstable', 'release-1.0');
-  return { root, url: `file://${bare}`, baseSha, tipSha };
+  w('push', '-q', 'origin', 'unstable', 'release-1.0', 'side');
+  return { root, url: `file://${bare}`, baseSha, tipSha, sideSha };
+}
+
+const REAL_GIT = execFileSync('sh', ['-c', 'command -v git'], { encoding: 'utf8' }).trim();
+
+/**
+ * An environment whose `git` drops GIT_NO_LAZY_FETCH, as git before 2.44
+ * ignores it, and fails (mode 'fail') or stalls (mode 'stall') any fetch
+ * that names `base`.
+ */
+function oldGitEnv(root, base, mode) {
+  const bin = path.join(root, 'bin');
+  mkdirSync(bin);
+  writeFileSync(path.join(bin, 'git'), [
+    '#!/bin/sh',
+    'unset GIT_NO_LAZY_FETCH',
+    'if [ "$1" = fetch ]; then',
+    '  for a in "$@"; do',
+    '    if [ "$a" = "$SKC_BASE" ]; then',
+    '      [ "$SKC_MODE" = stall ] && exec sleep 30',
+    '      echo "fatal: simulated network failure" >&2',
+    '      exit 128',
+    '    fi',
+    '  done',
+    'fi',
+    'exec "$SKC_REAL_GIT" "$@"',
+    '',
+  ].join('\n'), { mode: 0o755 });
+  return { ...upstreamGitEnv(), PATH: `${bin}:${process.env.PATH}`, SKC_BASE: base, SKC_MODE: mode, SKC_REAL_GIT: REAL_GIT };
 }
 
 test('the checkout finds the default branch, fetches tip and base at depth 1 and detaches at the tip', async () => {
@@ -65,17 +99,45 @@ test('the checkout finds the default branch, fetches tip and base at depth 1 and
   assert.equal(existsSync(path.join(dir, 'src', 'old.c')), false);
   assert.equal(g('rev-list', '--count', 'HEAD'), '1', 'depth 1');
   assert.deepEqual(readFileSync(path.join(dir, '.git', 'shallow'), 'utf8').trim().split('\n').sort(), [up.baseSha, up.tipSha].sort());
-  // The base came without blobs: its own files are missing until something asks for them.
-  const missing = execFileSync('git', ['rev-list', '--objects', '--missing=print', up.baseSha], {
-    cwd: dir, env: { ...cleanEnv, GIT_NO_LAZY_FETCH: '1' }, encoding: 'utf8',
-  });
-  assert.match(missing, /^\?[0-9a-f]{40}$/m);
-  assert.equal(g('config', 'remote.origin.promisor'), 'true');
-  assert.equal(g('config', 'remote.origin.partialclonefilter'), 'blob:none');
   assert.equal(existsSync(path.join(dir, '.git', 'hooks')), false, 'no template hooks');
+
+  // The base's blobs of the changed files came in their batch, so the diff works.
+  const diff = await co.git(['diff', '--no-color', up.baseSha, up.tipSha, '--']);
+  assert.equal(diff.code, 0, diff.stderr);
+  assert.match(diff.stdout, /^-void emptyDB\(int flags\) \{$/m);
+  assert.match(diff.stdout, /^-int removed_later = 1;$/m);
+
+  // No longer a partial clone: a missing object is an error, not a fetch.
+  for (const key of ['remote.origin.promisor', 'remote.origin.partialclonefilter', 'extensions.partialClone']) {
+    assert.equal((await co.git(['config', '--get', key])).code, 1, key);
+  }
+  assert.notEqual((await co.git(['cat-file', '-e', `${up.sideSha}^{commit}`])).code, 0, 'the side commit was fetched');
+  assert.notEqual((await co.git(['rev-list', '-n', '1', 'HEAD~1'])).code, 0, 'history past depth 1 was fetched');
 
   // The runner it returns works in the checkout.
   assert.equal((await co.git(['rev-parse', 'HEAD'])).stdout.trim(), up.tipSha);
+  await removeCheckout(up.root);
+});
+
+test('a failed base fetch gives baseAvailable false even where git ignores GIT_NO_LAZY_FETCH', async () => {
+  const up = makeUpstream();
+  const env = oldGitEnv(up.root, up.baseSha, 'fail');
+  const co = await prepareUpstreamCheckout({ dir: path.join(up.root, 'checkout'), url: up.url, verifiedSha: up.baseSha, env });
+  assert.equal(co.baseAvailable, false);
+  assert.equal(co.tipSha, up.tipSha);
+  // The same old git does not fetch the base when asked for it later.
+  assert.notEqual((await co.git(['cat-file', '-e', `${up.baseSha}^{commit}`])).code, 0);
+  await removeCheckout(up.root);
+});
+
+test('a base fetch that stalls times out to baseAvailable false and the checkout still succeeds', { timeout: 20_000 }, async () => {
+  const up = makeUpstream();
+  const env = oldGitEnv(up.root, up.baseSha, 'stall');
+  const started = Date.now();
+  const co = await prepareUpstreamCheckout({ dir: path.join(up.root, 'checkout'), url: up.url, verifiedSha: up.baseSha, env, baseTimeoutMs: 500 });
+  assert.ok(Date.now() - started < 10_000);
+  assert.equal(co.baseAvailable, false);
+  assert.equal(gitIn(path.join(up.root, 'checkout'))('rev-parse', 'HEAD'), up.tipSha);
   await removeCheckout(up.root);
 });
 

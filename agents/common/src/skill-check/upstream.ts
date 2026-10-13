@@ -6,12 +6,17 @@ import type { Citation, LineResolver } from './edits.js';
 /**
  * A checkout of a public upstream repository for the release check.
  *
- * A fresh `git init` that fetches one branch tip (and the commit of the
- * last check) with depth 1 and no blobs, then checks the tip out, which
- * fetches the tip's blobs in one batch. The repository is new, so it has
- * no hooks, and git reads no system or global config and gets no
- * credentials. Nothing here talks to the network except git itself, on
- * the URL the caller gives.
+ * A fresh `git init` that fetches one branch tip with depth 1 and no
+ * blobs and checks it out, which fetches the tip's blobs in one batch.
+ * Then, best effort, the commit of the last check (depth 1, no blobs)
+ * and, in one more batch, its blobs of the files that changed since, so
+ * `git diff <base> <tip>` works. After that the repository stops being a
+ * partial clone: a missing object is an error, never a fetch. This does
+ * not rely on GIT_NO_LAZY_FETCH, which git before 2.44 ignores.
+ *
+ * The repository is new, so it has no hooks, and git reads no system or
+ * global config and gets no credentials. Nothing here talks to the
+ * network except git itself, on the URL the caller gives.
  *
  * No runtime relative imports, so scripts can load this file directly
  * under Node's type stripping.
@@ -38,6 +43,8 @@ export interface GitCallOptions {
 export type GitRunner = (args: readonly string[], opts?: GitCallOptions) => Promise<GitResult>;
 
 const GIT_TIMEOUT_MS = 10 * 60_000;
+/** Each best-effort step for the base: its fetch and its blob batch. */
+const BASE_TIMEOUT_MS = 3 * 60_000;
 const GIT_MAX_BYTES = 64 * 1024 * 1024;
 const FILE_MAX_BYTES = 16 * 1024 * 1024;
 
@@ -109,6 +116,8 @@ export interface PrepareOptions {
   readonly branch?: string;
   /** Environment for git. Default upstreamGitEnv(). */
   readonly env?: NodeJS.ProcessEnv;
+  /** Timeout of each best-effort base step. Default 3 minutes. */
+  readonly baseTimeoutMs?: number;
 }
 
 export interface UpstreamCheckout {
@@ -116,9 +125,13 @@ export interface UpstreamCheckout {
   readonly defaultBranch: string;
   /** The commit checked out, detached. */
   readonly tipSha: string;
-  /** verifiedSha is present locally and can be diffed against the tip. */
+  /**
+   * verifiedSha was fetched, with its blobs of the files changed since,
+   * so it can be diffed against the tip. False when it was not asked for,
+   * is not a full SHA, or its fetch failed, timed out or could not start.
+   */
   readonly baseAvailable: boolean;
-  /** A runner in the checkout, with the same environment. */
+  /** A runner in the checkout, with the same environment. The checkout is no longer a partial clone. */
   readonly git: GitRunner;
 }
 
@@ -145,11 +158,21 @@ function parseLsRemote(out: string): { head: string | null; refs: Map<string, st
   return { head, refs };
 }
 
+/** Run a best-effort git step: true when it exits 0, false on any failure, timeout or spawn error. */
+async function tryRun(git: GitRunner, args: readonly string[], timeoutMs: number): Promise<boolean> {
+  try {
+    return (await git(args, { timeoutMs })).code === 0;
+  } catch {
+    return false;
+  }
+}
+
 /**
  * Create the checkout: init, register origin as a promisor remote with
  * blob:none, find the branch and its tip with ls-remote, fetch the tip
- * and (best effort) verifiedSha at depth 1 without blobs, then check out
- * the tip detached.
+ * at depth 1 without blobs and check it out detached. Then, best effort,
+ * fetch verifiedSha the same way and its blobs of the changed files.
+ * Last, drop the promisor settings, so later commands never fetch.
  */
 export async function prepareUpstreamCheckout(opts: PrepareOptions): Promise<UpstreamCheckout> {
   checkUrl(opts.url);
@@ -177,16 +200,29 @@ export async function prepareUpstreamCheckout(opts: PrepareOptions): Promise<Ups
   // The fetched tip, not the one ls-remote printed: the branch can move in between.
   const tipSha = (await mustRun(git, ['rev-parse', '--verify', '-q', `refs/remotes/origin/${branch}^{commit}`])).trim();
 
-  let baseAvailable = false;
+  // Checking out fetches the tip's blobs in one batch.
+  await mustRun(git, ['-c', 'advice.detachedHead=false', 'checkout', '-q', '--detach', '--force', tipSha]);
+
+  let baseFetched = false;
   const base = opts.verifiedSha;
   if (base !== undefined && SHA_RE.test(base)) {
-    if (base !== tipSha) await git([...fetchArgs, base]);
-    // Look without fetching: in a partial clone a missing object is otherwise fetched on access.
-    const local = createGitRunner(opts.dir, { ...(opts.env ?? upstreamGitEnv()), GIT_NO_LAZY_FETCH: '1' });
-    baseAvailable = (await local(['cat-file', '-e', `${base}^{commit}`])).code === 0;
+    const timeoutMs = opts.baseTimeoutMs ?? BASE_TIMEOUT_MS;
+    baseFetched = base === tipSha || (
+      await tryRun(git, [...fetchArgs, base], timeoutMs)
+      // A diff that reads blobs fetches the missing ones (the base side of each changed file) in one batch.
+      && await tryRun(git, ['diff', '--shortstat', '--no-renames', '--no-ext-diff', '--no-textconv', base, tipSha], timeoutMs));
   }
 
-  await mustRun(git, ['-c', 'advice.detachedHead=false', 'checkout', '-q', '--detach', '--force', tipSha]);
+  // No longer a partial clone. Git before 2.44 ignores GIT_NO_LAZY_FETCH, and a
+  // remote with promisor or partialclonefilter set (or extensions.partialClone)
+  // makes any missing object a network fetch.
+  await mustRun(git, ['config', '--unset-all', 'remote.origin.promisor']);
+  await mustRun(git, ['config', '--unset-all', 'remote.origin.partialclonefilter']);
+  const unset = await git(['config', '--unset-all', 'extensions.partialClone']);
+  if (unset.code !== 0 && unset.code !== 5) throw new Error(`git config --unset-all extensions.partialClone exited ${unset.code}: ${unset.stderr.trim()}`);
+
+  // The fetch's result decides; the probe only confirms, and can no longer fetch.
+  const baseAvailable = baseFetched && (await git(['cat-file', '-e', `${base}^{commit}`])).code === 0;
   return { defaultBranch: branch, tipSha, baseAvailable, git };
 }
 
