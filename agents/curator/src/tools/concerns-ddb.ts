@@ -477,7 +477,9 @@ export function buildUpdateConcernTool(deps: ConcernsDeps) {
     description:
 `Change an existing record's area or add to its context without reinforcing it. Use it when the feedback corrects the record's scope or supplies the off-code reason behind it (often pushback such as "this is intentional because ..."), but does not confirm the concern itself.
 
-\`area\` replaces the glob list; \`context_addition\` is appended to the existing context. Give at least one. reinforcement_count, decay_score and updated_at do not change.`,
+\`area\` replaces the glob list; \`context_addition\` is appended to the existing context. Give at least one. reinforcement_count, decay_score and updated_at do not change.
+
+When the record has graduated and its skill is live, this run may then re-publish the corrected skill with submit_skill.`,
     inputSchema: z.object({ area_bucket: areaBucketField, record_id: recordIdField, ...editFields }),
     callback: (input) => oneWrite(deps, 'update_concern', { structural: true, action: `update_concern ${input.record_id}`, areaBucket: input.area_bucket }, async () => {
       if (!input.area && !input.context_addition) {
@@ -500,7 +502,9 @@ export function buildUpdateConcernTool(deps: ConcernsDeps) {
           ExpressionAttributeValues: parts.values,
           ReturnValues: 'ALL_NEW',
         }));
-        return { changed: true, text: ok({ record: recordView(resp.Attributes ?? {}) }) };
+        const record = resp.Attributes ?? {};
+        if (graduatedName(record)) deps.run.edited = { areaBucket: input.area_bucket, recordId: input.record_id };
+        return { changed: true, text: ok({ record: recordView(record) }) };
       } catch (err) {
         if (!isConditionFailure(err)) throw err;
         return { changed: false, text: fail(`update_concern: ${CHANGED_UNDERNEATH}`) };

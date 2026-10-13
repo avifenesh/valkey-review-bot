@@ -30,8 +30,14 @@ export class CuratorRun {
   readonly kind: FeedbackKind;
   readonly reinforcer: string;
   readonly graduationThreshold: number;
-  /** The record this run's bump or merge reinforced; the only record submit_skill may graduate. */
+  /** The record this run's bump or merge reinforced; submit_skill may graduate it. */
   reinforced: TouchedRecord | null = null;
+  /**
+   * A graduated record this run changed with update_concern. submit_skill
+   * may re-publish its skill, so pushback can correct a live skill, but
+   * never graduate it for the first time.
+   */
+  edited: TouchedRecord | null = null;
   done: CuratorDecision | null = null;
   readonly actions: string[] = [];
   private readonly held = new Set<Slot>();

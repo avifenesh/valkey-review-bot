@@ -462,3 +462,26 @@ test('list_concerns puts records with a retired skill after the live ones', asyn
   assert.deepEqual(out.records.map((r) => r.record_id), ['live', 'plain', 'tomb', 'tomb2']);
   assert.deepEqual(out.records.map((r) => r.skill_state), ['live', undefined, 'retired', 'retired']);
 });
+
+test('update_concern marks the run as having edited a graduated record, and only a graduated one', async () => {
+  for (const [name, item, expected] of [
+    ['graduated', checked('r1', 5), { areaBucket: 'src', recordId: 'r1' }],
+    ['never graduated', record('r1', 5), null],
+  ]) {
+    const ddb = fakeDdb({
+      GetCommand: () => ({ Item: item }),
+      UpdateCommand: (input) => ({ Attributes: { ...item, context: input.ExpressionAttributeValues[':ctx'] } }),
+    });
+    const t = tools(ddb);
+    const out = parse(await t.update_concern.invoke({ area_bucket: 'src', record_id: 'r1', context_addition: 'intentional because' }));
+    assert.equal(out.ok, true, name);
+    assert.deepEqual(t.run.edited, expected, name);
+    assert.equal(t.run.reinforced, null, `${name}: an edit is not a reinforcement`);
+  }
+
+  const failed = fakeDdb({ GetCommand: () => ({ Item: checked('r1', 5) }), UpdateCommand: () => { throw conditionFailed(); } });
+  const t = tools(failed);
+  const out = parse(await t.update_concern.invoke({ area_bucket: 'src', record_id: 'r1', context_addition: 'why' }));
+  assert.equal(out.ok, false);
+  assert.equal(t.run.edited, null, 'an edit that did not land marks nothing');
+});
