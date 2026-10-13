@@ -384,14 +384,41 @@ test('PUSH_REVIEW_DELAY_SECONDS sets the delay; 0 still holds the marker until t
   assert.equal(store.pending.get(`${REPO}#7`), 'pending-1');
 });
 
+test('a reopen or a draft marked ready joins a waiting review of new commits', async () => {
+  const { handler, sent, store, logs } = setup();
+  await handler(delivery('pull_request', push('bbb')));
+  await handler(delivery('pull_request', push('bbb', {}, GLIDE)));
+  const reopened = await handler(delivery('pull_request', prEvent('reopened', { head: { sha: 'ccc' } })));
+  assert.equal(body(reopened).skipped, 'auto-review-pending');
+  assert.equal(logs.at(-2), `[auto-review] route=valkey-review repo=${REPO} pr=7 head=ccc joins the waiting review; skipped`);
+  const ready = await handler(delivery('pull_request', prEvent('ready_for_review', { head: { sha: 'ccc' } }, GLIDE)));
+  assert.equal(body(ready).skipped, 'auto-review-pending');
+
+  assert.equal(sent.length, 2);
+  assert.equal(store.autoReviews.get(`${REPO}#7`), 1, 'no round used');
+  assert.equal(store.autoReviews.get(`${GLIDE}#7`), 1);
+  assert.equal(store.slotsTaken, 2, 'no budget used');
+  assert.deepEqual(store.released, [`${REPO}#7#ccc`, `${GLIDE}#7#ccc#ready`]);
+  assert.equal(store.pending.get(`${REPO}#7`), 'pending-1', 'the marker stays with the waiting review');
+});
+
 test('reviews that are not from new commits are sent without a delay or a marker', async () => {
   const { handler, sent, store } = setup();
+  let pendingReads = 0;
+  const reviewPending = store.reviewPending;
+  store.reviewPending = (...args) => { pendingReads += 1; return reviewPending(...args); };
+  await handler(delivery('pull_request', prEvent('opened')));
+  assert.equal(pendingReads, 0, 'an opened pull request has no waiting review to join');
   await handler(delivery('pull_request', push('bbb')));
-  await handler(delivery('pull_request', prEvent('reopened')));
-  assert.equal(sent.length, 2, 'a waiting review of new commits does not hold back a reopen');
-  assert.equal(sent[1].options, undefined);
-  assert.equal(sent[1].body.pending_marker, undefined);
-  assert.equal(store.pending.get(`${REPO}#7`), 'pending-1');
+  await store.clearReviewPending(REPO, 7, 'pending-1');
+  await handler(delivery('pull_request', prEvent('reopened', { head: { sha: 'ccc' } })));
+  assert.equal(pendingReads, 1);
+  assert.equal(sent.length, 3, 'a reopen after the review of new commits started is queued');
+  for (const i of [0, 2]) {
+    assert.equal(sent[i].options, undefined);
+    assert.equal(sent[i].body.pending_marker, undefined);
+  }
+  assert.equal(store.pending.size, 0, 'a reopen takes no marker');
 });
 
 test('over budget: the review is skipped, logged, and its key released', async () => {

@@ -14,11 +14,11 @@ import { releaseQuietly, type DeliveryStore } from './store.js';
  *      the secret again once in case it was rotated.
  *   2. pull_request opened, reopened, ready_for_review or synchronize (new
  *      commits) on a review route: route gates, idempotency key
- *      repo#pr#head_sha, for new commits the pull request's pending
- *      marker, the pull request's cap on automatic reviews, the route's
- *      daily review budget, then the route's queue. A review of new
- *      commits waits in the queue first, and covers every push made
- *      before its run starts.
+ *      repo#pr#head_sha, the pull request's pending marker, the pull
+ *      request's cap on automatic reviews, the route's daily review
+ *      budget, then the route's queue. A review of new commits waits in
+ *      the queue first, holding the marker, and covers every push, reopen
+ *      or ready_for_review that comes before its run starts.
  *   3. issue_comment, pull_request_review_comment, pull_request_review:
  *      an @mention of the bot is a review request (src/mention.ts).
  *      Everything else, and a thread reply even when it also starts a
@@ -186,32 +186,41 @@ export function createDeliveryHandler(
       for (let undo = taken.pop(); undo; undo = taken.pop()) await undo();
     };
 
+    // A skipped delivery relies on the marker's owner queuing its review,
+    // but the owner takes the marker before its cap and budget checks and
+    // gives it back when it does not queue (a store error or a failed
+    // send, as well as the cap and the budget). So the skipped delivery's
+    // key is released, and a redelivery of it is processed instead of
+    // being dropped as a duplicate. What remains: GitHub does not
+    // redeliver on its own, so in that case this head is reviewed only
+    // after a manual redelivery or the next push; and a redelivery that
+    // comes after the waiting review has started queues another review of
+    // this head.
+    const joinWaitingReview = async (): Promise<Outcome> => {
+      await giveBack();
+      log(`[auto-review] route=${route.routeId} repo=${repo} pr=${prNumber} head=${headSha} joins the waiting review; skipped`);
+      return skip('auto-review-pending');
+    };
+
     try {
       // A review of new commits waits in the queue, so that a burst of
       // pushes gets one review: while it waits, the pull request's pending
       // marker skips later pushes, and the runtime reviews the head as it
       // is when the run starts.
       //
-      // A skipped push relies on the marker's owner queuing its review,
-      // but the owner takes the marker before its cap and budget checks
-      // and gives it back when it does not queue (a store error or a
-      // failed send, as well as the cap and the budget). So the skipped
-      // push's key is released, and a redelivery of the push is processed
-      // instead of being dropped as a duplicate. What remains: GitHub does
-      // not redeliver on its own, so in that case this head is reviewed
-      // only after a manual redelivery or the next push; and a redelivery
-      // that comes after the waiting review has started queues another
-      // review of this head.
+      // A reopen, or a draft marked ready, while such a review waits joins
+      // it too, so the two do not use a round each: the pull request is
+      // open and ready when that review runs. A push that marks a pending
+      // review just after this check still queues its own, and so does a
+      // reopen once the waiting review has started.
       let pendingMarker: string | undefined;
       if (pushed) {
         const marker = await deps.store.markReviewPending(repo, prNumber, config.pushReviewDelaySeconds);
-        if (marker === null) {
-          await giveBack();
-          log(`[auto-review] route=${route.routeId} repo=${repo} pr=${prNumber} head=${headSha} joins the waiting review; skipped`);
-          return skip('auto-review-pending');
-        }
+        if (marker === null) return await joinWaitingReview();
         pendingMarker = marker;
         taken.push(() => clearPendingQuietly(repo, prNumber, marker));
+      } else if (action !== 'opened' && (await deps.store.reviewPending(repo, prNumber))) {
+        return await joinWaitingReview();
       }
 
       const cap = config.maxAutomaticReviewsPerPr;

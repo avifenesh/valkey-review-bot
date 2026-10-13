@@ -34,6 +34,10 @@ export function fakeDdb() {
         items.set(input.Item.key, { ...input.Item });
         return {};
       }
+      if (op === 'GetCommand') {
+        const item = items.get(input.Key.key);
+        return item ? { Item: { ...item } } : {};
+      }
       if (op === 'DeleteCommand') {
         if (input.ConditionExpression === '#m = :m') {
           if (items.get(input.Key.key)?.marker !== input.ExpressionAttributeValues[':m']) throw conditionFailed();
@@ -118,6 +122,9 @@ export function fakeStore({ budget = Infinity } = {}) {
       markers += 1;
       pending.set(prKey(repo, prNumber), `pending-${markers}`);
       return `pending-${markers}`;
+    },
+    async reviewPending(repo, prNumber) {
+      return pending.has(prKey(repo, prNumber));
     },
     async clearReviewPending(repo, prNumber, markerId) {
       if (pending.get(prKey(repo, prNumber)) !== markerId) return false;

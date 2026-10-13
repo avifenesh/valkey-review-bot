@@ -1,5 +1,5 @@
 import { randomUUID } from 'node:crypto';
-import { DeleteCommand, PutCommand, UpdateCommand, type DynamoDBDocumentClient } from '@aws-sdk/lib-dynamodb';
+import { DeleteCommand, GetCommand, PutCommand, UpdateCommand, type DynamoDBDocumentClient } from '@aws-sdk/lib-dynamodb';
 
 /**
  * The receiver's DynamoDB table, keyed by "key". It holds these kinds of
@@ -56,6 +56,8 @@ export interface DeliveryStore {
    * the marker. The marker expires an hour after the delay.
    */
   markReviewPending(repo: string, prNumber: number, delaySeconds: number): Promise<string | null>;
+  /** True while a review of new commits holds the pull request's pending marker. */
+  reviewPending(repo: string, prNumber: number): Promise<boolean>;
   /** Removes the pull request's pending marker if it is still `markerId`. */
   clearReviewPending(repo: string, prNumber: number, markerId: string): Promise<boolean>;
 }
@@ -215,6 +217,17 @@ export function createDeliveryStore(ddb: DocumentClient, tableName: string, now:
         if (isConditionFailure(err)) return null;
         throw err;
       }
+    },
+
+    async reviewPending(repo, prNumber) {
+      const resp = await ddb.send(new GetCommand({
+        TableName: tableName,
+        Key: { key: pendingReviewKey(repo, prNumber) },
+        ConsistentRead: true,
+      }));
+      const ttl = (resp.Item as { ttl?: unknown } | undefined)?.ttl;
+      // Expired the same way markReviewPending decides it.
+      return resp.Item !== undefined && !(typeof ttl === 'number' && ttl < epochSeconds());
     },
 
     clearReviewPending: (repo, prNumber, markerId) => clearPendingReview(ddb, tableName, repo, prNumber, markerId),
