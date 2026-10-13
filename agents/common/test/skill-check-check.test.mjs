@@ -6,7 +6,10 @@ import path from 'node:path';
 import test from 'node:test';
 
 // No resolve hook: these modules must load under plain type stripping.
-const { areaFileCounts, checkSkill, confirmableCommit, DIFF_BUDGET_BYTES, DIFF_FILES_PER_CALL, DIFF_MAX_BYTES, globToRegExp, RARE_MAX } = await import('../src/skill-check/check.ts');
+const {
+  areaFileCounts, checkSkill, confirmableCommit, DIFF_BUDGET_BYTES, DIFF_FILES_PER_CALL, DIFF_MAX_BYTES, globToRegExp, isPartial,
+  PARTIAL_CHECKS_BEFORE_CONFIRM, RARE_MAX,
+} = await import('../src/skill-check/check.ts');
 const { extractNames } = await import('../src/skill-check/names.ts');
 const { createGitRunner } = await import('../src/skill-check/upstream.ts');
 
@@ -365,6 +368,38 @@ test('once the diff budget is spent the files left are not diffed, and the resul
     `the diff budget of ${DIFF_BUDGET_BYTES} bytes ran out, so ${count - read} of the ${count} changed files that hold a cited name were not diffed`,
   ]);
   assert.equal(confirmableCommit(result), null);
+  r.cleanup();
+});
+
+test(`a check whose diff stays partial confirms after ${PARTIAL_CHECKS_BEFORE_CONFIRM} such checks; one without its base never does`, async () => {
+  const r = repo({ 'a.txt': 'int rare_p_name = 1;\n' }, { 'a.txt': 'int rare_p_name = 2;\n' });
+  const n = names('`rare_p_name`');
+  // A runner whose diff of the candidates is always cut short.
+  const cutting = async (args, opts) => (args.includes('-U0')
+    ? { code: -1, truncated: true, stderr: '', stdout: 'diff --git a/a.txt b/a.txt\n@@ -1 +1 @@\n-int rare_p_name = 1;\n+int rare_p_name = 2;\n+xxxx' }
+    : r.git(args, opts));
+  const partial = await checkSkill(cutting, { names: n, baseline: ['rare_p_name'], baseSha: r.baseSha });
+  assert.deepEqual([partial.compared, partial.diffTruncated, partial.touched], [true, true, ['rare_p_name']]);
+  assert.equal(isPartial(partial), true);
+  for (let before = 0; before < PARTIAL_CHECKS_BEFORE_CONFIRM; before++) assert.equal(confirmableCommit(partial, { partialBefore: before }), null, `after ${before}`);
+  assert.equal(confirmableCommit(partial), null);
+  assert.equal(confirmableCommit(partial, { partialBefore: Number.NaN }), null);
+  assert.equal(confirmableCommit(partial, { partialBefore: PARTIAL_CHECKS_BEFORE_CONFIRM }), r.tipSha);
+  assert.equal(confirmableCommit(partial, { partialBefore: PARTIAL_CHECKS_BEFORE_CONFIRM + 3 }), r.tipSha);
+
+  const complete = await checkSkill(r.git, { names: n, baseline: ['rare_p_name'], baseSha: r.baseSha });
+  assert.equal(isPartial(complete), false);
+  // However many checks came before, a base that was not diffed holds the verification.
+  for (const input of [
+    { baseSha: 'f'.repeat(40) },
+    { baseSha: 'HEAD~1' },
+    { baseSha: r.baseSha, checkout: { baseAvailable: false, baseGone: false } },
+  ]) {
+    const result = await checkSkill(cutting, { names: n, baseline: ['rare_p_name'], ...input });
+    assert.equal(result.incomplete.length, 1, input.baseSha);
+    assert.equal(isPartial(result), false);
+    assert.equal(confirmableCommit(result, { partialBefore: 99 }), null, input.baseSha);
+  }
   r.cleanup();
 });
 

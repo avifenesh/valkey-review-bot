@@ -78,7 +78,8 @@ export interface CheckResult {
   /**
    * Nothing lost, new and absent, or touched, and the diff was read in
    * full (`incomplete` is empty). Only a clean result confirms the skill
-   * without an audit.
+   * without an audit, apart from the way past a partial diff that
+   * confirmableCommit describes.
    */
   readonly clean: boolean;
   /** The base was available and diffed; without it `touched` is empty. */
@@ -95,14 +96,38 @@ export interface CheckResult {
    * Why `touched` may be incomplete, one line each: a diff budget that
    * ran out, a file whose diff was cut, a base that was given but is
    * missing or could not be fetched. Empty when the whole diff was
-   * examined, or none was asked for. See confirmableCommit.
+   * examined, or none was asked for. While `compared` is true, every
+   * entry is about a diff that was read only in part (isPartial). See
+   * confirmableCommit.
    */
   readonly incomplete: readonly string[];
 }
 
 /**
+ * Checks of a skill in a row whose diff was read only in part, after
+ * which the next such check confirms too. See confirmableCommit.
+ */
+export const PARTIAL_CHECKS_BEFORE_CONFIRM = 2;
+
+/** The diff since the base was examined, but only in part: the budget ran out, or a file's diff was cut. */
+export function isPartial(result: CheckResult): boolean {
+  return result.compared && result.incomplete.length > 0;
+}
+
+export interface ConfirmOptions {
+  /**
+   * The caller's count of earlier checks of the skill, in a row since
+   * its verification last moved, whose result isPartial. Default 0.
+   */
+  readonly partialBefore?: number;
+}
+
+/**
  * The commit a caller may record as verified (verified_sha) after acting
- * on a check: `result.commit`, or null when the result is incomplete.
+ * on a check: `result.commit`, or null while the result is incomplete.
+ * Ask it of the check of the skill as it was, never of a re-run on an
+ * edited body, which has no base.
+ *
  * On null the verification never moves, whatever an audit concludes,
  * because the hunks nobody examined would otherwise never be checked:
  * the next check diffs from the same base again. A check of a fresh
@@ -110,9 +135,19 @@ export interface CheckResult {
  * verified_sha: a base that could not be fetched is then incomplete,
  * and only one the remote no longer has (baseGone) gives a presence
  * check that confirms.
+ *
+ * The one way past an incomplete result, so that a skill whose diff
+ * never fits the budget still moves on: the result isPartial, and
+ * opts.partialBefore is at least PARTIAL_CHECKS_BEFORE_CONFIRM. A
+ * result that is incomplete because its base was malformed, missing or
+ * could not be fetched never confirms. A commit returned while
+ * `incomplete` is not empty means this way was taken, and the caller
+ * records that it was.
  */
-export function confirmableCommit(result: CheckResult): string | null {
-  return result.incomplete.length === 0 ? result.commit : null;
+export function confirmableCommit(result: CheckResult, opts: ConfirmOptions = {}): string | null {
+  if (result.incomplete.length === 0) return result.commit;
+  if (isPartial(result) && (opts.partialBefore ?? 0) >= PARTIAL_CHECKS_BEFORE_CONFIRM) return result.commit;
+  return null;
 }
 
 /**
