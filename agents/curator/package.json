@@ -23,6 +23,7 @@
     "@agent-sh/harness-write": "0.6.0",
     "@aws-sdk/client-agent-registry-control": "^3.1150.0",
     "@aws-sdk/client-dynamodb": "^3.1045.0",
+    "@aws-sdk/client-lambda": "^3.1150.0",
     "@aws-sdk/client-s3": "^3.1045.0",
     "@aws-sdk/lib-dynamodb": "^3.1045.0",
     "@aws/bedrock-token-generator": "^1.1.0",

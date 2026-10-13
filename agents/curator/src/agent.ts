@@ -6,18 +6,34 @@ import { DynamoDBDocumentClient } from '@aws-sdk/lib-dynamodb';
 import { createCuratorModel } from '../../common/src/model-fallback.js';
 import { createRegistryClient, loadSkills } from '../../common/src/skills-registry.js';
 
+import { renderCheckPrompt } from './check-run.js';
 import { loadAssets, loadEnv, renderTemplate } from './config.js';
 import { curate } from './curate.js';
-import { normalizeFeedback, reinforcerKey, renderFeedbackMessage, requestSchema, untrustedReason, type CuratorRequest } from './feedback.js';
-import { skillPublisher } from './maintenance.js';
+import { normalizeFeedback, reinforcerKey, renderFeedbackMessage, untrustedReason, type CuratorRequest } from './feedback.js';
+import {
+  curatorRequestSchema,
+  handleMaintenance,
+  isMaintenanceRequest,
+  maintenanceRegistry,
+  skillPublisher,
+  type CuratorMessage,
+  type MaintenanceRequest,
+  type RepoSkillApi,
+  type RepoSkillPrResult,
+  type RepoSkillProposal,
+} from './maintenance.js';
 import { assembleCuratorTools } from './tools/index.js';
 import { CuratorRun } from './tools/run.js';
 
 /**
- * Curator entrypoint. One invocation per maintainer feedback event: the
- * model reads the feedback and the reviewer's concerns store, makes at
- * most one change to the store, and may graduate the record it
- * reinforced into a skill in the reviewer's registry.
+ * Curator entrypoint. One invocation per message on the curator queue:
+ *
+ * - A maintainer feedback event (feedback_id): the model reads the
+ *   feedback and the reviewer's concerns store, makes at most one change
+ *   to the store, and may graduate the record it reinforced into a skill
+ *   in the reviewer's registry.
+ * - A skill maintenance message from the decay job (maintenance_id):
+ *   a release check or a retirement, see maintenance.ts.
  */
 
 const env = loadEnv();
@@ -28,17 +44,110 @@ const SYSTEM_PROMPT = assets.skill
   ? `${prompt}\n\n---\n\n## Skill: institutional memory\n\n${renderTemplate(assets.skill, templateValues)}`
   : prompt;
 
+// A placeholder typo in skill-check.md fails here, at boot.
+const CHECK_PROMPT = assets.checkPrompt ? renderCheckPrompt(assets.checkPrompt) : '';
+
 const ddb = DynamoDBDocumentClient.from(new DynamoDBClient({ region: env.region }));
 const registryClient = createRegistryClient(env.region);
 // The curator registry holds a handful of authoring skills; this bounds the read.
 const AUTHORING_SKILL_LIMIT = 10;
 
 console.log(`[boot] curator model=${env.modelId} region=${env.region} reviewers=${Object.keys(env.concernsTables).join(',')} graduation_threshold=${env.graduationThreshold}`);
+console.log(`[boot] skill maintenance upstreams=${JSON.stringify(env.upstreamRepos)} audit_prompt=${CHECK_PROMPT ? 'loaded' : 'none'} apply_edits=${env.checkApplyEdits} retire_skills=${env.retireSkills} open_pull_requests=${env.checkOpenPullRequests} skills_repo=${env.skillsRepo?.repo ?? 'none'}`);
+
+/**
+ * The skills-repo pull request module and its token source ship in their
+ * own package. They are loaded on first use, by a specifier TypeScript
+ * does not resolve, so the feedback path never loads them; the expected
+ * exports are checked here.
+ */
+interface RepoSkillPrModule {
+  proposeRepoSkillChange(p: RepoSkillProposal, deps: {
+    repo: string; baseBranch: string; signOff?: string; getToken: () => Promise<string>;
+  }): Promise<RepoSkillPrResult>;
+  fetchRepoFile(repo: string, ref: string, path: string): Promise<{ sha: string; content: string } | null>;
+}
+interface SkillsRepoTokenModule {
+  createSkillsRepoTokenSource(opts: { functionName: string; region: string }): { get(): Promise<string> };
+}
+
+async function loadModule<T>(file: string, exports: readonly string[]): Promise<T> {
+  const mod = await import(new URL(file, import.meta.url).href) as Record<string, unknown>;
+  const missing = exports.filter((name) => typeof mod[name] !== 'function');
+  if (missing.length > 0) throw new Error(`${file} does not export ${missing.join(', ')}`);
+  return mod as T;
+}
+
+let repoSkillApi: Promise<RepoSkillApi> | undefined;
+function repoSkills(): Promise<RepoSkillApi> {
+  repoSkillApi ??= (async () => {
+    const pr = await loadModule<RepoSkillPrModule>('./repo-skill-pr.js', ['proposeRepoSkillChange', 'fetchRepoFile']);
+    return {
+      fetchRepoFile: (repo, ref, path) => pr.fetchRepoFile(repo, ref, path),
+      propose: async (proposal) => {
+        const settings = env.skillsRepo;
+        if (!settings?.tokenFunction) throw new Error('no skills-repo token broker is configured');
+        const { createSkillsRepoTokenSource } = await loadModule<SkillsRepoTokenModule>('./skills-repo-token.js', ['createSkillsRepoTokenSource']);
+        const tokens = createSkillsRepoTokenSource({ functionName: settings.tokenFunction, region: env.region });
+        return pr.proposeRepoSkillChange(proposal, {
+          repo: settings.repo,
+          baseBranch: settings.baseBranch,
+          ...(settings.signOff ? { signOff: settings.signOff } : {}),
+          getToken: () => tokens.get(),
+        });
+      },
+    };
+  })();
+  // A failed load is retried by the next run.
+  repoSkillApi.catch(() => { repoSkillApi = undefined; });
+  return repoSkillApi;
+}
+
+/**
+ * One maintenance message, registered as an async task so the runtime's
+ * /ping reports HealthyBusy while a check runs: AgentCore stops a
+ * session that reports Healthy for 15 minutes.
+ */
+async function* maintain(req: MaintenanceRequest) {
+  const table = env.concernsTables[req.reviewer_id];
+  const registryId = env.skillsRegistries[req.reviewer_id];
+  if (!table || !registryId) {
+    throw new Error(`reviewer_id "${req.reviewer_id}" has no concerns table or skills registry configured`);
+  }
+  const task = app.addAsyncTask('maintenance', { maintenance_id: req.maintenance_id });
+  try {
+    const result = yield* handleMaintenance(req, {
+      ddb,
+      table,
+      registry: maintenanceRegistry(registryClient, registryId),
+      settings: env,
+      audit: {
+        // See the feedback path for the cast.
+        model: () => createCuratorModel(env) as unknown as AgentConfig['model'],
+        systemPrompt: CHECK_PROMPT,
+      },
+      repoSkills,
+    });
+    console.log(`[curator] maintenance ${result.status} reason=${req.reason} reviewer=${req.reviewer_id} decision=${result.decision} dry_run=${req.dry_run} maintenance=${JSON.stringify(req.maintenance_id)}`);
+    yield {
+      event: 'done',
+      data: { status: result.status, maintenance_id: req.maintenance_id, reviewer_id: req.reviewer_id, reason: req.reason, decision: result.decision },
+    };
+  } finally {
+    app.completeAsyncTask(task);
+  }
+}
 
 const app = new BedrockAgentCoreApp({
   invocationHandler: {
-    requestSchema,
-    process: async function* (request: CuratorRequest) {
+    // A feedback event or a maintenance message, told apart by maintenance_id.
+    requestSchema: curatorRequestSchema,
+    process: async function* (body: CuratorMessage) {
+      if (isMaintenanceRequest(body)) {
+        yield* maintain(body);
+        return;
+      }
+      const request: CuratorRequest = body;
       const feedback = normalizeFeedback(request);
       const skip = untrustedReason(feedback);
       if (skip) {
