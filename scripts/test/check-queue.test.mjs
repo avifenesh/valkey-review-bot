@@ -2,7 +2,7 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 import '../../ops/test/support/ts-resolve.mjs';
 import {
-  checkDelay, checkMessage, claimArgs, MAINTENANCE_RETRY_DAYS, maintenanceId, planChecks, queueChecks, releaseArgs, sendArgs,
+  checkDelay, checkMessage, claimArgs, DEFAULT_CHECK_LIMIT, MAINTENANCE_RETRY_DAYS, maintenanceId, planChecks, queueChecks, releaseArgs, sendArgs,
 } from '../lib/check-queue.mjs';
 import { CONDITION_FAILED, cliError, fakeAws, flag, typed } from './support/aws.mjs';
 
@@ -161,7 +161,7 @@ const run = (aws, fields = {}) => {
 test('queueChecks claims each record before sending its message, in report mode', () => {
   const aws = cliWith([live('b'), live('a'), live('tomb', { retired_at: daysAgo(1) })]);
   const { result, lines } = run(aws);
-  assert.deepEqual(result, { queued: 2, skipped: 1, errors: 0 });
+  assert.deepEqual(result, { queued: 2, skipped: 1, deferred: 0, errors: 0 });
   assert.deepEqual(ops(aws), ['scan', 'update-item SET', 'send-message', 'update-item SET', 'send-message']);
   const scan = aws.calls[0];
   assert.equal(flag(scan, '--filter-expression'), 'attribute_exists(#grn)');
@@ -189,7 +189,7 @@ test('a record that changed since the scan is skipped and gets no message', () =
     },
   });
   const { result, lines } = run(aws);
-  assert.deepEqual(result, { queued: 1, skipped: 1, errors: 0 });
+  assert.deepEqual(result, { queued: 1, skipped: 1, deferred: 0, errors: 0 });
   const sends = aws.calls.filter((a) => a[1] === 'send-message');
   assert.deepEqual(sends.map((a) => JSON.parse(flag(a, '--message-body')).record_id), ['b']);
   assert.equal(flag(sends[0], '--delay-seconds'), '0', 'only claims made count toward the stagger');
@@ -205,7 +205,7 @@ test('a failed claim is an error; a failed send is an error and releases the cla
     'sqs send-message': (args) => { throw cliError(args, 'An error occurred (AWS.SimpleQueueService.NonExistentQueue)'); },
   });
   const { result, lines } = run(aws);
-  assert.deepEqual(result, { queued: 0, skipped: 0, errors: 2 });
+  assert.deepEqual(result, { queued: 0, skipped: 0, deferred: 0, errors: 2 });
   assert.deepEqual(ops(aws), ['scan', 'update-item SET', 'update-item SET', 'send-message', 'update-item REMOVE']);
   const release = aws.calls.at(-1);
   assert.deepEqual(JSON.parse(flag(release, '--expression-attribute-values')), { ':mid': { S: `check#valkey-review#b#${NOW_ISO}` } });
@@ -216,7 +216,7 @@ test('a failed claim is an error; a failed send is an error and releases the cla
 test('plan mode writes and sends nothing', () => {
   const aws = cliWith([live('a'), live('b')]);
   const { result, lines } = run(aws, { plan: true });
-  assert.deepEqual(result, { queued: 2, skipped: 0, errors: 0 });
+  assert.deepEqual(result, { queued: 2, skipped: 0, deferred: 0, errors: 0 });
   assert.deepEqual(ops(aws), ['scan']);
   assert.deepEqual(lines, ['would queue bucket="src" id="a" name="skill-a" delay=0s', 'would queue bucket="src" id="b" name="skill-b" delay=60s']);
 });
@@ -245,4 +245,54 @@ test('AWS error text in a line is printable and stays on the line', () => {
   const sendLine = lines.find((l) => l.includes('send failed'));
   assert.ok(sendLine.endsWith('An error occurred ?[2Jerror bucket="src" id="b": forged?'), sendLine);
   for (const l of lines) assert.ok(!/[\n\u001b\u202e]/.test(l), JSON.stringify(l));
+});
+
+test('the default limit is the decay pass\'s default checks per day', () => {
+  const config = decay.loadDecayConfig({ CONCERNS_TABLES_JSON: '{"valkey-review":"valkey_review_concerns"}' });
+  assert.equal(DEFAULT_CHECK_LIMIT, config.checksPerDay);
+  assert.equal(DEFAULT_CHECK_LIMIT, 10);
+});
+
+test('up to the limit, the same records, order and delays as the decay pass', async () => {
+  // All due for the decay pass: never checked, re-published since the check, or checked at an older release.
+  const old = (recordId, verifiedDays, graduatedDays) => live(recordId, {
+    verified_at: daysAgo(verifiedDays), verified_release: '9.1.1', graduated_at: daysAgo(graduatedDays),
+  });
+  const records = [
+    old('v-40', 40, 100), old('v-60', 60, 100), old('v-50', 50, 100), old('v-45', 45, 100), old('v-55', 55, 100),
+    old('rp-30', 30, 20), old('rp-70', 70, 20),
+    live('n-10', { graduated_at: daysAgo(10) }), live('n-50', { graduated_at: daysAgo(50) }), live('n-20', { graduated_at: daysAgo(20) }),
+    live('n-none', { graduated_at: undefined }), old('v-35', 35, 100),
+  ];
+  const { sent } = await decayRequests([REPO_ITEM, ...records]);
+  assert.equal(sent.length, 10, 'the decay pass sends checksPerDay');
+
+  const aws = cliWith(records);
+  const { result, lines } = run(aws);
+  assert.deepEqual(result, { queued: 10, skipped: 0, deferred: 2, errors: 0 });
+  const sends = aws.calls.filter((a) => a[1] === 'send-message');
+  assert.deepEqual(sends.map((a) => JSON.parse(flag(a, '--message-body')).record_id), sent.map((m) => JSON.parse(m.MessageBody).record_id));
+  assert.deepEqual(sends.map((a) => Number(flag(a, '--delay-seconds'))), sent.map((m) => m.DelaySeconds));
+  assert.deepEqual(sends.slice(0, 6).map((a) => JSON.parse(flag(a, '--message-body')).record_id), ['n-none', 'n-50', 'n-20', 'n-10', 'rp-70', 'rp-30']);
+  const over = lines.filter((l) => l.startsWith('over the limit '));
+  assert.deepEqual(over.map((l) => /\bid="([^"]*)"/.exec(l)[1]), ['v-40', 'v-35']);
+  assert.equal(over[0], 'over the limit bucket="src" id="v-40" name="skill-v-40": a later run can queue it');
+});
+
+test('only claims made count toward the limit, and plan mode keeps to it too', () => {
+  const lostFirst = cliWith([live('a'), live('b'), live('c')], {
+    'dynamodb update-item': (args) => {
+      if (JSON.parse(flag(args, '--key')).record_id.S === 'a') throw cliError(args, CONDITION_FAILED);
+      return {};
+    },
+  });
+  const lost = run(lostFirst, { limit: 1 });
+  assert.deepEqual(lost.result, { queued: 1, skipped: 1, deferred: 1, errors: 0 });
+  assert.deepEqual(lostFirst.calls.filter((a) => a[1] === 'send-message').map((a) => JSON.parse(flag(a, '--message-body')).record_id), ['b']);
+
+  const plan = run(cliWith([live('a'), live('b'), live('c')]), { plan: true, limit: 2 });
+  assert.deepEqual(plan.result, { queued: 2, skipped: 0, deferred: 1, errors: 0 });
+  assert.equal(plan.lines.at(-1), 'over the limit bucket="src" id="c" name="skill-c": a later run can queue it');
+
+  for (const bad of [0, -1, 1.5, Number.NaN]) assert.throws(() => run(cliWith([]), { limit: bad }), /the limit must be a whole number of at least 1/);
 });

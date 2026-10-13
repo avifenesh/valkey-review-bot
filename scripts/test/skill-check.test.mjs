@@ -89,6 +89,9 @@ test('bad options fail before any AWS call', async () => {
     [['--table', 'my-table', '--queue-url', QUEUE, '--reviewer', 'Bad'], /--reviewer must be a reviewer id/],
     [['--table', 'valkey_glide_review_concerns', '--queue-url', QUEUE, '--reviewer', 'valkey-review'], /table valkey_glide_review_concerns belongs to reviewer valkey-glide-review, not "valkey-review"/],
     [[...STACKS, '--dry-run'], /Unknown option '--dry-run'/],
+    [[...STACKS, '--limit', '0'], /--limit must be a whole number of at least 1, got "0"/],
+    [[...STACKS, '--limit', '2.5'], /--limit must be a whole number of at least 1/],
+    [[...STACKS, '--limit', 'all'], /--limit must be a whole number of at least 1/],
   ]) {
     const r = await skillCheck(args);
     assert.equal(r.code, 1, args.join(' '));
@@ -123,4 +126,22 @@ test('an AWS error reaches the terminal without control or format characters', a
   assert.equal(r.code, 1);
   assert.match(r.stderr, /^error: could not read the outputs of stack ValkeyReviewAgent: .*Stack \?\[2J\? does not exist/);
   assert.ok(!/[\u001b\u202e]/.test(r.stderr));
+});
+
+test('--limit caps the checks queued; the rest are listed and counted', async () => {
+  const r = await skillCheck([...STACKS, '--limit', '1']);
+  assert.equal(r.code, 0, r.stderr);
+  assert.deepEqual(r.sent.map((m) => m.record_name), ['rdb-load']);
+  assert.match(r.stdout, /^limit: at most 1 check\(s\), 60 seconds apart$/m);
+  assert.match(r.stdout, /^over the limit bucket="src" id="r2" name="emptydb-flush": a later run can queue it$/m);
+  assert.match(r.stdout, /^queued 1 check\(s\) on the curator queue; skipped 0; errors 0$/m);
+  assert.match(r.stdout, /^1 more over --limit 1\. A report-mode check advances no record/m);
+
+  const apply = await skillCheck([...STACKS, '--limit', '1', '--apply']);
+  assert.match(apply.stdout, /^1 more over --limit 1\. Run again for them once these checks have run/m);
+
+  const many = await skillCheck([...STACKS, '--limit', '40', '--plan']);
+  assert.match(many.stdout, /^limit: at most 40 check\(s\), 60 seconds apart; past the 16th they arrive together/m);
+  const defaults = await skillCheck([...STACKS, '--plan']);
+  assert.match(defaults.stdout, /^limit: at most 10 check\(s\), 60 seconds apart$/m);
 });

@@ -12,6 +12,8 @@ import { printable } from './text.mjs';
 // message this sends. test/check-queue.test.mjs checks the messages and
 // claims against what decayTable sends and writes.
 export const MAINTENANCE_RETRY_DAYS = 7;
+/** Checks queued per run unless the caller says otherwise: the decay pass's default SKILL_CHECKS_PER_DAY. */
+export const DEFAULT_CHECK_LIMIT = 10;
 const DAY_MS = 24 * 3600 * 1000;
 const CHECK_STAGGER_SECONDS = 60;
 const MAX_DELAY_SECONDS = 900;
@@ -26,6 +28,8 @@ const ATTRIBUTES = {
   '#rid': 'record_id',
   '#grn': 'graduated_record_name',
   '#ua': 'updated_at',
+  '#ga': 'graduated_at',
+  '#va': 'verified_at',
   '#ret': 'retired_at',
   '#mra': 'maintenance_requested_at',
   '#mr': 'maintenance_reason',
@@ -39,12 +43,27 @@ export const checkDelay = (i) => Math.min(MAX_DELAY_SECONDS, CHECK_STAGGER_SECON
 /** A record's table and key for an output line; the values are model-chosen, so quoted. */
 export const recordRef = (key) => `bucket=${quoted(key.area_bucket)} id=${quoted(key.record_id)}`;
 
+const timeOf = (value) => Date.parse(typeof value === 'string' ? value : '');
+
+/**
+ * Where a record sorts, as the decay pass orders its checks: never
+ * checked first (oldest graduation first), then re-published since its
+ * check, then the oldest check.
+ */
+function checkOrder(item) {
+  const verifiedMs = timeOf(item.verified_at);
+  const graduatedMs = timeOf(item.graduated_at);
+  if (!Number.isFinite(verifiedMs)) return { rank: 0, sinceMs: Number.isFinite(graduatedMs) ? graduatedMs : 0 };
+  return { rank: Number.isFinite(graduatedMs) && graduatedMs > verifiedMs ? 1 : 2, sinceMs: verifiedMs };
+}
+
 /**
  * Which live graduated records get a check, and why the others do not.
  * `name` narrows it to the record that graduated under that name.
  * Records in reserved buckets are not concern records and are left out.
- * Returns `checks` sorted by bucket and id, `skipped` with a reason
- * each, and `matched`, how many records `name` matched.
+ * Returns `checks` in the decay pass's order (checkOrder, then bucket
+ * and id), `skipped` with a reason each, sorted by bucket and id, and
+ * `matched`, how many records `name` matched.
  */
 export function planChecks(items, { reviewerId, name, nowMs }) {
   const nowIso = new Date(nowMs).toISOString();
@@ -81,10 +100,11 @@ export function planChecks(items, { reviewerId, name, nowMs }) {
       skip('area_bucket or record_id is too long for a maintenance message');
       continue;
     }
-    checks.push({ key, name: grn, updatedAt: item.updated_at, requestedAt });
+    checks.push({ key, name: grn, updatedAt: item.updated_at, requestedAt, ...checkOrder(item) });
   }
   const byKey = (a, b) => a.key.area_bucket.localeCompare(b.key.area_bucket) || a.key.record_id.localeCompare(b.key.record_id);
-  return { checks: checks.sort(byKey), skipped: skipped.sort(byKey), matched };
+  checks.sort((a, b) => a.rank - b.rank || a.sinceMs - b.sinceMs || byKey(a, b));
+  return { checks, skipped: skipped.sort(byKey), matched };
 }
 
 /** The message body, as decay builds a CheckMessage. */
@@ -159,11 +179,16 @@ export function releaseArgs(table, key, id) {
 }
 
 /**
- * Claim and queue a check of each live graduated record of `table` (or
- * the one graduated as `name`). With `plan`, only print what it would
- * queue. Returns the counts; the caller turns errors into the exit code.
+ * Claim and queue a check of the live graduated records of `table` (or
+ * the one graduated as `name`), at most `limit` of them, in the decay
+ * pass's order and with its delays. With `plan`, only print what it
+ * would queue. Returns the counts; `deferred` is how many were left over
+ * `limit`. The caller turns errors into the exit code.
  */
-export function queueChecks({ aws, table, queueUrl, reviewerId, name, releaseTag, dryRun, plan, nowMs, log = console.log }) {
+export function queueChecks({
+  aws, table, queueUrl, reviewerId, name, releaseTag, dryRun, plan, nowMs, limit = DEFAULT_CHECK_LIMIT, log = console.log,
+}) {
+  if (!Number.isInteger(limit) || limit < 1) throw new Error(`the limit must be a whole number of at least 1, got ${limit}`);
   const nowIso = new Date(nowMs).toISOString();
   const items = scanItems(aws, table, {
     projection: Object.keys(ATTRIBUTES).join(', '),
@@ -177,10 +202,17 @@ export function queueChecks({ aws, table, queueUrl, reviewerId, name, releaseTag
   let claims = 0;
   let queued = 0;
   let lost = 0;
+  let deferred = 0;
   let errors = 0;
   for (const check of checks) {
     const id = maintenanceId(reviewerId, check.key.record_id, nowIso);
     const line = `${recordRef(check.key)} name=${quoted(check.name)}`;
+    // As in the decay pass, only claims made count, so a record that changed under us frees its slot.
+    if (claims >= limit) {
+      deferred += 1;
+      log(`over the limit ${line}: a later run can queue it`);
+      continue;
+    }
     if (plan) {
       log(`would queue ${line} delay=${checkDelay(claims)}s`);
       claims += 1;
@@ -219,5 +251,5 @@ export function queueChecks({ aws, table, queueUrl, reviewerId, name, releaseTag
       }
     }
   }
-  return { queued, skipped: skipped.length + lost, errors };
+  return { queued, skipped: skipped.length + lost, deferred, errors };
 }

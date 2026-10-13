@@ -6,7 +6,7 @@
 // Usage:
 //   node scripts/skill-check.mjs (--stack REVIEWER_STACK | --table CONCERNS_TABLE)
 //        (--webhook-stack WEBHOOK_STACK | --queue-url URL) [--name SKILL_NAME]
-//        [--release TAG] [--reviewer ID] [--apply] [--plan] [--region REGION]
+//        [--release TAG] [--reviewer ID] [--limit N] [--apply] [--plan] [--region REGION]
 //
 //   --stack          a reviewer agent stack; its ConcernsTableName output is used
 //   --table          a concerns table, used as given
@@ -20,23 +20,42 @@
 //                    check the next scheduled pass checks the skill again.
 //   --reviewer       the reviewer id, for a table whose name does not give it;
 //                    valkey_review_concerns is valkey-review's table
+//   --limit          queue at most N checks (default 10, the decay job's
+//                    default SKILL_CHECKS_PER_DAY)
 //   --apply          send dry_run: false (see below)
 //   --plan           print the checks it would queue; write and send nothing
 //
-// Each live graduated record (or the one that graduated as --name) is
-// claimed the way the decay job claims it (maintenance_id,
-// maintenance_requested_at and maintenance_reason on the record) and gets
-// one check message, 60 seconds after the previous one (at most 900), so
-// the checks do not hold up maintainer feedback on the shared queue. A
-// record with a maintenance request younger than 7 days is skipped, as
-// is a retired skill's record.
+// Run it only once the curator that handles maintenance messages is
+// deployed. An older curator rejects them, so they go to its dead-letter
+// queue, and each record it claimed gets no decay check or retirement for
+// 7 days. Stopping the script between a claim and its send does the same
+// to that record.
+//
+// The live graduated records (or the one that graduated as --name) are
+// taken in the decay job's order: never checked first, then re-published
+// since their last check, then the oldest check. Up to --limit of them are
+// claimed the way the decay job claims them (maintenance_id,
+// maintenance_requested_at and maintenance_reason on the record), and
+// each gets one check message, 60 seconds after the previous one. SQS
+// delays a message by at most 900 seconds, so with --limit above 16 the
+// rest arrive together. Checks share the curator queue with maintainer
+// feedback, and an audit can take up to 12 minutes, so a large --limit
+// makes feedback wait. A record with a maintenance request younger than
+// 7 days is skipped, as is a retired skill's record.
+//
+// The records past --limit are listed as over the limit. The ones this
+// run claimed count as in flight until the curator has run them, so a
+// second run before that queues the next --limit on top of these. Once
+// they have run, an --apply run starts with the ones left over; a
+// report-mode run starts with the same records again (see below).
 //
 // Report mode (the default): the messages carry dry_run: true. The
 // curator runs each check and records and logs its outcome, but makes no
 // registry change and opens no pull request, whatever its own settings
-// say. --apply sends dry_run: false; the curator's skillLifecycle
-// settings (applyEdits, openPullRequests) still decide what it may
-// change.
+// say. A report-mode check advances no record, so the next run starts
+// with the same records: use --name for one skill, or a larger --limit.
+// --apply sends dry_run: false; the curator's skillLifecycle settings
+// (applyEdits, openPullRequests) still decide what it may change.
 //
 // Outcomes: the curator's [maintenance] log lines, and
 // scripts/concerns-dump.sh (check_outcome, check_note, stale names and
@@ -51,14 +70,14 @@
 import { parseArgs } from 'node:util';
 import { RELEASE_TAG_RE } from '../ops/src/releases.ts';
 import { awsRunner, quoted, stackOutputs } from './lib/aws-cli.mjs';
-import { queueChecks, REVIEWER_ID_RE } from './lib/check-queue.mjs';
+import { DEFAULT_CHECK_LIMIT, queueChecks, REVIEWER_ID_RE } from './lib/check-queue.mjs';
 import { reviewerIdOfTable } from './lib/skill-records.mjs';
 import { printable } from './lib/text.mjs';
 
 const USAGE = [
   'usage: node scripts/skill-check.mjs (--stack REVIEWER_STACK | --table CONCERNS_TABLE)',
   '         (--webhook-stack WEBHOOK_STACK | --queue-url URL) [--name SKILL_NAME]',
-  '         [--release TAG] [--reviewer ID] [--apply] [--plan] [--region REGION]',
+  '         [--release TAG] [--reviewer ID] [--limit N] [--apply] [--plan] [--region REGION]',
 ].join('\n');
 
 function fail(message) {
@@ -77,6 +96,7 @@ try {
       name: { type: 'string' },
       release: { type: 'string' },
       reviewer: { type: 'string' },
+      limit: { type: 'string' },
       apply: { type: 'boolean', default: false },
       plan: { type: 'boolean', default: false },
       region: { type: 'string' },
@@ -95,6 +115,8 @@ if (!values['webhook-stack'] === !values['queue-url']) fail(`pass exactly one of
 const releaseTag = values.release ?? '';
 if (releaseTag && !RELEASE_TAG_RE.test(releaseTag)) fail(`--release must be a GA tag such as 9.1.2 or v2.5.3, got ${quoted(releaseTag)}`);
 if (values.name !== undefined && !/^[a-z0-9][a-z0-9-]{0,99}$/.test(values.name)) fail('--name must be a registry record name: lowercase letters, digits and hyphens');
+if (values.limit !== undefined && !/^[1-9][0-9]{0,5}$/.test(values.limit)) fail(`--limit must be a whole number of at least 1, got ${quoted(values.limit)}`);
+const limit = values.limit === undefined ? DEFAULT_CHECK_LIMIT : Number(values.limit);
 
 const aws = awsRunner(values.region);
 function output(stack, key) {
@@ -121,16 +143,22 @@ console.log(`reviewer ${reviewerId}, table ${table}, release ${releaseTag || 'no
 console.log(dryRun
   ? 'report mode: dry_run=true, so the curator makes no registry change and opens no pull request; --apply sends dry_run=false'
   : 'apply mode: dry_run=false, so the curator acts as its skillLifecycle settings allow');
+console.log(`limit: at most ${limit} check(s), 60 seconds apart${limit > 16 ? '; past the 16th they arrive together, at the 900-second SQS maximum' : ''}`);
 if (values.plan) console.log('plan only: nothing is claimed or sent');
 
 let result;
 try {
-  result = queueChecks({ aws, table, queueUrl, reviewerId, name: values.name, releaseTag, dryRun, plan: values.plan, nowMs: Date.now() });
+  result = queueChecks({ aws, table, queueUrl, reviewerId, name: values.name, releaseTag, dryRun, plan: values.plan, nowMs: Date.now(), limit });
 } catch (err) {
   fail(err.message);
 }
 const verb = values.plan ? 'would queue' : 'queued';
 console.log(`${verb} ${result.queued} check(s) on the curator queue; skipped ${result.skipped}; errors ${result.errors}`);
+if (result.deferred > 0) {
+  console.log(`${result.deferred} more over --limit ${limit}. ${dryRun
+    ? 'A report-mode check advances no record, so a new run starts with the same ones: use --name or a larger --limit.'
+    : 'Run again for them once these checks have run; before that, a new run queues the next ones on top of these.'}`);
+}
 if (result.queued > 0 && !values.plan) {
   console.log('Outcomes: the curator\'s [maintenance] log lines, and scripts/concerns-dump.sh once the checks have run.');
 }
