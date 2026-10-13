@@ -13,7 +13,9 @@
 #
 # Needs the AWS CLI v2 and jq, and credentials allowed to call
 # cloudformation:DescribeStacks (for --stack) and dynamodb:Scan on the
-# tables. The region comes from AWS_REGION or the CLI profile.
+# tables, plus kms:Decrypt on the key the tables are encrypted with (the
+# SubstrateKeyArn output of ValkeyReviewerSubstrate). The region comes
+# from AWS_REGION or the CLI profile.
 set -euo pipefail
 
 . "$(dirname "$0")/lib/common.sh"
