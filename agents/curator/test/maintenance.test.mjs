@@ -695,6 +695,39 @@ test('obsolete with every area glob empty sets the score to 0 and records the re
   assert.ok(claimGone(item));
 });
 
+test('an obsolete finding a reinforcement overtook is recorded, logged and returned as suspect', async () => {
+  let bumped = false;
+  const s = setup({
+    item: record({ area: ['src/gone/**'] }),
+    turns: [report('obsolete')],
+    hooks: {
+      beforeUpdate: (input, table) => {
+        // A maintainer reinforces the record just before the obsolete write.
+        if (!bumped && input.UpdateExpression.includes('#checkoutcome')) {
+          bumped = true;
+          table.put({ ...table.item(KEY), decay_score: 1, updated_at: '2026-10-13T00:30:00.000Z' });
+        }
+      },
+    },
+  });
+  const { result, lines } = await run(checkMessage(), s.deps);
+  assert.deepEqual(result, { status: 'completed', decision: 'suspect' });
+  const item = s.table.item(KEY);
+  assert.equal(item.check_outcome, 'suspect');
+  assert.equal(item.decay_score, 1);
+  assert.equal(item.obsolete_release, undefined);
+  // The audit's finding waits for the operator, and the verification stays where it was.
+  assert.equal(item.pending_revision.verdict, 'obsolete');
+  assert.equal(item.pending_revision.reason, 'reinforced since the check');
+  assert.equal(item.verified_sha, BASE_SHA);
+  assert.equal(item.verified_ref, undefined);
+  assert.deepEqual(set(item.audit_names), ['serverCron', 'signalFlushedDb', 'src/db.c']);
+  assert.ok(claimGone(item));
+  const line = lines.find((l) => l.startsWith('[maintenance] check '));
+  assert.match(line, /outcome="suspect"/);
+  assert.match(line, /why="reinforced since the check"/);
+});
+
 test('the penalty is conditioned on the score as read and dropped after a reinforcement', async () => {
   let bumped = false;
   const s = setup({

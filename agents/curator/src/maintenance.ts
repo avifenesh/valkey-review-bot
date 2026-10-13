@@ -730,6 +730,9 @@ async function finishCheck(run: Run, build: (item: Item, penalty: boolean) => Wr
   return run.state(terminal(fresh!, fresh!.updated_at === first.updated_at));
 }
 
+/** pending_revision.reason of an obsolete finding a reinforcement overtook. */
+const REINFORCED_SINCE = 'reinforced since the check';
+
 /** Fields every completed check sets: outcome, note, release and time; the claim goes. */
 function outcomeWrite(run: Run, v: Outcome): Write {
   const tag = run.req.reason === 'repo_check' || run.req.reason === 'check' ? run.req.release_tag : '';
@@ -1070,17 +1073,32 @@ async function* checkBody(run: Run, req: CheckRequest, c: Checked, skill: SkillR
 
   if (report.verdict === 'obsolete' && valid && await obsoleteCorroborated(c, areaGlobs(item))) {
     const v: Outcome = { outcome: 'obsolete', note: flaggedNote(`the skill's subject is gone (${r.lost.length} of ${c.baseline.length + c.carried.length} names lost)`) };
-    await finishCheck(run, (it, reinforcedNot) => {
-      const w = outcomeWrite(run, reinforcedNot ? v : { outcome: 'suspect', note: v.note }).remove('pending_revision');
+    // What was written: a reinforcement since the read turns the finding into a suspect one.
+    const written: { outcome: 'obsolete' | 'suspect' } = { outcome: 'obsolete' };
+    await finishCheck(run, (it, notReinforced) => {
+      written.outcome = notReinforced ? 'obsolete' : 'suspect';
+      if (!notReinforced) {
+        // The record stays live and unverified; the finding waits for the operator.
+        const w = outcomeWrite(run, { outcome: 'suspect', note: v.note }).set('pending_revision', pendingRevision(run.nowIso, c, report, REINFORCED_SINCE));
+        keepBaseline(w, it, c.result.lost);
+        stale(w, it, unresolved, run.nowIso);
+        lostNames(w, r.lost);
+        return w;
+      }
+      const w = outcomeWrite(run, v).remove('pending_revision');
       confirm(w, c, r.present, it, c.result.lost);
       stale(w, it, unresolved, run.nowIso);
       lostNames(w, r.lost);
-      // A reinforcement since the read wins: the record stays live and only the finding is kept.
-      if (reinforcedNot) w.set('obsolete_release', c.label).set('decay_score', 0).is('updated_at', it.updated_at);
-      return w;
+      return w.set('obsolete_release', c.label).set('decay_score', 0).is('updated_at', it.updated_at);
     });
-    run.log('check', { outcome: 'obsolete', ...fields, note: v.note, summary: report.summary });
-    return completed('obsolete');
+    run.log('check', {
+      outcome: written.outcome,
+      ...fields,
+      ...(written.outcome === 'suspect' ? { why: REINFORCED_SINCE } : {}),
+      note: v.note,
+      summary: report.summary,
+    });
+    return completed(written.outcome);
   }
 
   if (report.verdict === 'revise' && valid && report.skillMd !== null && run.deps.settings.checkApplyEdits) {
