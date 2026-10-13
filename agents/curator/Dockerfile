@@ -1,8 +1,9 @@
 # Curator agent container: the concerns-store tools and skill graduation
 # into AWS Agent Registry. Unlike the reviewers it needs no repository
-# checkout, language toolchains or language servers.
+# checkout, language toolchains or language servers. The base image is
+# pinned by digest.
 
-FROM --platform=$BUILDPLATFORM public.ecr.aws/docker/library/node:26-bookworm-slim AS build
+FROM --platform=$BUILDPLATFORM public.ecr.aws/docker/library/node:26-bookworm-slim@sha256:86f07bc9c5dce4578cf37e5a418b7bfc7f817cda25cde66e2b66e95ed86c4567 AS build
 
 ENV NODE_ENV=development
 
@@ -26,7 +27,7 @@ RUN npx tsc --noEmit && npx tsc -p tsconfig.json
 
 RUN npm prune --omit=dev
 
-FROM public.ecr.aws/docker/library/node:26-bookworm-slim AS runtime
+FROM public.ecr.aws/docker/library/node:26-bookworm-slim@sha256:86f07bc9c5dce4578cf37e5a418b7bfc7f817cda25cde66e2b66e95ed86c4567 AS runtime
 
 ENV NODE_ENV=production
 

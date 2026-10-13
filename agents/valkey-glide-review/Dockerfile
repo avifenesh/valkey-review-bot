@@ -12,12 +12,18 @@
 #   runtime  base plus the toolchains, the clone, and the build output.
 #
 # Build with the repository root as the context: the agent imports
-# agents/common. Downloads are pinned by version and checked against
-# the SHA-256 published with each release.
+# agents/common.
+#
+# Pinned: the base image by digest, and the JDK, protoc, Go, zig and
+# cargo-zigbuild downloads by version, each checked against the SHA-256
+# published with its release. Not pinned: Node.js comes from the
+# NodeSource apt repository for NODE_MAJOR, Rust from rustup's stable
+# channel, and gh and the Debian packages from their apt repositories
+# at build time.
 
 ARG NODE_MAJOR=26
 
-FROM public.ecr.aws/docker/library/debian:bookworm-slim AS base
+FROM public.ecr.aws/docker/library/debian:bookworm-slim@sha256:7c7b2c966bc9ee8cedfeef67e0e279108992c77681fa595db4a9d65c06ccc587 AS base
 ARG NODE_MAJOR
 SHELL ["/bin/bash", "-o", "pipefail", "-c"]
 ENV DEBIAN_FRONTEND=noninteractive \
