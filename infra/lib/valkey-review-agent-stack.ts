@@ -13,6 +13,16 @@ import { modelAccessStatements } from './bedrock-arns';
 import type { ModelsConfig, ReviewerAgentConfig, ReviewerId } from './deployment-config';
 import { createRuntimeRole, registryResources } from './grants';
 
+/**
+ * A review reports HealthyBusy on /ping for as long as it runs, so the
+ * 15-minute idle timeout never stops a working session. maxLifetime bounds
+ * a run that hangs instead: the watchdog gives up on a review after its
+ * run budget (RUN_BUDGET_MINUTES, default 90), so a session still busy
+ * after two hours is stuck.
+ */
+const SESSION_IDLE_TIMEOUT_SECONDS = 15 * 60;
+const SESSION_MAX_LIFETIME_SECONDS = 2 * 60 * 60;
+
 export interface AgentStackProps extends cdk.StackProps {
   readonly agentId: ReviewerId;
   readonly description: string;
@@ -132,6 +142,10 @@ export class ValkeyReviewAgentStack extends cdk.Stack {
       },
       networkConfiguration: {
         networkMode: 'PUBLIC',
+      },
+      lifecycleConfiguration: {
+        idleRuntimeSessionTimeout: SESSION_IDLE_TIMEOUT_SECONDS,
+        maxLifetime: SESSION_MAX_LIFETIME_SECONDS,
       },
       roleArn: this.role.roleArn,
       environmentVariables: {

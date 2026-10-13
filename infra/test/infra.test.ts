@@ -99,6 +99,11 @@ describe('reviewer role', () => {
     expect(JSON.stringify(invoke)).not.toContain('TokenBrokerValkeyGlideReviewFn');
   });
 
+  test.each(['valkey-review', 'valkey-glide-review'] as const)('%s sessions end two hours after they start at the latest', (id) => {
+    const runtime = Object.values<any>(reviewerTemplate(id).findResources('AWS::BedrockAgentCore::Runtime'))[0];
+    expect(runtime.Properties.LifecycleConfiguration).toEqual({ IdleRuntimeSessionTimeout: 900, MaxLifetime: 7200 });
+  });
+
   test.each([
     ['valkey-review', 'valkey_review_runtime'],
     ['valkey-glide-review', 'valkey_glide_review_runtime'],
