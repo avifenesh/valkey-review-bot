@@ -238,6 +238,7 @@ test('update_concern on a graduated record lets the run re-publish its skill', a
     item: { area_bucket: 'src', record_id: 'r1', reinforcement_count: 5, graduated_record_name: 'original-name' },
     reinforced: null,
     edited: { areaBucket: 'src', recordId: 'r1' },
+    get: async (name) => ({ name, status: 'DRAFT', description: 'd', skillMd: 'old body' }),
   });
   const out = parse(await submit.invoke(INPUT));
   assert.equal(out.ok, true);
@@ -457,6 +458,23 @@ test('update_concern alone cannot bring a retired skill back', async () => {
   assert.match(out.error, /was retired; only a bump or merge in this run can publish it again/);
   assert.deepEqual(w.registry.calls, []);
   assert.deepEqual(w.ddb.ops(), ['GetCommand']);
+});
+
+test('update_concern alone cannot publish a skill the registry does not have', async () => {
+  const w = world({ item: live(), skills: {}, reinforced: false, edited: true });
+  const out = parse(await w.submit.invoke(INPUT));
+  assert.equal(out.ok, false);
+  assert.match(out.error, /the registry has no skill named "replication-handshake-cancel-paths"; only a reinforcement can publish it/);
+  assert.deepEqual(w.registry.calls, [`get ${OLD}`]);
+  assert.deepEqual(w.ddb.ops(), ['GetCommand'], 'nothing is claimed');
+  assert.equal(w.run.take('skill_submit', 'next'), null, 'the slot is free');
+
+  // A reinforcement still finishes a first graduation whose publish failed.
+  const reinforced = world({ item: live(), skills: {} });
+  const done = parse(await reinforced.submit.invoke(INPUT));
+  assert.equal(done.ok, true, done.error);
+  assert.equal(done.action, 'created');
+  assert.equal(done.record_name, OLD);
 });
 
 test('a live skill deprecated outside the lifecycle is marked as an operator retirement', async () => {

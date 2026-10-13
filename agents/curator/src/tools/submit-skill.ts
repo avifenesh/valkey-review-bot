@@ -432,6 +432,8 @@ async function chooseTarget(
     if (published && isRetiredStatus(published.status)) {
       return markRetired(deps, { area_bucket: input.area_bucket, record_id: input.source_record_id }, current, reinforced);
     }
+    // update_concern corrects a published skill; it does not create a missing one.
+    if (!published && !reinforced) return `the registry has no skill named "${current}"; only a reinforcement can publish it`;
     return keep(false, published?.skillMd ?? null);
   }
 
