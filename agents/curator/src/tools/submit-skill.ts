@@ -65,7 +65,12 @@ export interface SkillPublisher {
 
 export interface SubmitSkillDeps extends ConcernsDeps {
   readonly registry: SkillPublisher;
+  /** Waits between attempts of the write that records a publish; setTimeout when absent. */
+  readonly sleep?: (ms: number) => Promise<void>;
 }
+
+/** Waits before each retry of the write that records a publish. */
+const RECORD_RETRY_DELAYS_MS: readonly number[] = [200, 800, 2_000];
 
 /** The provenance sentence submit_skill appends to every description, for operators. */
 const PROVENANCE_RE = /\s*Graduated from concern record_id=\S*\s*$/;
@@ -238,6 +243,27 @@ interface Target {
   readonly replaces?: string;
   /** The published markdown whose suppressed blocks the new text must keep; null when there is none. */
   readonly previous: string | null;
+  /** The record stays a tombstone until the write after the publish clears retired_at. */
+  readonly tombstone: boolean;
+}
+
+/**
+ * Send the write `build` returns, again after each of
+ * RECORD_RETRY_DELAYS_MS when it fails for a reason other than its
+ * condition. Throws the last error.
+ */
+async function sendWithRetries(deps: SubmitSkillDeps, build: () => UpdateCommand): Promise<void> {
+  const sleep = deps.sleep ?? ((ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms)));
+  for (let attempt = 0; ; attempt++) {
+    try {
+      await deps.ddb.send(build());
+      return;
+    } catch (err) {
+      const delay = RECORD_RETRY_DELAYS_MS[attempt];
+      if (isConditionFailure(err) || delay === undefined) throw err;
+      await sleep(delay);
+    }
+  }
 }
 
 /**
@@ -306,6 +332,7 @@ async function chooseTarget(
       conditions: [...gate, 'attribute_not_exists(#grn)'],
       values: { ':name': name, ':t': threshold },
       previous: null,
+      tombstone: false,
     };
   }
 
@@ -315,6 +342,7 @@ async function chooseTarget(
     conditions: [...gate, '#grn = :name', retired ? 'attribute_exists(#ret)' : 'attribute_not_exists(#ret)'],
     values: { ':name': current, ':t': threshold },
     previous,
+    tombstone: retired,
   });
   if (source.retired_at === undefined) {
     // The published text may hold the release check's suppressed blocks, which the new text must keep.
@@ -355,6 +383,7 @@ async function chooseTarget(
     values: { ':name': name, ':gen': generation, ':old': current, ':t': threshold },
     replaces: current,
     previous: published.skillMd,
+    tombstone: true,
   };
 }
 
@@ -444,14 +473,27 @@ Do not delete the source record afterwards; it stays as the skill's provenance.`
         // from an operator's, so it stays.
         const marker = source.maintenance_deprecating;
         const cleared = typeof marker === 'string' && marker !== target.name ? `${CLEARED_ON_PUBLISH}, #mdep` : CLEARED_ON_PUBLISH;
+        // On a re-publication this write also takes the record out of
+        // tombstone state, so it is retried. If it still fails, the
+        // record stays retired while its skill is live: decay skips it
+        // until a reinforcement and submit_skill finish the publication
+        // under the same name (chooseTarget).
+        const now = new Date().toISOString();
         try {
-          await deps.ddb.send(updateCommand(deps.table, key, `SET #ga = :now REMOVE ${cleared}`, ['#grn = :name'], {
-            ':now': new Date().toISOString(),
+          await sendWithRetries(deps, () => updateCommand(deps.table, key, `SET #ga = :now REMOVE ${cleared}`, ['#grn = :name'], {
+            ':now': now,
             ':name': target.name,
           }));
         } catch (err) {
-          // The skill is live; a missing timestamp is not worth failing the graduation over.
-          console.warn(`[submit_skill] graduated_at not recorded on ${input.source_record_id}: ${errorText(err)}`);
+          const where = `record ${JSON.stringify(input.source_record_id)} in ${JSON.stringify(input.area_bucket)}`;
+          if (isConditionFailure(err)) {
+            console.warn(`[submit_skill] ${where} no longer names skill ${JSON.stringify(target.name)}; the publish is not recorded on it`);
+          } else if (target.tombstone) {
+            console.error(`[submit_skill] ${where} is still marked retired while its skill ${JSON.stringify(target.name)} is live: ${errorText(err)}`);
+          } else {
+            // The skill is live; a missing timestamp is not worth failing the graduation over.
+            console.warn(`[submit_skill] graduated_at not recorded on ${where}: ${errorText(err)}`);
+          }
         }
 
         return ok({

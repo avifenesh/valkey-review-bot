@@ -314,14 +314,51 @@ function fakeRegistry(records = {}) {
   };
 }
 
-function world({ item, skills = {}, reinforced = true, edited = false, registry = fakeRegistry(skills) }) {
+/**
+ * A record in a memoryTable and a registry, with a submit_skill tool for
+ * one run. `intercept(command, row)` runs before the table handles each
+ * command and may throw or change the stored row. `nextRun()` builds the
+ * tool for a later run on the same table and registry.
+ */
+function world({ item, skills = {}, reinforced = true, edited = false, registry = fakeRegistry(skills), intercept }) {
   const table = memoryTable([item]);
-  const run = newRun();
+  const record = () => table.item(item.area_bucket, item.record_id);
+  if (intercept) {
+    const send = table.ddb.send;
+    table.ddb.send = async (command) => {
+      intercept(command, record());
+      return send(command);
+    };
+  }
+  const sleeps = [];
   const touched = { areaBucket: item.area_bucket, recordId: item.record_id };
-  if (reinforced) run.reinforced = touched;
-  if (edited) run.edited = touched;
-  const submit = buildSubmitSkillTool({ ddb: table.ddb, table: 'concerns', run, registry });
-  return { ddb: table.ddb, registry, run, submit, record: () => table.item(item.area_bucket, item.record_id) };
+  const build = (asReinforced, asEdited) => {
+    const run = newRun();
+    if (asReinforced) run.reinforced = touched;
+    if (asEdited) run.edited = touched;
+    const sleep = async (ms) => { sleeps.push(ms); };
+    return { run, submit: buildSubmitSkillTool({ ddb: table.ddb, table: 'concerns', run, registry, sleep }) };
+  };
+  const { run, submit } = build(reinforced, edited);
+  return { ddb: table.ddb, registry, run, submit, record, sleeps, nextRun: ({ reinforced = true, edited = false } = {}) => build(reinforced, edited) };
+}
+
+const throttled = () => Object.assign(new Error('Rate exceeded'), { name: 'ProvisionedThroughputExceededException' });
+const isPublishWrite = (command) => command.constructor.name === 'UpdateCommand' && command.input.UpdateExpression.startsWith('SET #ga = :now');
+
+/** Runs `fn` with console.error and console.warn captured; returns what they printed. */
+async function capturingLogs(fn) {
+  const logged = { error: [], warn: [] };
+  const { error, warn } = console;
+  console.error = (...args) => { logged.error.push(args.join(' ')); };
+  console.warn = (...args) => { logged.warn.push(args.join(' ')); };
+  try {
+    await fn();
+  } finally {
+    console.error = error;
+    console.warn = warn;
+  }
+  return logged;
 }
 
 const OLD = 'replication-handshake-cancel-paths';
@@ -487,6 +524,64 @@ test('an unfinished re-publication finishes under the name it claimed', async ()
     assert.equal(rec.skill_generation, 2);
     assert.ok(!('retired_at' in rec));
   }
+});
+
+test('the write that takes a re-published record out of tombstone state is retried', async () => {
+  let failures = 2;
+  const w = world({
+    item: tombstone(),
+    skills: DEPRECATED,
+    intercept: (command) => { if (isPublishWrite(command) && failures-- > 0) throw throttled(); },
+  });
+  const out = parse(await w.submit.invoke(INPUT));
+  assert.equal(out.ok, true, out.error);
+  assert.deepEqual(w.sleeps, [200, 800], 'two failures, two waits');
+  const rec = w.record();
+  assert.equal(rec.graduated_record_name, generationName(2));
+  for (const gone of ['retired_at', 'retired_reason', 'retired_from_status']) assert.ok(!(gone in rec), gone);
+  assert.ok(rec.graduated_at > '2026-10-01');
+});
+
+test('a re-published record left retired is logged as an error and a later reinforcement finishes it', async () => {
+  let failing = true;
+  const w = world({
+    item: tombstone(),
+    skills: DEPRECATED,
+    intercept: (command) => { if (failing && isPublishWrite(command)) throw throttled(); },
+  });
+  let out;
+  const logged = await capturingLogs(async () => { out = parse(await w.submit.invoke(INPUT)); });
+  assert.equal(out.ok, true, 'the skill is live, so the submit succeeded');
+  assert.equal(w.sleeps.length, 3, 'every retry was used');
+  assert.equal(logged.error.length, 1);
+  assert.match(logged.error[0], new RegExp(`"r1" in "src" is still marked retired while its skill "${generationName(2)}" is live: ProvisionedThroughputExceededException`));
+  assert.equal(w.registry.skills.get(generationName(2)).status, 'CREATING');
+  assert.equal(w.record().graduated_record_name, generationName(2));
+  assert.equal(w.record().retired_reason, 'decayed', 'the record is still a tombstone');
+
+  failing = false;
+  const next = w.nextRun();
+  const again = parse(await next.submit.invoke(INPUT));
+  assert.equal(again.ok, true, again.error);
+  assert.equal(again.record_name, generationName(2), 'no third generation');
+  assert.equal(again.action, 'updated');
+  const rec = w.record();
+  for (const gone of ['retired_at', 'retired_reason', 'retired_from_status']) assert.ok(!(gone in rec), gone);
+  assert.equal(rec.skill_generation, 2);
+});
+
+test('a live update whose record write keeps failing only warns', async () => {
+  const w = world({
+    item: live(),
+    skills: { [OLD]: { status: 'DRAFT', skillMd: 'live body' } },
+    intercept: (command) => { if (isPublishWrite(command)) throw throttled(); },
+  });
+  let out;
+  const logged = await capturingLogs(async () => { out = parse(await w.submit.invoke(INPUT)); });
+  assert.equal(out.ok, true, out.error);
+  assert.deepEqual(logged.error, []);
+  assert.equal(logged.warn.length, 1);
+  assert.match(logged.warn[0], /graduated_at not recorded on record "r1" in "src"/);
 });
 
 test('publishing clears the old text\'s check and maintenance state and keeps the name baseline', async () => {
