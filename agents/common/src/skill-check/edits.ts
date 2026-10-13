@@ -11,6 +11,11 @@
  *   <!-- /suppressed -->
  *   <the replacement piece>
  *
+ * <release> is the GA tag that triggered the check (9.1.2 or v2.5.1), or
+ * "<branch>@<first 12 hex of the checked commit>" when no tag is known
+ * (releaseLabel builds it). parseSuppressed is the one reader of this
+ * grammar; names.ts keeps a copy of it, kept in step by the tests.
+ *
  * The reason is generated from the changed names ("`a` is now `b`",
  * several joined by "; "); an edit cannot supply one, so no caller or
  * model text reaches the skill. Several citations are separated by
@@ -57,7 +62,7 @@ export interface SuppressEdit {
 export interface EditContext {
   /** Names the check flagged (lost, new_absent or touched). Every piece must contain one. */
   readonly flagged: readonly string[];
-  /** The release named in the marker: a tag, or "<branch>@<sha12>" when no tag is known. */
+  /** The release named in the marker: a GA tag, or "<branch>@<sha12>" when no tag is known (see releaseLabel). */
   readonly release: string;
   /** YYYY-MM-DD of the check. */
   readonly date: string;
@@ -116,7 +121,11 @@ const HEADER_RE = /^<!-- suppressed: superseded in ([^\s,;]+), (\d{4}-\d{2}-\d{2
 const OPEN_LIKE_RE = /^<!--\s*suppressed\b/;
 const CLOSE_LIKE_RE = /^<!--\s*\/\s*suppressed\b/;
 
-const RELEASE_RE = /^[A-Za-z0-9][A-Za-z0-9._\/@+-]{0,99}$/;
+/** A GA release tag, the shape release detection accepts (RELEASE_TAG_RE in ops). */
+const RELEASE_TAG_RE = /^v?[0-9]{1,4}\.[0-9]{1,4}\.[0-9]{1,4}$/;
+/** A branch name in a release label: git ref rules, and no '@', ',', ';' or space, so the marker parses. */
+const LABEL_BRANCH_RE = /^(?!.*\.\.)(?!.*\/\/)(?!.*\/\.)(?!.*\/$)(?!.*\.$)(?!.*\.lock$)[A-Za-z0-9][A-Za-z0-9._\/-]{0,99}$/;
+const LABEL_SHA_CHARS = 12;
 const REPO_RE = /^[A-Za-z0-9_.-]{1,100}\/[A-Za-z0-9_.-]{1,100}$/;
 const SHA_RE = /^(?:[0-9a-f]{40}|[0-9a-f]{64})$/;
 const CITATION_RE = /^([A-Za-z0-9_.-]{1,100}\/[A-Za-z0-9_.-]{1,100})@([0-9a-f]{40}|[0-9a-f]{64}):(.+):([1-9][0-9]{0,6})$/;
@@ -258,9 +267,32 @@ function stripCr(line: string): string {
   return line.endsWith('\r') ? line.slice(0, -1) : line;
 }
 
+/** Whether `release` can be named in a marker: a GA tag, or "<branch>@<12 hex>". */
+export function isReleaseLabel(release: string): boolean {
+  if (RELEASE_TAG_RE.test(release)) return true;
+  const at = release.lastIndexOf('@');
+  return at > 0 && LABEL_BRANCH_RE.test(release.slice(0, at)) && new RegExp(`^[0-9a-f]{${LABEL_SHA_CHARS}}$`).test(release.slice(at + 1));
+}
+
+/**
+ * The release a marker names: the tag when there is one, else
+ * "<branch>@<first 12 hex of sha>", as for a check started without a
+ * known release (release_tag ""). Throws when neither form is valid.
+ */
+export function releaseLabel(tag: string, branch: string, sha: string): string {
+  if (tag !== '') {
+    if (!RELEASE_TAG_RE.test(tag)) throw new Error(`release tag ${JSON.stringify(tag)} is not a GA tag such as 9.1.2`);
+    return tag;
+  }
+  if (!SHA_RE.test(sha)) throw new Error(`not a full commit SHA: ${JSON.stringify(sha)}`);
+  const label = `${branch}@${sha.slice(0, LABEL_SHA_CHARS)}`;
+  if (!isReleaseLabel(label)) throw new Error(`branch ${JSON.stringify(branch)} cannot be named in a marker`);
+  return label;
+}
+
 function parseHeader(text: string): Header | null {
   const m = HEADER_RE.exec(text);
-  if (!m || !isValidDate(m[2]!) || reasonProblem(m[3]!) !== null) return null;
+  if (!m || !isReleaseLabel(m[1]!) || !isValidDate(m[2]!) || reasonProblem(m[3]!) !== null) return null;
   const evidence = m[4]!.split(', ').map(parseCitation);
   if (evidence.some((c) => c === null)) return null;
   return { release: m[1]!, date: m[2]!, reason: m[3]!, evidence: evidence as Citation[] };
@@ -552,7 +584,9 @@ function isValidDate(date: string): boolean {
 }
 
 function assertContext(ctx: EditContext): void {
-  if (!RELEASE_RE.test(ctx.release)) throw new Error(`release ${JSON.stringify(ctx.release)} is not a tag or ref the marker can name`);
+  if (!isReleaseLabel(ctx.release)) {
+    throw new Error(`release ${JSON.stringify(ctx.release)} is neither a GA tag nor "<branch>@<12 hex>" (see releaseLabel)`);
+  }
   if (!isValidDate(ctx.date)) throw new Error(`date ${JSON.stringify(ctx.date)} is not YYYY-MM-DD`);
   if (!REPO_RE.test(ctx.upstream.repo) || !SHA_RE.test(ctx.upstream.sha)) {
     throw new Error(`upstream ${ctx.upstream.repo}@${ctx.upstream.sha} is not "owner/name" and a full commit SHA`);
@@ -586,7 +620,7 @@ function generatedReason(changes: readonly Change[]): string {
   return used < parts.length ? `${out}; and ${parts.length - used} more` : out;
 }
 
-export function suppressionHeader(release: string, date: string, reason: string, evidence: readonly Citation[]): string {
+function suppressionHeader(release: string, date: string, reason: string, evidence: readonly Citation[]): string {
   return `<!-- suppressed: superseded in ${release}, ${date}; ${reason}; evidence: ${evidence.map(formatCitation).join(', ')} -->`;
 }
 

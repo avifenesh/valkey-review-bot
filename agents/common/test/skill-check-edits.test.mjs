@@ -4,8 +4,8 @@ import test from 'node:test';
 
 // No resolve hook: these modules must load under plain type stripping.
 const {
-  applyEdits, checkEdits, formatCitation, listSuppressedBlocks, MAX_EDITS, parseCitation, parseSuppressed,
-  validateEdits, verifyEvidence,
+  applyEdits, checkEdits, formatCitation, isReleaseLabel, listSuppressedBlocks, MAX_EDITS, parseCitation, parseSuppressed,
+  releaseLabel, validateEdits, verifyEvidence,
 } = await import('../src/skill-check/edits.ts');
 const { classifyToken, extractNames } = await import('../src/skill-check/names.ts');
 
@@ -478,6 +478,34 @@ test('an invalid context is a programming error', () => {
   assert.throws(() => checkEdits(SKILL, [renamed], ctx({ date: '2026-02-30' })), /date/);
   assert.throws(() => checkEdits(SKILL, [renamed], ctx({ upstream: { repo: REPO, sha: 'HEAD' } })), /upstream/);
   assert.deepEqual(checkEdits(SKILL, [renamed], ctx({ release: 'unstable@0eb4ba3c1d2e' })), []);
+  for (const release of ['main', 'unstable', 'unstable@0eb4ba3', 'unstable@0EB4BA3C1D2E', '9.1.2-rc1', 'release-9.1.2', 'a b@0eb4ba3c1d2e', 'x;y@0eb4ba3c1d2e']) {
+    assert.throws(() => checkEdits(SKILL, [renamed], ctx({ release })), /neither a GA tag nor/, release);
+  }
+});
+
+test('without a release tag the marker names the branch and the checked commit', async () => {
+  assert.equal(releaseLabel('9.1.2', 'unstable', SHA), '9.1.2');
+  assert.equal(releaseLabel('v2.5.1', 'main', SHA), 'v2.5.1');
+  const label = releaseLabel('', 'unstable', SHA);
+  assert.equal(label, 'unstable@0123456789ab');
+  assert.equal(releaseLabel('', 'release/9.0', SHA), 'release/9.0@0123456789ab');
+  assert.throws(() => releaseLabel('9.1.2-rc1', 'unstable', SHA), /not a GA tag/);
+  assert.throws(() => releaseLabel('', 'bad;branch', SHA), /cannot be named/);
+  assert.throws(() => releaseLabel('', 'a..b', SHA), /cannot be named/);
+  assert.throws(() => releaseLabel('', 'unstable', 'HEAD'), /full commit SHA/);
+  for (const ok of ['9.1.2', 'v9.1.2', 'unstable@0123456789ab', 'release/9.0@0123456789ab']) assert.equal(isReleaseLabel(ok), true, ok);
+
+  const out = await validateEdits(SKILL, [renamed], ctx({ release: label }), resolver());
+  assert.deepEqual(out.problems, []);
+  assert.match(out.skillMd, /^<!-- suppressed: superseded in unstable@0123456789ab, 2026-10-13; `emptyDB` is now `emptyData`; evidence: /m);
+  assert.equal(listSuppressedBlocks(out.skillMd)[0].release, label);
+
+  // A marker naming anything else is not well formed.
+  for (const release of ['main', 'unstable@0123456', '9.1.2-rc1']) {
+    const md = out.skillMd.replace(`superseded in ${label},`, `superseded in ${release},`);
+    assert.deepEqual(listSuppressedBlocks(md), [], release);
+    assert.match(parseSuppressed(md).problems[0], /not a well-formed suppression marker/, release);
+  }
 });
 
 test('citations format and parse back', () => {
