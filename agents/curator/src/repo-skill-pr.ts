@@ -676,13 +676,46 @@ export async function proposeRepoSkillChange(p: RepoSkillProposal, deps: RepoSki
 }
 
 /**
+ * GitHub refused an anonymous read for its rate limit (60 REST calls an
+ * hour per IP, shared with whatever else uses the egress IP). Retryable:
+ * the read can be tried again after resetAt.
+ */
+export class GitHubRateLimitError extends Error {
+  readonly retryable = true;
+  /** When GitHub said the limit resets, or null when it did not say. */
+  readonly resetAt: Date | null;
+
+  constructor(message: string, resetAt: Date | null) {
+    super(message);
+    this.name = 'GitHubRateLimitError';
+    this.resetAt = resetAt;
+  }
+}
+
+/**
+ * The rate-limit error for a response that is one: 429, or 403 with no
+ * calls left or a Retry-After (GitHub's secondary limit). Null otherwise.
+ */
+function rateLimitError(what: string, resp: Response): GitHubRateLimitError | null {
+  const retryAfter = resp.headers.get('retry-after')?.trim() ?? '';
+  const exhausted = resp.headers.get('x-ratelimit-remaining')?.trim() === '0';
+  if (resp.status !== 429 && !(resp.status === 403 && (exhausted || retryAfter !== ''))) return null;
+  const reset = Number(resp.headers.get('x-ratelimit-reset'));
+  const resetAt = /^\d{1,6}$/.test(retryAfter) ? new Date(Date.now() + Number(retryAfter) * 1000)
+    : Number.isInteger(reset) && reset > 0 ? new Date(reset * 1000) : null;
+  const until = resetAt ? ` until ${resetAt.toISOString()}` : '';
+  return new GitHubRateLimitError(`${what} is rate limited by GitHub${until} (${resp.status}); retry later`, resetAt);
+}
+
+/**
  * A file of a public repository at a branch, tag or commit, read
  * anonymously. `sha` is the commit the content came from: the ref is
  * resolved first and the file read at that commit, so the two always
  * match. Null when the file is not there (or, for a ref given as a full
  * SHA, the commit is unknown). Throws when a named ref does not exist.
  * The content is decoded as strict UTF-8 with any BOM kept, so
- * gitBlobSha(content) is the file's blob id.
+ * gitBlobSha(content) is the file's blob id. A refusal for GitHub's rate
+ * limit throws GitHubRateLimitError, which is worth retrying later.
  */
 export async function fetchRepoFile(
   repo: string,
@@ -702,6 +735,8 @@ export async function fetchRepoFile(
       signal: AbortSignal.timeout(TIMEOUT_MS),
     });
     const text = (await resp.text()).trim();
+    const limited = rateLimitError(`GET ${repo} commits/${ref}`, resp);
+    if (limited) throw limited;
     if (resp.status === 404 || resp.status === 422) throw new Error(`${repo} has no ref ${ref}`);
     if (resp.status !== 200 || !SHA_RE.test(text)) throw new Error(`GET ${repo} commits/${ref} returned ${resp.status}`);
     sha = text;
@@ -715,7 +750,10 @@ export async function fetchRepoFile(
     await resp.body?.cancel();
     return null;
   }
-  if (resp.status !== 200) throw new Error(`GET ${repo}@${sha}:${path} returned ${resp.status}`);
+  if (resp.status !== 200) {
+    await resp.body?.cancel();
+    throw rateLimitError(`GET ${repo}@${sha}:${path}`, resp) ?? new Error(`GET ${repo}@${sha}:${path} returned ${resp.status}`);
+  }
   const bytes = new Uint8Array(await resp.arrayBuffer());
   if (bytes.length > MAX_FILE_BYTES) throw new Error(`${path} at ${sha} is larger than ${MAX_FILE_BYTES} bytes`);
   try {

@@ -3,6 +3,7 @@ import { createHash } from 'node:crypto';
 import test from 'node:test';
 import {
   fetchRepoFile,
+  GitHubRateLimitError,
   gitBlobSha,
   insertionProblem,
   proposeRepoSkillChange,
@@ -768,4 +769,34 @@ test('fetchRepoFile keeps a BOM, so the blob id matches, and refuses text that i
   const file = await fetchRepoFile(REPO, 'main', PATH, { fetch: gh.fetch });
   assert.equal(gitBlobSha(file.content), blobId(withBom));
   await assert.rejects(fetchRepoFile(REPO, 'main', 'bad.md', { fetch: gh.fetch }), /is not UTF-8 text/);
+});
+
+test('fetchRepoFile reports GitHub\'s anonymous rate limit as a retryable error', async () => {
+  const gh = fakeGitHub();
+  const answer = (host, resp) => async (url, init) => (new URL(url).host === host ? resp() : gh.fetch(url, init));
+  const exhausted = () => new Response(JSON.stringify({ message: 'API rate limit exceeded' }), {
+    status: 403,
+    headers: { 'x-ratelimit-remaining': '0', 'x-ratelimit-reset': '1791878400' },
+  });
+  await assert.rejects(fetchRepoFile(REPO, 'main', PATH, { fetch: answer('api.github.com', exhausted) }), (err) => {
+    assert.ok(err instanceof GitHubRateLimitError);
+    assert.equal(err.retryable, true);
+    assert.equal(err.resetAt.toISOString(), '2026-10-13T08:00:00.000Z');
+    assert.equal(err.message, `GET ${REPO} commits/main is rate limited by GitHub until 2026-10-13T08:00:00.000Z (403); retry later`);
+    return true;
+  });
+  const tooMany = () => new Response('Too Many Requests', { status: 429, headers: { 'retry-after': '60' } });
+  const t0 = Date.now();
+  await assert.rejects(fetchRepoFile(REPO, 'main', PATH, { fetch: answer('raw.githubusercontent.com', tooMany) }), (err) => {
+    assert.ok(err instanceof GitHubRateLimitError);
+    assert.ok(err.resetAt.getTime() >= t0 + 60_000 && err.resetAt.getTime() <= Date.now() + 60_000);
+    return true;
+  });
+  // A 403 that is not the rate limit stays an ordinary error.
+  const forbidden = () => new Response(JSON.stringify({ message: 'Forbidden' }), { status: 403 });
+  await assert.rejects(fetchRepoFile(REPO, 'main', PATH, { fetch: answer('api.github.com', forbidden) }), (err) => {
+    assert.ok(!(err instanceof GitHubRateLimitError));
+    assert.equal(err.message, `GET ${REPO} commits/main returned 403`);
+    return true;
+  });
 });
