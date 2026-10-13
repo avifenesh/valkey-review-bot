@@ -220,6 +220,15 @@ export function createDeliveryHandler(
       // waits in the queue first, so that a burst of pushes gets one
       // review. An event after the waiting review has started queues the
       // next review.
+      //
+      // Apart from a store error, which the worker logs, a marker
+      // outlives its review only when the review worker lacks the table
+      // wiring: IDEMPOTENCY_TABLE, and GetItem, UpdateItem and DeleteItem
+      // on that table. The worker then cannot remove the marker, and
+      // until it expires, an hour after its delay, every automatic review
+      // of the pull request joins a review that has already run. The
+      // infra package (infra/lib/webhook-stack.ts) wires both into each
+      // review worker.
       const marker = await deps.store.markReviewPending(repo, prNumber, pushed ? config.pushReviewDelaySeconds : 0);
       if (marker === null) return await joinWaitingReview();
       taken.push(() => clearPendingQuietly(repo, prNumber, marker));
