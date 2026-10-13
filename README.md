@@ -24,16 +24,30 @@ The reviewer runs as a GitHub App. On the Valkey repositories it appears as
 
 ## How to use it
 
-- **Automatic reviews** run when a pull request is opened or reopened, within a daily
-  budget per repository. On repositories set to skip drafts, a draft is reviewed when it
-  is marked ready for review instead.
+- **Automatic reviews** run when a pull request is opened or reopened and when new
+  commits are pushed to it, within a daily budget per repository. A pull request gets at
+  most 3 automatic reviews, counting the first (the deployment can set 1 to 20).
+  - A review of new commits starts 5 minutes after the push. Pushes in those 5 minutes
+    join it, so a burst of pushes gets one review, of the newest head.
+  - A push while a review runs queues the next review, which waits for the running one
+    to end.
+  - On repositories set to skip drafts, a draft is reviewed when it is marked ready for
+    review instead, and pushes to a draft start nothing.
 - **Ask for a review** by mentioning the bot in a pull request comment, for example
   `@valkey-review-bot please check the replica path`. Any user with write access can do
-  this. The instruction becomes the main focus of that review.
-- **Ask for a re-check**, on repositories where it is enabled (GLIDE today), by replying
-  to one of the bot's review comments and mentioning the bot, for example "fixed in the
-  last push". The bot verifies the fix against the current head instead of taking the
-  reply on trust.
+  this. The instruction becomes the main focus of that review. These reviews, and the
+  thread replies below, do not count toward the limit of automatic reviews.
+- **Reply in a review thread**, on repositories where it is enabled (`threadReplyReview`,
+  which the example configuration turns on for both Valkey and GLIDE). Reply to one of
+  the bot's review comments, mention the bot, and do one of these:
+  - say the concern is fixed, for example "fixed in the last push". The bot checks the
+    fix at the current head and confirms it, or says exactly what remains.
+  - dispute the finding. The bot checks its claim against the code again. It withdraws
+    the finding if the reply is right, and shows its evidence if not.
+  - ask a question about the finding. The bot answers from the code.
+
+  The bot never takes a reply on trust and never acts as the author. It answers in its
+  status comment on the pull request, not inside the thread.
 
 ## How it learns
 
