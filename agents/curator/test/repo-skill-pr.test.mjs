@@ -109,6 +109,12 @@ function fakeGitHub(files = { [PATH]: BASE, 'README.md': '# bot\n' }) {
       return sha;
     },
     writes: () => calls.filter((c) => c.method !== 'GET'),
+    /** Close a pull request as maintainers do; its head stays where the branch was. */
+    closePull(number, { merged = false } = {}) {
+      const pr = pulls.find((x) => x.number === number);
+      Object.assign(pr, { state: 'closed', merged_at: merged ? '2026-10-14T00:00:00Z' : null });
+      pr.head.sha = refs.get(`heads/${pr.head.ref}`);
+    },
     async fetch(url, init = {}) {
       const method = init.method ?? 'GET';
       const body = init.body ? JSON.parse(init.body) : undefined;
@@ -185,10 +191,14 @@ function fakeGitHub(files = { [PATH]: BASE, 'README.md': '# bot\n' }) {
         });
       }
       if (method === 'GET' && rest === 'pulls') {
-        assert.equal(u.searchParams.get('state'), 'open');
+        const state = u.searchParams.get('state');
+        assert.ok(state === 'open' || state === 'closed', state);
         const [owner, branch] = u.searchParams.get('head').split(/:(.*)/s);
         assert.equal(owner, 'valkey-io');
-        return json(200, pulls.filter((p) => p.state === 'open' && p.head.ref === branch));
+        // An open pull request's head follows its branch; GitHub lists the newest first.
+        const listed = pulls.filter((p) => p.state === state && p.head.ref === branch)
+          .map((p) => (p.state === 'open' ? { ...p, head: { ...p.head, sha: refs.get(`heads/${p.head.ref}`) } } : p));
+        return json(200, listed.reverse());
       }
       if (method === 'POST' && rest === 'pulls') {
         gh.beforeCreatePull?.();
@@ -196,7 +206,7 @@ function fakeGitHub(files = { [PATH]: BASE, 'README.md': '# bot\n' }) {
           return json(422, { message: 'Validation Failed', errors: [{ message: `A pull request already exists for valkey-io:${body.head}.` }] });
         }
         const number = pulls.length + 1;
-        const pr = { number, state: 'open', html_url: `https://github.com/${REPO}/pull/${number}`, head: { ref: body.head }, base: { ref: body.base }, title: body.title, body: body.body };
+        const pr = { number, state: 'open', merged_at: null, html_url: `https://github.com/${REPO}/pull/${number}`, head: { ref: body.head }, base: { ref: body.base }, title: body.title, body: body.body };
         pulls.push(pr);
         return json(201, pr);
       }
@@ -432,6 +442,58 @@ test('a pull request title or body changed since is brought back to the proposal
   gh.pulls[0].body = 'Edited';
   assert.equal((await proposeRepoSkillChange(p, deps(gh))).action, 'updated');
   assert.deepEqual({ title: gh.pulls[0].title, body: gh.pulls[0].body }, text);
+});
+
+test('content of a pull request maintainers closed without merging is not proposed again', async () => {
+  const gh = fakeGitHub();
+  const p = proposal({ baseSha: gh.tip() });
+  await proposeRepoSkillChange(p, deps(gh));
+  gh.closePull(1);
+  const rejected = {
+    action: 'rejected',
+    branch: BRANCH,
+    url: `https://github.com/${REPO}/pull/1`,
+    reason: 'maintainers closed #1 without merging, and it held this content',
+  };
+  const before = gh.writes().length;
+  assert.deepEqual(await proposeRepoSkillChange(p, deps(gh)), rejected);
+  // Also once the branch is deleted: the closed pull request still has its head.
+  gh.refs.delete(`heads/${BRANCH}`);
+  assert.deepEqual(await proposeRepoSkillChange(p, deps(gh)), rejected);
+  assert.equal(gh.writes().length, before);
+  assert.equal(gh.pulls.length, 1);
+});
+
+test('other content after a closed pull request opens a new one that names it', async () => {
+  const gh = fakeGitHub();
+  const tip = gh.tip();
+  await proposeRepoSkillChange(proposal({ baseSha: tip }), deps(gh));
+  gh.closePull(1);
+  const more = edited(NEW, '`rdbLoad*` caller', '`rdbLoadAll*` caller', { ...CTX, flagged: ['rdbLoad*'] });
+  const p = proposal({ baseSha: tip, newContent: more, summary: '`emptyDB` is now `emptyData`; `rdbLoad*` is now `rdbLoadAll*`.' });
+  assert.deepEqual(await proposeRepoSkillChange(p, deps(gh)), { action: 'opened', branch: BRANCH, url: `https://github.com/${REPO}/pull/2` });
+  assert.equal(gh.filesAt(gh.tip(BRANCH))[PATH], more);
+  assert.match(gh.pulls[1].body, /\nMaintainers closed #1 from this branch without merging\. The content proposed here differs from what it held;/);
+  // The note is part of the text, so a retry finds nothing to change.
+  const before = gh.writes().length;
+  assert.equal((await proposeRepoSkillChange(p, deps(gh))).action, 'unchanged');
+  assert.equal(gh.writes().length, before);
+  // The closed content stays rejected while the new pull request is open.
+  const head = gh.tip(BRANCH);
+  assert.equal((await proposeRepoSkillChange(proposal({ baseSha: tip }), deps(gh))).action, 'rejected');
+  assert.equal(gh.tip(BRANCH), head);
+  assert.equal(gh.writes().length, before);
+});
+
+test('a merged pull request is not a rejection', async () => {
+  const gh = fakeGitHub();
+  await proposeRepoSkillChange(proposal({ baseSha: gh.tip() }), deps(gh));
+  const merged = gh.commitOn('main', { [PATH]: NEW }, { message: 'Merge pull request #1' });
+  gh.closePull(1, { merged: true });
+  const more = edited(NEW, '`rdbLoad*` caller', '`rdbLoadAll*` caller', { ...CTX, flagged: ['rdbLoad*'] });
+  const result = await proposeRepoSkillChange(proposal({ baseSha: merged, baseContent: NEW, newContent: more }), deps(gh));
+  assert.deepEqual(result, { action: 'opened', branch: BRANCH, url: `https://github.com/${REPO}/pull/2` });
+  assert.doesNotMatch(gh.pulls[1].body, /Maintainers closed/);
 });
 
 test('commits a maintainer added to the branch are never overwritten', async () => {

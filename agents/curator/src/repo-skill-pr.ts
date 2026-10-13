@@ -41,6 +41,10 @@ import {
  *   attempt, so a run that moved the branch and failed before the text
  *   is finished by its retry. The text is built from the proposal alone
  *   (dated by its markers), so a retry finds nothing to change;
+ * - respects maintainers who closed a pull request from the branch
+ *   without merging: content one of those held is never proposed again
+ *   (rejected), and a new pull request for other content says which
+ *   were closed;
  * - never writes the base branch: the only ref it writes is the
  *   skill-check branch.
  * A retry after any partial run converges on the same branch and pull
@@ -82,8 +86,16 @@ export interface RepoSkillPrDeps {
   readonly fetch?: typeof fetch;
 }
 
+/**
+ * - opened, updated, unchanged: the pull request (url) now proposes this content.
+ * - base-moved: the skill changed on the base branch since baseSha; nothing was written.
+ * - refused: this module will not write the proposal (reason); nothing was written.
+ * - rejected: maintainers closed a pull request from this branch without
+ *   merging, and its head held this same content; nothing was written, and
+ *   url is that pull request.
+ */
 export type RepoSkillPrResult = {
-  action: 'opened' | 'updated' | 'unchanged' | 'base-moved' | 'refused';
+  action: 'opened' | 'updated' | 'unchanged' | 'base-moved' | 'refused' | 'rejected';
   branch: string;
   url?: string;
   reason?: string;
@@ -185,7 +197,14 @@ function evidenceItem(entry: string): string {
   return `- [${codeSpan(shown)}](https://github.com/${c.repo}/blob/${c.sha}/${encodePath(c.path)}#L${c.line})`;
 }
 
-function prBody(p: RepoSkillProposal, date: string): string {
+/** `closed`: pull requests from the branch that maintainers closed without merging, all with other content. */
+function prBody(p: RepoSkillProposal, date: string, closed: readonly number[]): string {
+  const earlier = closed.length === 0 ? [] : [
+    `Maintainers closed ${pullList(closed)} from this branch without merging. `
+      + `The content proposed here differs from what ${closed.length === 1 ? 'it' : 'each of them'} held; `
+      + 'the same content is never proposed again.',
+    '',
+  ];
   return [
     `The release check found facts in \`${p.path}\` that ${p.releaseLabel} superseded. `
       + 'It does not rewrite them: each stale piece stays, byte for byte, between suppression markers '
@@ -194,6 +213,7 @@ function prBody(p: RepoSkillProposal, date: string): string {
     '',
     'Check the evidence before merging. Close this pull request to reject the change.',
     '',
+    ...earlier,
     '### Changes',
     '',
     p.summary.trim(),
@@ -386,6 +406,14 @@ function skillsRepo(api: Api, repo: string, baseBranch: string) {
   const writable = (branch: string) => {
     if (!branch.startsWith(BRANCH_PREFIX) || branch === baseBranch) throw new Error(`refusing to write branch ${branch}`);
   };
+  /** Pull requests from the branch, newest first (GitHub's order); the first 100. */
+  const pulls = async (branch: string, state: 'open' | 'closed'): Promise<Pull[]> => {
+    const head = encodeURIComponent(`${owner}:${branch}`);
+    const r = await api('GET', `repos/${repo}/pulls?head=${head}&state=${state}&per_page=100`);
+    if (r.status !== 200) throw apiError(`GET ${state} pulls from ${branch}`, r);
+    const list = Array.isArray(r.json) ? r.json as PullJson[] : [];
+    return list.filter((x) => x?.head?.ref === branch && Number.isInteger(x.number)).map(pull);
+  };
   return {
     /** The commit a branch points at, or null when there is no such branch. */
     async branchSha(branch: string): Promise<string | null> {
@@ -448,13 +476,9 @@ function skillsRepo(api: Api, repo: string, baseBranch: string) {
         files: (c.files ?? []).map((f) => String(f.filename ?? '')),
       };
     },
+    pulls,
     async openPull(branch: string): Promise<Pull | null> {
-      const head = encodeURIComponent(`${owner}:${branch}`);
-      const r = await api('GET', `repos/${repo}/pulls?head=${head}&state=open&per_page=10`);
-      if (r.status !== 200) throw apiError(`GET pulls from ${branch}`, r);
-      const pulls = Array.isArray(r.json) ? r.json as PullJson[] : [];
-      const pr = pulls.find((x) => x.head?.ref === branch && Number.isInteger(x.number));
-      return pr ? pull(pr) : null;
+      return (await pulls(branch, 'open'))[0] ?? null;
     },
     /** The new pull request, or GitHub's 422 refusal, which another open pull request from the branch explains. */
     async createPull(branch: string, title: string, body: string): Promise<Pull | ApiResponse> {
@@ -478,7 +502,8 @@ interface PullJson {
   readonly html_url?: unknown;
   readonly title?: unknown;
   readonly body?: unknown;
-  readonly head?: { readonly ref?: unknown };
+  readonly merged_at?: unknown;
+  readonly head?: { readonly ref?: unknown; readonly sha?: unknown };
 }
 
 interface Pull {
@@ -487,12 +512,38 @@ interface Pull {
   readonly title: string;
   /** '' when GitHub has none. */
   readonly body: string;
+  readonly merged: boolean;
+  /** The head commit: the branch tip while open, the last head once closed. */
+  readonly headSha: string | null;
 }
 
 function pull(pr: PullJson): Pull {
   const number = field(pr.number, 'pull request number', (v): v is number => Number.isInteger(v));
-  const text = { title: typeof pr.title === 'string' ? pr.title : '', body: typeof pr.body === 'string' ? pr.body : '' };
-  return typeof pr.html_url === 'string' && pr.html_url ? { number, url: pr.html_url, ...text } : { number, ...text };
+  const rest = {
+    title: typeof pr.title === 'string' ? pr.title : '',
+    body: typeof pr.body === 'string' ? pr.body : '',
+    merged: typeof pr.merged_at === 'string' && pr.merged_at !== '',
+    headSha: isSha(pr.head?.sha) ? pr.head.sha : null,
+  };
+  return typeof pr.html_url === 'string' && pr.html_url ? { number, url: pr.html_url, ...rest } : { number, ...rest };
+}
+
+/** "#1", "#1 and #3", "#1, #3 and #5". */
+function pullList(numbers: readonly number[]): string {
+  const refs = numbers.map((n) => `#${n}`);
+  return refs.length <= 1 ? refs.join('') : `${refs.slice(0, -1).join(', ')} and ${refs.at(-1)}`;
+}
+
+/**
+ * Pull requests from the branch that maintainers closed without merging,
+ * oldest first, each with the blob id its head held at `path` (null when
+ * that commit or file is gone).
+ */
+async function closedUnmerged(gh: SkillsRepo, branch: string, path: string): Promise<(Pull & { blob: string | null })[]> {
+  const closed = (await gh.pulls(branch, 'closed')).filter((pr) => !pr.merged).sort((a, b) => a.number - b.number);
+  const out: (Pull & { blob: string | null })[] = [];
+  for (const pr of closed) out.push({ ...pr, blob: pr.headSha ? await gh.fileBlob(path, pr.headSha) : null });
+  return out;
 }
 
 /** Whether the pull request shows this title and body; GitHub may store a body edited on the web with CRLF. */
@@ -591,12 +642,24 @@ export async function proposeRepoSkillChange(p: RepoSkillProposal, deps: RepoSki
     };
   }
 
+  // Closing a pull request without merging rejects its content: the same
+  // content is not proposed again from this branch, open pull request or not.
+  const closed = await closedUnmerged(gh, branch, p.path);
+  const declined = [...closed].reverse().find((pr) => pr.blob === gitBlobSha(p.newContent));
+  if (declined) {
+    return withUrl({
+      action: 'rejected',
+      branch,
+      reason: `maintainers closed #${declined.number} without merging, and it held this content`,
+    }, declined);
+  }
+
   const title = titleFor(p);
   const pointed = await pointBranch(gh, tip, p, branch, title, deps.signOff);
   if ('refused' in pointed) return { action: 'refused', branch, reason: pointed.refused };
   const rebuilt = pointed.moved;
 
-  const body = prBody(p, checked.date);
+  const body = prBody(p, checked.date, closed.map((pr) => pr.number));
   let open = await gh.openPull(branch);
   if (!open) {
     const created = await gh.createPull(branch, title, body);
