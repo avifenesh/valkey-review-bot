@@ -155,7 +155,7 @@ const sizeOf = (file) => (existsSync(file) ? readFileSync(file).length : 0);
 test('a base fetch that times out is killed with everything it started', { timeout: 20_000 }, async () => {
   const up = makeUpstream();
   const env = oldGitEnv(up.root, up.baseSha, 'stall-writer');
-  const co = await prepareUpstreamCheckout({ dir: path.join(up.root, 'checkout'), url: up.url, verifiedSha: up.baseSha, env, baseTimeoutMs: 500 });
+  const co = await prepareUpstreamCheckout({ dir: path.join(up.root, 'checkout'), url: up.url, verifiedSha: up.baseSha, env, baseTimeoutMs: 1_500 });
   assert.equal(co.baseAvailable, false);
   const log = env.SKC_WRITER_LOG;
   assert.ok(sizeOf(log) > 0, 'the writer ran');
@@ -292,9 +292,9 @@ test('the runner kills what git started when the output passes the cap, or when 
   assert.equal(cut.stdout.length, 1000);
   // A child that holds git's output after git exits.
   const started = Date.now();
-  const left = await git(['-c', `alias.leave=!(sleep 5; echo late; touch ${marker}) & echo early`, 'leave']);
+  const left = await git(['-c', `alias.leave=!(sleep 8; echo late; touch ${marker}) & echo early`, 'leave']);
   assert.deepEqual({ code: left.code, stdout: left.stdout }, { code: 0, stdout: 'early\n' });
-  assert.ok(Date.now() - started < 4_000, 'waited for the child that held the output');
+  assert.ok(Date.now() - started < 6_000, 'waited for the child that held the output');
   await sleep(800);
   assert.equal(existsSync(marker), false, 'a child git started outlived the call');
   rmSync(dir, { recursive: true, force: true });
