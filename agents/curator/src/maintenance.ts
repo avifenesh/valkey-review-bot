@@ -179,7 +179,7 @@ export interface RepoSkillProposal {
 }
 
 export interface RepoSkillPrResult {
-  readonly action: 'opened' | 'updated' | 'unchanged' | 'base-moved' | 'refused';
+  readonly action: 'opened' | 'updated' | 'unchanged' | 'base-moved' | 'refused' | 'rejected';
   readonly branch: string;
   readonly url?: string;
   readonly reason?: string;
@@ -649,8 +649,8 @@ async function* retire(run: Run, req: RetireRequest): AsyncGenerator<StreamFrame
 
 /** What a check found and what it will record. */
 interface Outcome {
-  /** check_outcome; a repo check can also end 'proposed' or 'skipped'. */
-  readonly outcome: 'clean' | 'accurate' | 'revised' | 'suspect' | 'obsolete' | 'inconclusive' | 'error' | 'proposed' | 'skipped';
+  /** check_outcome; a repo check can also end 'proposed', 'declined' or 'skipped'. */
+  readonly outcome: 'clean' | 'accurate' | 'revised' | 'suspect' | 'obsolete' | 'inconclusive' | 'error' | 'proposed' | 'declined' | 'skipped';
   readonly note: string;
 }
 
@@ -1521,7 +1521,7 @@ async function* repoCheck(run: Run, req: RepoCheckRequest): AsyncGenerator<Strea
       logEdits(run, c, report, false);
       return keep(`${counts} at ${c.ref}; the pull request could not be opened`, {}, c);
     }
-    logEdits(run, c, report, pr.action !== 'refused' && pr.action !== 'base-moved');
+    logEdits(run, c, report, pr.action !== 'refused' && pr.action !== 'base-moved' && pr.action !== 'rejected');
     const prFields = { ...fieldsWith, pr: pr.action, branch: pr.branch, url: pr.url ?? '' };
     if (pr.action === 'base-moved') {
       // The file changed under the proposal: release without recording, so the next pass checks the new text.
@@ -1532,6 +1532,12 @@ async function* repoCheck(run: Run, req: RepoCheckRequest): AsyncGenerator<Strea
     if (pr.action === 'refused') {
       return finish({ outcome: 'error', note: note(`the pull request was refused: ${(pr.reason ?? '').slice(0, 200)}`) },
         (w, it) => notConfirmed(w, it, report, 'the pull request was refused'), prFields);
+    }
+    if (pr.action === 'rejected') {
+      // Maintainers closed this release's pull request without merging: their
+      // call stands until the next release, which proposes on a new branch.
+      return finish({ outcome: 'declined', note: note(`maintainers declined the pull request on ${pr.branch}${pr.url ? `: ${pr.url}` : ''}`) },
+        (w, it) => notConfirmed(w, it, report, `declined by maintainers on ${pr.branch}`), prFields);
     }
     return finish({ outcome: 'proposed', note: note(`pull request ${pr.action} on ${pr.branch}${pr.url ? `: ${pr.url}` : ''}`) },
       (w, it) => notConfirmed(w, it, report, `proposed by pull request on ${pr.branch}`), prFields);

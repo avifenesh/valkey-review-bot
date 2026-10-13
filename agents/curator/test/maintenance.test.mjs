@@ -1194,7 +1194,7 @@ const repoItem = (overrides = {}) => ({
 });
 const SKILLS_REPO = { repo: 'valkey-io/valkey-review-bot', baseBranch: 'main', tokenFunction: 'skills-repo-broker' };
 
-function repoApi() {
+function repoApi(action = 'opened') {
   const calls = [];
   return {
     calls,
@@ -1205,7 +1205,7 @@ function repoApi() {
       },
       propose: async (p) => {
         calls.push(['propose', p]);
-        return { action: 'opened', branch: `skill-check/${p.reviewerId}/${p.releaseLabel}`, url: 'https://github.com/valkey-io/valkey-review-bot/pull/9' };
+        return { action, branch: `skill-check/${p.reviewerId}/${p.releaseLabel}`, url: 'https://github.com/valkey-io/valkey-review-bot/pull/9' };
       },
     },
   };
@@ -1280,6 +1280,22 @@ test('a repo check with pull requests on proposes code-generated text only', asy
   assert.equal(item.check_outcome, 'proposed');
   assert.match(item.check_note, /pull request opened on skill-check\/valkey-review\/9\.1\.2/);
   assert.equal(item.verified_release, '9.1.2');
+  assert.ok(claimGone(item));
+});
+
+test('a repo check whose pull request maintainers closed records it as declined', async () => {
+  const r = repoApi('rejected');
+  const s = setup({
+    item: repoItem(),
+    turns: [report('revise', [EDIT])],
+    settings: { skillsRepo: SKILLS_REPO, checkOpenPullRequests: true },
+    repoSkills: async () => r.api,
+  });
+  const { result } = await run(repoMessage(), s.deps);
+  assert.equal(result.decision, 'declined');
+  const item = s.table.item(REPO_SKILL_KEY);
+  assert.equal(item.check_outcome, 'declined');
+  assert.match(item.check_note, /maintainers declined the pull request on skill-check\/valkey-review\/9\.1\.2/);
   assert.ok(claimGone(item));
 });
 

@@ -64,7 +64,7 @@ console.log(`[boot] skill maintenance upstreams=${JSON.stringify(env.upstreamRep
  */
 interface RepoSkillPrModule {
   proposeRepoSkillChange(p: RepoSkillProposal, deps: {
-    repo: string; baseBranch: string; signOff?: string; getToken: () => Promise<string>;
+    repo: string; baseBranch: string; reviewerIds: readonly string[]; signOff?: string; getToken: () => Promise<string>;
   }): Promise<RepoSkillPrResult>;
   fetchRepoFile(repo: string, ref: string, path: string): Promise<{ sha: string; content: string } | null>;
 }
@@ -93,6 +93,8 @@ function repoSkills(): Promise<RepoSkillApi> {
         return pr.proposeRepoSkillChange(proposal, {
           repo: settings.repo,
           baseBranch: settings.baseBranch,
+          // The reviewers this curator serves: the only repo skill files it may propose.
+          reviewerIds: Object.keys(env.concernsTables),
           ...(settings.signOff ? { signOff: settings.signOff } : {}),
           getToken: () => tokens.get(),
         });
