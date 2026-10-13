@@ -5,7 +5,7 @@
 // after `npm ci` in agents/common and ops.
 
 import { execFile } from 'node:child_process';
-import { chmodSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, writeFileSync } from 'node:fs';
+import { chmodSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -39,6 +39,12 @@ export const tempDir = (prefix) => realpathSync(mkdtempSync(path.join(tmpdir(), 
 /** The stderr of a conditional write that lost, as the CLI prints it. */
 export const CONDITION_FAILED = 'An error occurred (ConditionalCheckFailedException) when calling the UpdateItem operation: The conditional request failed\n';
 
+// The fake CLI directories, deleted when the test process exits.
+const fakeDirs = [];
+process.on('exit', () => {
+  for (const dir of fakeDirs) rmSync(dir, { recursive: true, force: true });
+});
+
 /**
  * An `aws` executable on a fresh PATH directory that answers from
  * `responses` (see fake-aws-cli.mjs). `env` is what a child process
@@ -46,6 +52,7 @@ export const CONDITION_FAILED = 'An error occurred (ConditionalCheckFailedExcept
  */
 export function fakeAwsCli(responses) {
   const dir = tempDir('fake-aws-');
+  fakeDirs.push(dir);
   const bin = path.join(dir, 'bin');
   mkdirSync(bin);
   writeFileSync(path.join(dir, 'responses.json'), JSON.stringify(responses));
