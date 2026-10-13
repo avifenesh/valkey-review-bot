@@ -296,10 +296,14 @@ export interface CheckMessage {
  * For RETIRE_REFUSED_BACKOFF_SECONDS (30 days by default) after
  * retire_refused_at the pass requests no retirement of the record, so a
  * skill the registry will not deprecate does not take a slot of
- * MAX_RETIREMENTS_PER_DAY every day. Reviewers still load the skill, so
- * it gets checks as a record above the floor does. The pass only reads
- * the age of the attribute: the curator may leave it, or REMOVE it in a
- * tombstone write or when submit_skill publishes the skill again.
+ * MAX_RETIREMENTS_PER_DAY every day. Meanwhile the record can still be
+ * checked when a check is due, as a record above the floor is. That
+ * matters after a refusal in DRAFT, PENDING_APPROVAL or APPROVED, whose
+ * skill reviewers still load. After one in CREATE_FAILED or
+ * UPDATE_FAILED, whose skill reviewers do not load, the checks only cost
+ * a little. The pass only reads the age of the attribute: the curator
+ * may leave it, or REMOVE it in a tombstone write or when submit_skill
+ * publishes the skill again.
  */
 export interface RetireMessage {
   /** "retire#<reviewer_id>#<record_id>#<ISO time of the pass>", at most 200 characters. */
@@ -807,7 +811,7 @@ export async function decayTable(
       if (!inFlight && nextScore < config.floor) {
         // A refused retirement is not requested again for a while, so it
         // does not take a slot from the other candidates every day. The
-        // skill stays live meanwhile, so it can still be checked.
+        // record can still be checked meanwhile (see RetireMessage).
         const refusedAt = stringOrEmpty(item.retire_refused_at);
         const leftMs = Date.parse(refusedAt) + config.retireRefusedBackoffSeconds * 1000 - nowMs;
         if (leftMs > 0) {
