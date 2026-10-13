@@ -99,6 +99,7 @@ import type { SkillPublisher } from './tools/submit-skill.js';
  */
 
 const RECORD_NAME_RE = /^[a-z0-9][a-z0-9-]{0,99}$/;
+const SHA_RE = /^(?:[0-9a-f]{40}|[0-9a-f]{64})$/;
 const REVIEWER_ID_RE = /^[a-z0-9][a-z0-9-]{0,99}$/;
 /** RELEASE_TAG_RE in ops/src/releases.ts. */
 const RELEASE_TAG_RE = /^v?([0-9]{1,4})[.]([0-9]{1,4})[.]([0-9]{1,4})$/;
@@ -654,6 +655,8 @@ interface Checked {
   readonly dir: string;
   readonly co: UpstreamCheckout;
   readonly upstream: string;
+  /** The commit of the last check the diff starts from, or null for a first check. */
+  readonly base: string | null;
   /** The library's result, against the baseline: its lost names are this check's new losses. */
   readonly result: CheckResult;
   /**
@@ -690,6 +693,11 @@ function nameList(list: readonly string[], room: number): string {
 function note(head: string, list: readonly string[] = []): string {
   const text = list.length ? `${head}: ${nameList(list, CHECK_NOTE_MAX - head.length - 2)}` : head;
   return text.slice(0, CHECK_NOTE_MAX);
+}
+
+/** The note of a check with nothing flagged whose diff was not examined in full. */
+function notExamined(c: Checked): string {
+  return `the diff since the last check was not examined in full at ${c.ref} (${c.result.incomplete.length} reason(s)); the skill was not confirmed`;
 }
 
 /** The flagged names: lost, then new and absent, then touched. */
@@ -758,24 +766,32 @@ function penalize(w: Write, item: Item, keptFraction: number, lost: number): voi
 }
 
 /**
+ * A state write built from the record as read. One that loses its
+ * condition is built again once from a fresh read, with `unchanged`
+ * false when a reinforcement won (updated_at changed). A record that no
+ * longer holds the claim gets nothing; when the second write loses too,
+ * the claim is released.
+ */
+async function writeRetried(run: Run, build: (item: Item, unchanged: boolean) => Write): Promise<boolean> {
+  const first = run.item!;
+  if (await run.attempt(build(first, true))) return true;
+  const fresh = await run.read();
+  if (!run.holds(fresh)) return false;
+  return run.state(build(fresh!, fresh!.updated_at === first.updated_at));
+}
+
+/**
  * The terminal write of a check that is not a dry run: the outcome, the
- * verification, the names, and the claim released. A write that loses
- * its condition is built again once from a fresh read, without the
- * standing penalty when a reinforcement won (updated_at changed). A
- * record that no longer holds the claim gets nothing; when the second
- * write loses too, the claim is released.
+ * verification, the names, and the claim released, retried as
+ * writeRetried does. `penalty` is false after a reinforcement, so the
+ * standing penalty is dropped.
  */
 async function finishCheck(run: Run, build: (item: Item, penalty: boolean) => Write): Promise<boolean> {
-  const first = run.item!;
-  const terminal = (item: Item, penalty: boolean) => {
+  return writeRetried(run, (item, penalty) => {
     const w = build(item, penalty);
     if (run.liveRead) w.remove(MARKER);
     return w;
-  };
-  if (await run.attempt(terminal(first, true))) return true;
-  const fresh = await run.read();
-  if (!run.holds(fresh)) return false;
-  return run.state(terminal(fresh!, fresh!.updated_at === first.updated_at));
+  });
 }
 
 /** pending_revision.reason of an obsolete finding a reinforcement overtook. */
@@ -827,11 +843,14 @@ function stale(w: Write, item: Item, list: readonly string[], nowIso: string): v
 }
 
 /** A check that ends without a result to act on: the claim is kept and the check is retried once it ages out. */
-async function inconclusive(run: Run, why: string): Promise<MaintenanceResult> {
-  if (run.req.dry_run) await run.release();
-  else await run.state(new Write().set('check_outcome', 'inconclusive').set('check_note', note(why)));
-  run.log(run.req.reason, { outcome: 'inconclusive', note: why });
-  return completed('inconclusive');
+async function inconclusive(run: Run, why: string, fields: LogFields = {}): Promise<MaintenanceResult> {
+  if (run.req.dry_run) {
+    await run.release();
+    run.log(run.req.reason, { outcome: 'inconclusive', ...fields, note: why, mode: 'report' });
+    return completed('inconclusive');
+  }
+  const recorded = await writeRetried(run, () => new Write().set('check_outcome', 'inconclusive').set('check_note', note(why)));
+  return ended(run, 'inconclusive', recorded, { ...fields, note: why });
 }
 
 /**
@@ -883,13 +902,15 @@ async function* withCheckout<T>(
   const dir = path.join(settings.checkDir, `${run.req.reviewer_id}-${randomBytes(8).toString('hex')}`);
   try {
     yield { event: 'status', data: { phase: 'checkout', upstream } };
+    // A verified_sha that is not a full SHA counts as no earlier check.
+    const verified = str(baselineFrom.verified_sha);
+    const base = SHA_RE.test(verified) ? verified : null;
     let co: UpstreamCheckout;
     try {
-      const verifiedSha = str(baselineFrom.verified_sha) || undefined;
       co = await (run.deps.checkout ?? prepareUpstreamCheckout)({
         dir,
         url: (run.deps.upstreamUrl ?? ((r: string) => `https://github.com/${r}.git`))(upstream),
-        ...(verifiedSha ? { verifiedSha } : {}),
+        ...(base ? { verifiedSha: base } : {}),
       });
     } catch (err) {
       console.warn(`[maintenance] checkout of ${upstream} failed: ${errorText(err)}`);
@@ -902,12 +923,16 @@ async function* withCheckout<T>(
       const baseline = names(baselineFrom.audit_names).filter((n) => citedSet.has(n));
       const lostBefore = new Set(names(baselineFrom.lost_names));
       const ignored = names(baselineFrom.ignored_names).filter((n) => !lostBefore.has(n));
-      const result = await checkSkill(co.git, {
-        names: cited,
-        baseline,
-        ignored,
-        ...(co.baseAvailable ? { baseSha: str(baselineFrom.verified_sha) } : {}),
-      });
+      // The base and the checkout whenever there is a base (the check.ts
+      // contract of wp/fu2-skill-check): a base that could not be fetched
+      // is then incomplete and never confirms, and only one the remote no
+      // longer has (baseGone) gives a presence check that may.
+      const input = { names: cited, baseline, ignored, ...(base ? { baseSha: base, checkout: co } : {}) };
+      const result = await checkSkill(co.git, input);
+      if (base && !co.baseAvailable) {
+        const gone = (co as { readonly baseGone?: boolean }).baseGone === true;
+        console.log(`[maintenance] ${gone ? 'base-gone' : 'base-unavailable'} ${quoted(subjectOf(run))} base=${base.slice(0, 12)}`);
+      }
       // A name lost before is outside the baseline, so the library calls it new and absent.
       const carried = result.newAbsent.filter((n) => lostBefore.has(n));
       const view: CheckResult = {
@@ -917,7 +942,7 @@ async function* withCheckout<T>(
       };
       const tag = run.req.reason === 'retire' ? '' : run.req.release_tag;
       checked = {
-        dir, co, upstream, result, view, baseline, carried, ignored, skillMd,
+        dir, co, upstream, base, result, view, baseline, carried, ignored, skillMd,
         ref: `${co.defaultBranch}@${co.tipSha.slice(0, 12)}`,
         label: releaseLabel(tag, co.defaultBranch, co.tipSha),
       };
@@ -976,7 +1001,7 @@ async function* audit(
         upstream: c.upstream,
         branch: c.co.defaultBranch,
         tipSha: c.co.tipSha,
-        baseSha: r.compared ? str(run.item?.verified_sha) || null : null,
+        baseSha: r.compared ? c.base : null,
         releaseTag: tag,
         releaseLabel: c.label,
         skillMd: c.skillMd,
@@ -1071,21 +1096,9 @@ async function* checkBody(run: Run, req: CheckRequest, c: Checked, skill: SkillR
 
   const flagged = flaggedNames(r);
   if (flagged.length === 0) {
-    // Nothing flagged, but part of the diff went unexamined: no audit can confirm it.
-    const v: Outcome = { outcome: 'suspect', note: note(`the diff since the last check was not examined in full at ${c.ref} (${r.incomplete.length} reason(s)); the skill was not confirmed`) };
-    const logged = { ...fields, incomplete: r.incomplete.join('; '), note: v.note };
-    if (req.dry_run) {
-      await run.release();
-      run.log('check', { outcome: 'suspect', ...logged, mode: 'report' });
-      return completed('suspect');
-    }
-    const recorded = await finishCheck(run, (it) => {
-      const w = outcomeWrite(run, v);
-      confirm(w, c, r.present, it, []);
-      lostNames(w, []);
-      return w;
-    });
-    return ended(run, 'suspect', recorded, logged);
+    // Nothing flagged, but part of the diff went unexamined: no audit can
+    // confirm it, so the claim is kept and the check runs again once it ages out.
+    return inconclusive(run, notExamined(c), { ...fields, incomplete: r.incomplete.join('; ') });
   }
 
   if (!run.deps.audit.systemPrompt) return inconclusive(run, `${counts} at ${c.ref}; no audit prompt is configured`);
@@ -1256,6 +1269,11 @@ async function* applyRevision(
 
 // --- Repo check ------------------------------------------------------------
 
+/** What a run checks, for log lines: the registry record's name, or the repo skill file. */
+function subjectOf(run: Run): string {
+  return run.req.reason === 'repo_check' ? repoSkillPath(run.req.reviewer_id) : run.name;
+}
+
 /** The reviewer's built-in skill file in the bot's repository. */
 export function repoSkillPath(reviewerId: string): string {
   return `agents/${reviewerId}/config/skill.md`;
@@ -1304,12 +1322,7 @@ async function* repoCheck(run: Run, req: RepoCheckRequest): AsyncGenerator<Strea
     });
     return ended(run, v.outcome, recorded, { file: filePath, ...fields, note: v.note });
   };
-  const keep = async (why: string): Promise<MaintenanceResult> => {
-    if (req.dry_run) await run.release();
-    else await run.state(new Write().set('check_outcome', 'inconclusive').set('check_note', note(why)));
-    run.log('repo_check', { file: filePath, outcome: 'inconclusive', note: why });
-    return completed('inconclusive');
-  };
+  const keep = (why: string, fields: LogFields = {}): Promise<MaintenanceResult> => inconclusive(run, why, { file: filePath, ...fields });
 
   const upstream = settings.upstreamRepos[req.reviewer_id];
   if (!upstream) return skipWithRelease(run, `no upstream repository is configured for ${req.reviewer_id}`);
@@ -1353,13 +1366,7 @@ async function* repoCheck(run: Run, req: RepoCheckRequest): AsyncGenerator<Strea
     if (r.clean) {
       return finish({ outcome: 'clean', note: note(`${r.present.length} cited names present at ${c.ref}`) }, req.dry_run ? undefined : confirmed, fields);
     }
-    if (flagged.length === 0) {
-      return finish({ outcome: 'suspect', note: note(`the diff since the last check was not examined in full at ${c.ref}`) },
-        req.dry_run ? undefined : (w, it) => {
-          confirm(w, c, r.present, it, []);
-          lostNames(w, []);
-        }, fields);
-    }
+    if (flagged.length === 0) return keep(notExamined(c), { ...fields, incomplete: r.incomplete.join('; ') });
     if (!run.deps.audit.systemPrompt) return keep(`${counts} at ${c.ref}; no audit prompt is configured`);
 
     const { report, why } = yield* audit(run, c, 'repo', SKILL_MD_MAX_CHARS, startMs);

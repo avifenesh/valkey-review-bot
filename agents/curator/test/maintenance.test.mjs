@@ -497,21 +497,67 @@ test('a first check with every name present is clean', async () => {
 const MISSING_BASE = 'f'.repeat(40);
 const claimingBase = async (opts) => ({ ...(await prepareUpstreamCheckout(opts)), baseAvailable: true });
 
-test('an incomplete result with nothing flagged is not confirmed and needs no model', async () => {
+test('an incomplete result with nothing flagged is not confirmed, needs no model and keeps the claim', async () => {
   const s = setup({
     item: record({ audit_names: new Set(['serverCron', 'src/server.c']), verified_sha: MISSING_BASE }),
     skill: { name: NAME, skillMd: CLEAN_MD },
     checkout: claimingBase,
   });
   const { result, lines } = await run(checkMessage(), s.deps);
-  assert.equal(result.decision, 'suspect');
+  assert.equal(result.decision, 'inconclusive');
   assert.equal(s.modelBuilds(), 0);
   const item = s.table.item(KEY);
+  assert.equal(item.check_outcome, 'inconclusive');
   assert.equal(item.verified_sha, MISSING_BASE);
-  assert.equal(item.verified_release, '9.1.2');
+  assert.equal(item.verified_release, '9.1.1');
   assert.match(item.check_note, /not examined in full/);
-  assert.ok(claimGone(item));
-  assert.ok(lines.some((l) => l.includes('is not in the repository')), lines.join('\n'));
+  assert.equal(item.maintenance_id, MID);
+  assert.ok(lines.some((l) => l.includes('outcome="inconclusive"') && l.includes('is not in the repository')), lines.join('\n'));
+});
+
+/** prepareUpstreamCheckout, but the base fetch failed (`baseGone` says whether the remote no longer has the base). */
+const baseFailing = (seen, baseGone) => async (opts) => {
+  seen.push(opts.verifiedSha);
+  return { ...(await prepareUpstreamCheckout({ ...opts, verifiedSha: undefined })), baseAvailable: false, baseGone };
+};
+
+test('a base that could not be fetched makes no presence check that confirms', async () => {
+  const seen = [];
+  const s = setup({
+    item: record({ audit_names: new Set(['serverCron', 'src/server.c']) }),
+    skill: { name: NAME, skillMd: CLEAN_MD },
+    checkout: baseFailing(seen, false),
+  });
+  const { result, lines } = await run(checkMessage(), s.deps);
+  assert.deepEqual(seen, [BASE_SHA]);
+  assert.equal(result.decision, 'inconclusive');
+  const item = s.table.item(KEY);
+  assert.equal(item.verified_sha, BASE_SHA);
+  assert.equal(item.maintenance_id, MID);
+  assert.ok(lines.includes(`[maintenance] base-unavailable "db-flush" base=${BASE_SHA.slice(0, 12)}`), lines.join('\n'));
+});
+
+test('a base the remote no longer has is logged as gone', async () => {
+  const s = setup({
+    item: record({ audit_names: new Set(['serverCron', 'src/server.c']) }),
+    skill: { name: NAME, skillMd: CLEAN_MD },
+    checkout: baseFailing([], true),
+  });
+  const { lines } = await run(checkMessage(), s.deps);
+  assert.ok(lines.includes(`[maintenance] base-gone "db-flush" base=${BASE_SHA.slice(0, 12)}`), lines.join('\n'));
+});
+
+test('a verified_sha that is not a full SHA counts as no earlier check', async () => {
+  const seen = [];
+  const s = setup({
+    item: record({ audit_names: new Set(['serverCron', 'src/server.c']), verified_sha: BASE_SHA.slice(0, 12) }),
+    skill: { name: NAME, skillMd: CLEAN_MD },
+    checkout: async (opts) => { seen.push(opts.verifiedSha); return prepareUpstreamCheckout(opts); },
+  });
+  const { result } = await run(checkMessage(), s.deps);
+  assert.deepEqual(seen, [undefined]);
+  assert.equal(result.decision, 'clean');
+  assert.equal(s.table.item(KEY).verified_sha, TIP_SHA);
 });
 
 test('an accurate verdict on an incomplete result keeps the verification where it was', async () => {
@@ -875,7 +921,7 @@ test('a check whose outcome write loses its claim records nothing and says so', 
   const md = '---\nname: db-flush\ndescription: Use when.\n---\n\n- `serverCron` is never `old_placeholder_name`.\n';
   const cases = [
     ['clean', { item: record({ audit_names: new Set(['serverCron', 'src/server.c']) }), skill: { name: NAME, skillMd: CLEAN_MD } }],
-    ['suspect', { item: record({ audit_names: new Set(['serverCron', 'src/server.c']), verified_sha: MISSING_BASE }), skill: { name: NAME, skillMd: CLEAN_MD }, checkout: claimingBase }],
+    ['inconclusive', { item: record({ audit_names: new Set(['serverCron', 'src/server.c']), verified_sha: MISSING_BASE }), skill: { name: NAME, skillMd: CLEAN_MD }, checkout: claimingBase }],
     ['accurate', { item: record({ audit_names: new Set(['serverCron']) }), skill: { name: NAME, skillMd: md }, turns: [report('accurate')] }],
     ['obsolete', { item: record({ area: ['src/gone/**'] }), turns: [report('obsolete')] }],
     ['suspect', { turns: [report('unsure')] }],
@@ -1175,6 +1221,25 @@ test('a repo check without a skills repository records why, once per release', a
   const item = s.table.item(REPO_SKILL_KEY);
   assert.match(item.check_note, /no skills repository/);
   assert.equal(item.verified_release, '9.1.2');
+});
+
+test('a repo check whose diff was not examined in full, with nothing flagged, keeps the claim', async () => {
+  const r = repoApi();
+  r.api.fetchRepoFile = async () => ({ sha: 'c'.repeat(40), content: '# Skill\n\n- `serverCron` lives in `src/server.c`.\n' });
+  const s = setup({
+    item: repoItem({ audit_names: new Set(['serverCron', 'src/server.c']), verified_sha: MISSING_BASE }),
+    settings: { skillsRepo: SKILLS_REPO },
+    repoSkills: async () => r.api,
+    checkout: claimingBase,
+  });
+  const { result } = await run(repoMessage(), s.deps);
+  assert.equal(result.decision, 'inconclusive');
+  assert.equal(s.modelBuilds(), 0);
+  const item = s.table.item(REPO_SKILL_KEY);
+  assert.equal(item.check_outcome, 'inconclusive');
+  assert.equal(item.verified_sha, MISSING_BASE);
+  assert.equal(item.verified_release, '9.1.1');
+  assert.equal(item.maintenance_id, REPO_ID);
 });
 
 test('a repo check with pull requests on but no token broker never proposes', async () => {
