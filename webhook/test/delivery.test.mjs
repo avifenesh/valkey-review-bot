@@ -41,7 +41,9 @@ function setup({ env = {}, github = {}, store = fakeStore(), secrets = [SECRET],
       return refresh ? secrets.at(-1) : secrets[0];
     },
     store,
-    sendMessage: sendMessage ?? (async (queueUrl, body, attributes) => { sent.push({ queueUrl, body, attributes }); }),
+    sendMessage: sendMessage ?? (async (queueUrl, body, attributes, options) => {
+      sent.push({ queueUrl, body, attributes, ...(options ? { options } : {}) });
+    }),
     github: async () => api,
     approveInstruction: approve ?? (async () => ({ allow: true, reason: '' })),
     log: (line) => logs.push(line),
@@ -190,7 +192,7 @@ test('route gates: unrouted, mention-only, bot author, author allowlist, other a
   assert.equal(await skipped(prEvent('opened', {}, 'example-org/mention-only')), 'mention-only-route=mention-only');
   assert.equal(await skipped(prEvent('opened', { user: { login: 'dependabot[bot]', type: 'Bot' } })), 'bot-author=dependabot[bot]');
   assert.equal(await skipped(prEvent('opened', {}, 'example-org/gated')), 'author-not-allowed=author');
-  assert.equal(await skipped(prEvent('synchronize')), 'action=synchronize');
+  assert.equal(await skipped(prEvent('edited')), 'action=edited');
   assert.equal(await skipped(prEvent('closed')), 'action=closed');
   assert.equal(sent.length, 0);
   await handler(delivery('pull_request', prEvent('opened', { user: { login: 'trusted' } }, 'example-org/gated')));
@@ -212,6 +214,137 @@ test('ready_for_review gets its own key and heartbeat nonce', async () => {
   assert.equal(sent.length, 1);
   assert.equal(sent[0].body.run_nonce, 'ready');
   assert.ok(store.keys.has(`${GLIDE}#7#abc123#ready`));
+});
+
+const push = (sha, pr = {}, repo = REPO) => prEvent('synchronize', { head: { sha }, ...pr }, repo);
+
+test('new commits start a delayed review that holds the pull request\'s pending marker', async () => {
+  const { handler, sent, store, logs } = setup();
+  await handler(delivery('pull_request', prEvent('opened')));
+  const resp = await handler(delivery('pull_request', push('bbb')));
+  assert.equal(body(resp).enqueued, `${REPO}#7#bbb`);
+  assert.deepEqual(sent[1], {
+    queueUrl: 'q-valkey',
+    body: { repo: REPO, pr_number: 7, installation_id: 42, head_sha: 'bbb', pending_marker: 'pending-1' },
+    attributes: { repo: REPO, pr_number: 7, action: 'synchronize' },
+    options: { delaySeconds: 300 },
+  });
+  assert.equal(store.pending.get(`${REPO}#7`), 'pending-1');
+  assert.equal(store.autoReviews.get(`${REPO}#7`), 2);
+  assert.equal(store.slotsTaken, 2, 'it takes a budget slot like any automatic review');
+  assert.equal(logs.at(-2), `[auto-review] route=valkey-review repo=${REPO} pr=7 round=2/3 queued delay=300s`);
+});
+
+test('pushes while a review of new commits waits are covered by it', async () => {
+  const { handler, sent, store, logs } = setup();
+  await handler(delivery('pull_request', push('bbb')));
+  const resp = await handler(delivery('pull_request', push('ccc')));
+  assert.equal(body(resp).skipped, 'auto-review-pending');
+  assert.equal(logs.at(-1), `[delivery] event=pull_request action=synchronize repo=${REPO} actor=author status=200 decision=skipped:auto-review-pending`);
+  assert.equal(sent.length, 1);
+  assert.equal(store.autoReviews.get(`${REPO}#7`), 1, 'no round used');
+  assert.equal(store.slotsTaken, 1, 'no budget used');
+  assert.ok(store.keys.has(`${REPO}#7#ccc`), 'the key stays claimed: the waiting review covers this head');
+  assert.deepEqual(store.released, []);
+  assert.equal(store.pending.get(`${REPO}#7`), 'pending-1');
+});
+
+test('once the worker starts the waiting review, the next push starts the next round, up to the cap', async () => {
+  const { handler, sent, store } = setup();
+  await handler(delivery('pull_request', prEvent('opened')));
+  await handler(delivery('pull_request', push('bbb')));
+  assert.equal(await store.clearReviewPending(REPO, 7, 'pending-1'), true);
+  await handler(delivery('pull_request', push('ccc')));
+  assert.equal(sent.length, 3);
+  assert.equal(sent[2].body.pending_marker, 'pending-2');
+  assert.equal(store.autoReviews.get(`${REPO}#7`), 3);
+
+  await store.clearReviewPending(REPO, 7, 'pending-2');
+  const resp = await handler(delivery('pull_request', push('ddd')));
+  assert.equal(body(resp).skipped, 'auto-review-cap');
+  assert.equal(sent.length, 3);
+  assert.equal(store.pending.size, 0, 'the capped push leaves no marker');
+  assert.deepEqual(store.released, [`${REPO}#7#ddd`]);
+  assert.equal(store.slotsTaken, 3);
+});
+
+test('new commits pass the same gates as an opened pull request', async () => {
+  const { handler, sent, store } = setup();
+  const skipped = async (payload) => body(await handler(delivery('pull_request', payload))).skipped;
+  assert.equal(await skipped(push('b1', {}, 'someone/else')), 'unrouted-repo=someone/else');
+  assert.equal(await skipped(push('b2', {}, 'example-org/mention-only')), 'mention-only-route=mention-only');
+  assert.equal(await skipped(push('b3', { user: { login: 'dependabot[bot]', type: 'Bot' } })), 'bot-author=dependabot[bot]');
+  assert.equal(await skipped(push('b4', {}, 'example-org/gated')), 'author-not-allowed=author');
+  assert.equal(await skipped(push('b5', { draft: true }, GLIDE)), 'draft');
+  assert.equal(sent.length, 0);
+  assert.equal(store.pending.size, 0);
+
+  await handler(delivery('pull_request', push('b6', { draft: true })));
+  assert.equal(sent.length, 1, 'a push to a draft reviews on a route without skipDrafts');
+  await store.clearReviewPending(REPO, 7, 'pending-1');
+  assert.equal(await skipped(push('b6')), 'duplicate', 'one review per head SHA');
+});
+
+test('over budget, a review of new commits gives back its marker, its round and its key', async () => {
+  const original = console.warn;
+  console.warn = () => {};
+  try {
+    const { handler, sent, store } = setup({ env: { DAILY_REVIEW_BUDGET: '1' } });
+    await handler(delivery('pull_request', prEvent('opened', { number: 1 })));
+    const resp = await handler(delivery('pull_request', push('bbb')));
+    assert.equal(body(resp).skipped, 'budget-exhausted=valkey-review');
+    assert.equal(sent.length, 1);
+    assert.equal(store.pending.size, 0);
+    assert.equal(store.autoReviews.get(`${REPO}#7`), 0);
+    assert.deepEqual(store.released, [`${REPO}#7#bbb`]);
+  } finally {
+    console.warn = original;
+  }
+});
+
+test('a failed send of a review of new commits gives back its marker, its round and its key', async () => {
+  let fail = true;
+  const sent = [];
+  const { handler, store } = setup({
+    sendMessage: async (queueUrl, b, attributes, options) => {
+      if (fail) throw new Error('queue unavailable');
+      sent.push({ b, options });
+    },
+  });
+  const original = console.error;
+  console.error = () => {};
+  try {
+    assert.equal((await handler(delivery('pull_request', push('bbb')))).statusCode, 500);
+  } finally {
+    console.error = original;
+  }
+  assert.equal(store.pending.size, 0);
+  assert.equal(store.autoReviews.get(`${REPO}#7`), 0);
+  assert.deepEqual(store.released, [`${REPO}#7#bbb`]);
+
+  fail = false;
+  assert.equal((await handler(delivery('pull_request', push('bbb')))).statusCode, 200, 'a redelivery is processed');
+  assert.equal(sent[0].b.pending_marker, 'pending-2');
+  assert.deepEqual(sent[0].options, { delaySeconds: 300 });
+  assert.equal(store.autoReviews.get(`${REPO}#7`), 1);
+});
+
+test('PUSH_REVIEW_DELAY_SECONDS sets the delay; 0 still holds the marker until the run starts', async () => {
+  const { handler, sent, store } = setup({ env: { PUSH_REVIEW_DELAY_SECONDS: '0' } });
+  await handler(delivery('pull_request', push('bbb')));
+  assert.deepEqual(sent[0].options, { delaySeconds: 0 });
+  assert.equal(body(await handler(delivery('pull_request', push('ccc')))).skipped, 'auto-review-pending');
+  assert.equal(store.pending.get(`${REPO}#7`), 'pending-1');
+});
+
+test('reviews that are not from new commits are sent without a delay or a marker', async () => {
+  const { handler, sent, store } = setup();
+  await handler(delivery('pull_request', push('bbb')));
+  await handler(delivery('pull_request', prEvent('reopened')));
+  assert.equal(sent.length, 2, 'a waiting review of new commits does not hold back a reopen');
+  assert.equal(sent[1].options, undefined);
+  assert.equal(sent[1].body.pending_marker, undefined);
+  assert.equal(store.pending.get(`${REPO}#7`), 'pending-1');
 });
 
 test('over budget: the review is skipped, logged, and its key released', async () => {

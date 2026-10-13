@@ -23,11 +23,23 @@ export function fakeDdb() {
       const input = command.input;
       calls.push({ op, input });
       if (op === 'PutCommand') {
-        if (items.has(input.Item.key)) throw conditionFailed();
+        const existing = items.get(input.Item.key);
+        if (input.ConditionExpression === 'attribute_not_exists(#k)') {
+          if (existing) throw conditionFailed();
+        } else if (input.ConditionExpression === 'attribute_not_exists(#k) OR #ttl < :now') {
+          if (existing && !(existing.ttl < input.ExpressionAttributeValues[':now'])) throw conditionFailed();
+        } else {
+          throw new Error(`unexpected condition ${input.ConditionExpression}`);
+        }
         items.set(input.Item.key, { ...input.Item });
         return {};
       }
       if (op === 'DeleteCommand') {
+        if (input.ConditionExpression === '#m = :m') {
+          if (items.get(input.Key.key)?.marker !== input.ExpressionAttributeValues[':m']) throw conditionFailed();
+        } else if (input.ConditionExpression !== undefined) {
+          throw new Error(`unexpected condition ${input.ConditionExpression}`);
+        }
         items.delete(input.Key.key);
         return {};
       }
@@ -55,20 +67,25 @@ export function fakeDdb() {
 
 /**
  * An in-memory DeliveryStore with the same behavior as src/store.ts.
- * autoReviews counts automatic reviews per "owner/name#pr", lowercased.
+ * autoReviews counts automatic reviews and pending holds the pending
+ * marker ids ("pending-1", "pending-2", ...), both per "owner/name#pr",
+ * lowercased. Pending markers never expire here.
  */
 export function fakeStore({ budget = Infinity } = {}) {
   const keys = new Map();
   const released = [];
   const autoReviews = new Map();
   const returned = [];
+  const pending = new Map();
   let slots = 0;
+  let markers = 0;
   const prKey = (repo, prNumber) => `${repo.toLowerCase()}#${prNumber}`;
   return {
     keys,
     released,
     autoReviews,
     returned,
+    pending,
     get slotsTaken() { return slots; },
     async claim(key, attributes = {}) {
       if (keys.has(key)) return false;
@@ -94,6 +111,18 @@ export function fakeStore({ budget = Infinity } = {}) {
       const taken = autoReviews.get(prKey(repo, prNumber)) ?? 0;
       returned.push(prKey(repo, prNumber));
       if (taken > 0) autoReviews.set(prKey(repo, prNumber), taken - 1);
+    },
+    async markReviewPending(repo, prNumber, delaySeconds) {
+      if (typeof delaySeconds !== 'number') throw new Error('markReviewPending needs the delay');
+      if (pending.has(prKey(repo, prNumber))) return null;
+      markers += 1;
+      pending.set(prKey(repo, prNumber), `pending-${markers}`);
+      return `pending-${markers}`;
+    },
+    async clearReviewPending(repo, prNumber, markerId) {
+      if (pending.get(prKey(repo, prNumber)) !== markerId) return false;
+      pending.delete(prKey(repo, prNumber));
+      return true;
     },
   };
 }

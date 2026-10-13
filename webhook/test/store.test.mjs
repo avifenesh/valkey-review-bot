@@ -3,7 +3,9 @@ import test from 'node:test';
 import './support/ts-resolve.mjs';
 import { fakeDdb } from './support/fakes.mjs';
 
-const { autoReviewKey, budgetKey, createDeliveryStore, releaseQuietly } = await import('../src/store.ts');
+const {
+  autoReviewKey, budgetKey, clearPendingReview, createDeliveryStore, pendingReviewKey, releaseQuietly,
+} = await import('../src/store.ts');
 
 const TABLE = 'idempotency';
 const at = (iso) => () => new Date(iso);
@@ -43,6 +45,8 @@ test('other DynamoDB errors are not mistaken for duplicates', async () => {
   await assert.rejects(store.takeReviewSlot('route', 40), /slow down/);
   await assert.rejects(store.takeAutoReview('o/r', 1, 3), /slow down/);
   await assert.rejects(store.returnAutoReview('o/r', 1), /slow down/);
+  await assert.rejects(store.markReviewPending('o/r', 1, 300), /slow down/);
+  await assert.rejects(store.clearReviewPending('o/r', 1, 'm'), /slow down/);
 });
 
 test('the budget key names the route and the UTC day', () => {
@@ -127,6 +131,56 @@ test('a returned automatic review can be taken again, and the count never goes b
   assert.equal(ddb.items.get('autoreviews#o/r#7').reviews, 0);
   assert.equal(ddb.items.has('autoreviews#o/r#9'), false);
   assert.equal(await store.takeAutoReview('o/r', 7, 1), 1);
+});
+
+test('the pending key names the lowercased repository and the PR', () => {
+  assert.equal(pendingReviewKey('Example-Org/Valkey', 7), 'pending#example-org/valkey#7');
+});
+
+test('one pending marker per pull request, expiring an hour after the delay', async () => {
+  const ddb = fakeDdb();
+  const store = createDeliveryStore(ddb, TABLE, at('2026-10-13T08:00:00Z'));
+  const marker = await store.markReviewPending('O/R', 7, 300);
+  assert.match(marker, /^[0-9a-f-]{36}$/);
+  assert.equal(await store.markReviewPending('o/r', 7, 300), null);
+  assert.notEqual(await store.markReviewPending('o/r', 8, 300), null, 'pull requests are separate');
+
+  const item = ddb.items.get('pending#o/r#7');
+  assert.equal(item.marker, marker);
+  assert.equal(item.ttl, Date.parse('2026-10-13T09:05:00Z') / 1000);
+  const put = ddb.calls.find((c) => c.op === 'PutCommand').input;
+  assert.equal(put.ConditionExpression, 'attribute_not_exists(#k) OR #ttl < :now');
+  assert.equal(put.ExpressionAttributeValues[':now'], Date.parse('2026-10-13T08:00:00Z') / 1000);
+});
+
+test('an expired marker that TTL has not deleted yet counts as gone', async () => {
+  const ddb = fakeDdb();
+  let now = new Date('2026-10-13T08:00:00Z');
+  const store = createDeliveryStore(ddb, TABLE, () => now);
+  const first = await store.markReviewPending('o/r', 7, 0);
+  now = new Date('2026-10-13T08:59:59Z');
+  assert.equal(await store.markReviewPending('o/r', 7, 0), null);
+  now = new Date('2026-10-13T09:00:01Z');
+  const second = await store.markReviewPending('o/r', 7, 0);
+  assert.ok(second && second !== first);
+  assert.equal(ddb.items.get('pending#o/r#7').marker, second);
+});
+
+test('a pending marker is cleared only by its own id', async () => {
+  const ddb = fakeDdb();
+  const store = createDeliveryStore(ddb, TABLE);
+  const marker = await store.markReviewPending('o/r', 7, 300);
+  assert.equal(await clearPendingReview(ddb, TABLE, 'o/r', 7, 'some-other-marker'), false);
+  assert.equal(ddb.items.has('pending#o/r#7'), true);
+  assert.equal(await clearPendingReview(ddb, TABLE, 'O/R', 7, marker), true);
+  assert.equal(ddb.items.has('pending#o/r#7'), false);
+  assert.equal(await store.clearReviewPending('o/r', 7, marker), false, 'already gone');
+
+  const del = ddb.calls.find((c) => c.op === 'DeleteCommand').input;
+  assert.equal(del.TableName, TABLE);
+  assert.deepEqual(del.Key, { key: 'pending#o/r#7' });
+  assert.equal(del.ConditionExpression, '#m = :m');
+  assert.notEqual(await store.markReviewPending('o/r', 7, 300), null, 'the next push can mark it again');
 });
 
 test('releaseQuietly logs a failed release instead of throwing', async () => {

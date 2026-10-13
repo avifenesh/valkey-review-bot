@@ -7,6 +7,7 @@ import { loadReceiverConfig } from './config.js';
 import { createDeliveryHandler } from './delivery.js';
 import { createAppSecretSource, createInstallationTokens, githubApi } from './github.js';
 import { createSafetyGate } from './mention.js';
+import { sendMessageInput } from './send-message.js';
 import { createDeliveryStore } from './store.js';
 
 /**
@@ -30,17 +31,8 @@ export const handler = createDeliveryHandler(config, {
     return webhookSecret;
   },
   store: createDeliveryStore(DynamoDBDocumentClient.from(new DynamoDBClient({})), config.idempotencyTable),
-  sendMessage: async (queueUrl, body, attributes) => {
-    await sqs.send(new SendMessageCommand({
-      QueueUrl: queueUrl,
-      MessageBody: JSON.stringify(body),
-      MessageAttributes: Object.fromEntries(Object.entries(attributes).map(([name, value]) => [
-        name,
-        typeof value === 'number'
-          ? { DataType: 'Number', StringValue: String(value) }
-          : { DataType: 'String', StringValue: value },
-      ])),
-    }));
+  sendMessage: async (queueUrl, body, attributes, options) => {
+    await sqs.send(new SendMessageCommand(sendMessageInput(queueUrl, body, attributes, options)));
   },
   github: async (installationId) => githubApi(await installationToken(installationId)),
   approveInstruction: createSafetyGate({ client: new BedrockRuntimeClient({}), modelId: config.safetyModelId }),

@@ -12,11 +12,13 @@ import { releaseQuietly, type DeliveryStore } from './store.js';
  *
  *   1. Verify X-Hub-Signature-256 over the raw body. On a mismatch, fetch
  *      the secret again once in case it was rotated.
- *   2. pull_request opened, reopened or ready_for_review on a review route:
- *      route gates, idempotency key repo#pr#head_sha, the pull request's
- *      cap on automatic reviews, the route's daily review budget, then the
- *      route's queue. New commits (synchronize) do not start a review; a
- *      maintainer can ask for one with an @mention.
+ *   2. pull_request opened, reopened, ready_for_review or synchronize (new
+ *      commits) on a review route: route gates, idempotency key
+ *      repo#pr#head_sha, for new commits the pull request's pending
+ *      marker, the pull request's cap on automatic reviews, the route's
+ *      daily review budget, then the route's queue. A review of new
+ *      commits waits in the queue first, and covers every push made
+ *      before its run starts.
  *   3. issue_comment, pull_request_review_comment, pull_request_review:
  *      an @mention of the bot is a review request (src/mention.ts).
  *      Everything else, and a thread reply even when it also starts a
@@ -27,12 +29,18 @@ import { releaseQuietly, type DeliveryStore } from './store.js';
  * cannot use, 500 when the work could not be queued. GitHub does not
  * retry failed deliveries; they can be redelivered from the App's
  * advanced settings. When queuing fails, the delivery's idempotency key
- * is released so that a redelivery is processed again.
+ * is released, and an automatic review gives back its round and pending
+ * marker, so that a redelivery is processed again.
  */
 
 export interface ApiGatewayResponse {
   readonly statusCode: number;
   readonly body: string;
+}
+
+export interface SendOptions {
+  /** SQS per-message delay, at most 900 seconds. */
+  readonly delaySeconds?: number;
 }
 
 export interface DeliveryDeps {
@@ -43,6 +51,7 @@ export interface DeliveryDeps {
     queueUrl: string,
     body: object,
     attributes: Readonly<Record<string, string | number>>,
+    options?: SendOptions,
   ) => Promise<void>;
   /** A GitHub client authenticated as the installation. */
   readonly github: (installationId: number) => Promise<GitHubApi>;
@@ -61,7 +70,7 @@ interface Target {
 }
 
 const FEEDBACK_EVENTS: ReadonlySet<string> = new Set(['issue_comment', 'pull_request_review_comment', 'pull_request_review']);
-const REVIEW_ACTIONS: ReadonlySet<string> = new Set(['opened', 'reopened', 'ready_for_review']);
+const REVIEW_ACTIONS: ReadonlySet<string> = new Set(['opened', 'reopened', 'ready_for_review', 'synchronize']);
 
 const skip = (reason: string): Outcome => ({ status: 200, body: { ok: true, skipped: reason } });
 const fail = (status: number, error: string): Outcome => ({ status, body: { error } });
@@ -93,6 +102,14 @@ export function createDeliveryHandler(
       await deps.store.returnAutoReview(repo, prNumber);
     } catch (err) {
       console.error(`[store] could not give back an automatic review of ${repo}#${prNumber}; the pull request has one fewer`, err);
+    }
+  }
+
+  async function clearPendingQuietly(repo: string, prNumber: number, marker: string): Promise<void> {
+    try {
+      await deps.store.clearReviewPending(repo, prNumber, marker);
+    } catch (err) {
+      console.error(`[store] could not clear the pending marker of ${repo}#${prNumber}; new commits are skipped until it expires`, err);
     }
   }
 
@@ -138,8 +155,9 @@ export function createDeliveryHandler(
     if (route.mentionOnly) return skip(`mention-only-route=${route.routeId}`);
 
     // skipDrafts routes review a draft when it is marked ready
-    // (ready_for_review, which always has draft=false). Other routes
-    // review on open, draft or not, and ignore ready_for_review.
+    // (ready_for_review, which always has draft=false), and skip new
+    // commits on a draft. Other routes review on open and on new commits,
+    // draft or not, and ignore ready_for_review.
     if (route.skipDrafts) {
       if (pr?.draft === true) return skip('draft');
     } else if (action === 'ready_for_review') {
@@ -156,6 +174,7 @@ export function createDeliveryHandler(
     // open as non-draft, and that completed run must not stand in for
     // this one.
     const ready = action === 'ready_for_review';
+    const pushed = action === 'synchronize';
     const key = `${repo}#${prNumber}#${headSha}${ready ? '#ready' : ''}`;
     if (!(await deps.store.claim(key, { action }))) return skip('duplicate');
 
@@ -168,6 +187,19 @@ export function createDeliveryHandler(
     };
 
     try {
+      // A review of new commits waits in the queue, so that a burst of
+      // pushes gets one review: while it waits, the pull request's pending
+      // marker skips later pushes, and the runtime reviews the head as it
+      // is when the run starts. This delivery's key stays claimed then,
+      // since the waiting review covers its head.
+      let pendingMarker: string | undefined;
+      if (pushed) {
+        const marker = await deps.store.markReviewPending(repo, prNumber, config.pushReviewDelaySeconds);
+        if (marker === null) return skip('auto-review-pending');
+        pendingMarker = marker;
+        taken.push(() => clearPendingQuietly(repo, prNumber, marker));
+      }
+
       const cap = config.maxAutomaticReviewsPerPr;
       const round = await deps.store.takeAutoReview(repo, prNumber, cap);
       if (round === 0) {
@@ -192,9 +224,11 @@ export function createDeliveryHandler(
         installation_id: target.installationId,
         head_sha: headSha,
         ...(ready ? { run_nonce: 'ready' } : {}),
+        ...(pendingMarker ? { pending_marker: pendingMarker } : {}),
       };
-      await deps.sendMessage(route.queueUrl, envelope, { repo, pr_number: prNumber, action });
-      log(`[auto-review] route=${route.routeId} repo=${repo} pr=${prNumber} round=${round}/${cap} queued`);
+      const delay = pushed ? { delaySeconds: config.pushReviewDelaySeconds } : undefined;
+      await deps.sendMessage(route.queueUrl, envelope, { repo, pr_number: prNumber, action }, delay);
+      log(`[auto-review] route=${route.routeId} repo=${repo} pr=${prNumber} round=${round}/${cap} queued${delay ? ` delay=${delay.delaySeconds}s` : ''}`);
     } catch (err) {
       await giveBack();
       throw err;

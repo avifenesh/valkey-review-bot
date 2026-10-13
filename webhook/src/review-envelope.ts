@@ -23,6 +23,12 @@ export interface ReviewEnvelope {
   readonly run_nonce?: string;
   readonly trigger_path?: string;
   readonly trigger_line?: number;
+  /**
+   * Reviews of new commits: the id of the pull request's pending marker
+   * (src/store.ts), which the worker removes when it starts the run. The
+   * runtime ignores it.
+   */
+  readonly pending_marker?: string;
 }
 
 /**

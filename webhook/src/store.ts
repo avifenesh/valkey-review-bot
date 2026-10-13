@@ -1,3 +1,4 @@
+import { randomUUID } from 'node:crypto';
 import { DeleteCommand, PutCommand, UpdateCommand, type DynamoDBDocumentClient } from '@aws-sdk/lib-dynamodb';
 
 /**
@@ -9,7 +10,10 @@ import { DeleteCommand, PutCommand, UpdateCommand, type DynamoDBDocumentClient }
  *   - daily review counters, "budget#ROUTEID#YYYY-MM-DD" (UTC), which cap
  *     automatic reviews per route;
  *   - pull request counters, "autoreviews#OWNER/NAME#PR" (lowercased), which
- *     cap automatic reviews per pull request.
+ *     cap automatic reviews per pull request;
+ *   - pending markers, "pending#OWNER/NAME#PR" (lowercased), held by a
+ *     review of new commits while it waits in the queue. The worker
+ *     removes the marker when it starts the review.
  */
 
 export type DocumentClient = Pick<DynamoDBDocumentClient, 'send'>;
@@ -18,6 +22,8 @@ const DELIVERY_KEY_TTL_SECONDS = 24 * 3600;
 const BUDGET_TTL_SECONDS = 3 * 24 * 3600;
 /** Counted from the pull request's latest automatic review. */
 const AUTO_REVIEW_TTL_SECONDS = 180 * 24 * 3600;
+/** How long a pending marker outlives its queue delay, in case no worker removes it. */
+const PENDING_TTL_SECONDS = 3600;
 
 function isConditionFailure(err: unknown): boolean {
   return (err as { name?: string } | null)?.name === 'ConditionalCheckFailedException';
@@ -44,6 +50,14 @@ export interface DeliveryStore {
   takeAutoReview(repo: string, prNumber: number, cap: number): Promise<number>;
   /** Gives back an automatic review taken for a review that was not queued. */
   returnAutoReview(repo: string, prNumber: number): Promise<void>;
+  /**
+   * Marks a review of new commits as waiting in the queue for the pull
+   * request. Returns the marker's id, or null while another review holds
+   * the marker. The marker expires an hour after the delay.
+   */
+  markReviewPending(repo: string, prNumber: number, delaySeconds: number): Promise<string | null>;
+  /** Removes the pull request's pending marker if it is still `markerId`. */
+  clearReviewPending(repo: string, prNumber: number, markerId: string): Promise<boolean>;
 }
 
 /**
@@ -65,6 +79,39 @@ export function budgetKey(routeId: string, now: Date): string {
 /** GitHub repository names are case-insensitive. */
 export function autoReviewKey(repo: string, prNumber: number): string {
   return `autoreviews#${repo.toLowerCase()}#${prNumber}`;
+}
+
+export function pendingReviewKey(repo: string, prNumber: number): string {
+  return `pending#${repo.toLowerCase()}#${prNumber}`;
+}
+
+/**
+ * Removes the pull request's pending marker, only while it is still
+ * `markerId`, so a late or repeated call cannot remove the marker of a
+ * later push. The receiver calls it when a review is not queued after
+ * all, the worker when it starts the review. False when the marker was
+ * not there.
+ */
+export async function clearPendingReview(
+  ddb: DocumentClient,
+  tableName: string,
+  repo: string,
+  prNumber: number,
+  markerId: string,
+): Promise<boolean> {
+  try {
+    await ddb.send(new DeleteCommand({
+      TableName: tableName,
+      Key: { key: pendingReviewKey(repo, prNumber) },
+      ConditionExpression: '#m = :m',
+      ExpressionAttributeNames: { '#m': 'marker' },
+      ExpressionAttributeValues: { ':m': markerId },
+    }));
+    return true;
+  } catch (err) {
+    if (isConditionFailure(err)) return false;
+    throw err;
+  }
 }
 
 export function createDeliveryStore(ddb: DocumentClient, tableName: string, now: () => Date = () => new Date()): DeliveryStore {
@@ -146,5 +193,30 @@ export function createDeliveryStore(ddb: DocumentClient, tableName: string, now:
         throw err;
       }
     },
+
+    async markReviewPending(repo, prNumber, delaySeconds) {
+      const marker = randomUUID();
+      try {
+        await ddb.send(new PutCommand({
+          TableName: tableName,
+          Item: {
+            key: pendingReviewKey(repo, prNumber),
+            marker,
+            ttl: epochSeconds() + delaySeconds + PENDING_TTL_SECONDS,
+            receivedAt: now().toISOString(),
+          },
+          // TTL deletes lazily, so an expired marker counts as gone.
+          ConditionExpression: 'attribute_not_exists(#k) OR #ttl < :now',
+          ExpressionAttributeNames: { '#k': 'key', '#ttl': 'ttl' },
+          ExpressionAttributeValues: { ':now': epochSeconds() },
+        }));
+        return marker;
+      } catch (err) {
+        if (isConditionFailure(err)) return null;
+        throw err;
+      }
+    },
+
+    clearReviewPending: (repo, prNumber, markerId) => clearPendingReview(ddb, tableName, repo, prNumber, markerId),
   };
 }
