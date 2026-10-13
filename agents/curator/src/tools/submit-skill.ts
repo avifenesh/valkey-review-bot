@@ -41,6 +41,16 @@ import { errorText, fail, ok, type TouchedRecord } from './run.js';
  * so a claimed generation the registry shows retired was retired by an
  * operator.
  *
+ * Release-check edits. A check run that applies an edit (the curator's
+ * maintenance mode) first claims it with a write that sets revised_at
+ * and removes maintenance_id, then updates the registry, and removes
+ * maintenance_requested_at in its last write. An update of a live skill
+ * is refused while such a run is between those writes, and its claim is
+ * conditioned on revised_at as read: whichever of the two claims comes
+ * second fails, so neither text overwrites the other. The claim also
+ * removes maintenance_id, which voids a check or retirement queued for
+ * the old text (ops/src/decay.ts).
+ *
  * Suppressed pieces. The release check edits a published skill in
  * suppress-and-add form (agents/common/src/skill-check/edits.ts): a
  * superseded piece stays between markers that name the release and cite
@@ -206,6 +216,7 @@ const NAMES: Readonly<Record<string, string>> = {
   '#ss': 'stale_since',
   '#or': 'obsolete_release',
   '#pr': 'pending_revision',
+  '#rva': 'revised_at',
   '#mid': 'maintenance_id',
   '#mra': 'maintenance_requested_at',
   '#mr': 'maintenance_reason',
@@ -223,6 +234,24 @@ const CLEARED_ON_PUBLISH = '#sn, #ss, #or, #pr, #ret, #rr, #rfs, #mid, #mra, #mr
 
 /** A queued check or retirement of the old text is void once a new text is claimed. */
 const CANCEL_MAINTENANCE = 'REMOVE #mid, #mra, #mr';
+
+/**
+ * maintenance_requested_at younger than this is a claim in flight, as
+ * MAINTENANCE_RETRY_DAYS in ops/src/decay.ts.
+ */
+const MAINTENANCE_RETRY_MS = 7 * 24 * 3600 * 1000;
+
+/**
+ * Whether a check run is applying an edit: it removed maintenance_id
+ * and has not yet removed maintenance_requested_at.
+ * Every other writer sets or removes the claim's attributes together.
+ * After MAINTENANCE_RETRY_MS the claim has expired, as decay sees it.
+ */
+function reviseInFlight(item: Item, nowMs: number): boolean {
+  if (item.maintenance_id !== undefined || typeof item.maintenance_requested_at !== 'string') return false;
+  const requestedMs = Date.parse(item.maintenance_requested_at);
+  return Number.isFinite(requestedMs) && nowMs - requestedMs < MAINTENANCE_RETRY_MS;
+}
 
 function updateCommand(table: string, key: Key, expression: string, conditions: readonly string[], values: Record<string, unknown>): UpdateCommand {
   const condition = conditions.join(' AND ');
@@ -380,15 +409,17 @@ async function chooseTarget(
     };
   }
 
-  const keep = (retired: boolean, previous: string | null): Target => ({
-    name: current,
-    update: `SET #grn = :name ${CANCEL_MAINTENANCE}`,
-    conditions: [...gate, '#grn = :name', retired ? 'attribute_exists(#ret)' : 'attribute_not_exists(#ret)'],
-    values: { ':name': current, ':t': threshold },
-    previous,
-    tombstone: retired,
-  });
+  const keep = (retired: boolean, previous: string | null): Target => {
+    const conditions = [...gate, '#grn = :name', retired ? 'attribute_exists(#ret)' : 'attribute_not_exists(#ret)'];
+    const values: Record<string, unknown> = { ':name': current, ':t': threshold };
+    // A check run's edit claim sets revised_at: if it lands first, this claim fails.
+    asRead(conditions, values, '#rva', ':readRva', source.revised_at);
+    return { name: current, update: `SET #grn = :name ${CANCEL_MAINTENANCE}`, conditions, values, previous, tombstone: retired };
+  };
   if (source.retired_at === undefined) {
+    if (reviseInFlight(source, Date.now())) {
+      return `the release check is applying an edit to skill "${current}", so this run does not update it`;
+    }
     // The published text may hold the release check's suppressed blocks, which the new text must keep.
     if (!deps.registry.get) return `cannot read the published skill "${current}" (no registry reader is configured), so it is not updated`;
     const published = await deps.registry.get(current);

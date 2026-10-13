@@ -696,6 +696,71 @@ test('publishing clears the old text\'s check and maintenance state and keeps th
   assertUpdatesWellFormed(w.ddb);
 });
 
+const ago = (ms) => new Date(Date.now() - ms).toISOString();
+const DAY_MS = 24 * 3600 * 1000;
+const CHECK_ID = 'check#valkey-review#r1#2026-10-01T00:00:00.000Z';
+/** The record as a revise run leaves it after its first write: revised_at set, maintenance_id removed. */
+const revising = (requestedAt) => ({
+  previous_skill_md: 'live body',
+  revised_at: ago(1_000),
+  maintenance_requested_at: requestedAt,
+  maintenance_reason: 'check',
+});
+/** The revise run's first write, as ops/src/decay.ts states it. */
+const reviseClaim = (id = CHECK_ID) => ({
+  ConditionExpression: '#mid = :id AND #grn = :name',
+  ExpressionAttributeNames: { '#mid': 'maintenance_id', '#grn': 'graduated_record_name' },
+  ExpressionAttributeValues: { ':id': id, ':name': OLD },
+});
+
+test('a live skill is not updated while a release-check edit is being applied', async () => {
+  const w = world({ item: live(revising(ago(60_000))), skills: { [OLD]: { status: 'DRAFT', skillMd: 'live body' } } });
+  const out = parse(await w.submit.invoke(INPUT));
+  assert.equal(out.ok, false);
+  assert.match(out.error, /the release check is applying an edit to skill "replication-handshake-cancel-paths", so this run does not update it/);
+  assert.deepEqual(w.ddb.ops(), ['GetCommand'], 'nothing is claimed');
+  assert.deepEqual(w.registry.calls, [], 'nothing is read or published');
+  assert.equal(w.run.take('skill_submit', 'next'), null, 'the slot is free');
+
+  // A revise run that stopped between its writes holds the skill only as long as decay holds a claim.
+  const expired = world({ item: live(revising(ago(8 * DAY_MS))), skills: { [OLD]: { status: 'DRAFT', skillMd: 'live body' } } });
+  const after = parse(await expired.submit.invoke(INPUT));
+  assert.equal(after.ok, true, after.error);
+  assert.ok(!('maintenance_requested_at' in expired.record()));
+});
+
+test('an update claim and a revise claim of the same skill cannot both succeed', async () => {
+  for (const readRevisedAt of [undefined, '2026-09-01T00:00:00.000Z']) {
+    const queued = { maintenance_id: CHECK_ID, maintenance_requested_at: ago(60_000), maintenance_reason: 'check' };
+    const item = live(readRevisedAt ? { ...queued, revised_at: readRevisedAt } : queued);
+    const w = world({
+      item,
+      skills: { [OLD]: { status: 'DRAFT', skillMd: 'live body' } },
+      intercept: (command, row) => {
+        if (command.constructor.name !== 'UpdateCommand' || !conditionHolds(row, reviseClaim())) return;
+        // The revise run claims its edit just before this run's claim.
+        delete row.maintenance_id;
+        Object.assign(row, { previous_skill_md: 'live body', revised_at: ago(0) });
+      },
+    });
+    const out = parse(await w.submit.invoke(INPUT));
+    assert.equal(out.ok, false, String(readRevisedAt));
+    assert.match(out.error, /the record changed or graduated under another name while submitting/);
+    assert.ok(!w.registry.calls.some((c) => c.startsWith('upsert')), 'the revise run\'s edit is not overwritten');
+    const [claim] = w.ddb.calls.filter((c) => c.op === 'UpdateCommand').map((c) => c.input);
+    assert.ok(claim.ConditionExpression.split(' AND ').includes(readRevisedAt ? '#rva = :readRva' : 'attribute_not_exists(#rva)'));
+    assertPlaceholdersMatch(claim);
+  }
+
+  // The other order: this run claims first, and the revise run's claim then fails.
+  const item = live({ maintenance_id: CHECK_ID, maintenance_requested_at: ago(60_000), maintenance_reason: 'check', revised_at: '2026-09-01T00:00:00.000Z' });
+  const w = world({ item, skills: { [OLD]: { status: 'DRAFT', skillMd: 'live body' } } });
+  assert.ok(conditionHolds(w.record(), reviseClaim()), 'before the submit the revise run could claim');
+  const out = parse(await w.submit.invoke(INPUT));
+  assert.equal(out.ok, true, out.error);
+  assert.equal(conditionHolds(w.record(), reviseClaim()), false);
+});
+
 test('two runs restoring one tombstone agree on one generation', async () => {
   // The other run claimed generation 2 after this one read the record.
   const now = tombstone({ graduated_record_name: generationName(2), skill_generation: 2, previous_record_name: OLD });
