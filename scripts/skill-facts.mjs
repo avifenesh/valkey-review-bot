@@ -91,6 +91,16 @@ if ([values.repo, values.url, values.checkout].filter(Boolean).length !== 1) fai
 if (values.ref && values.checkout) fail('--ref goes with --repo or --url; use --rev with --checkout');
 if (values.rev && !values.checkout) fail('--rev goes with --checkout; use --ref with --repo or --url');
 if (values.repo && !isRepoName(values.repo)) fail(`--repo must look like owner/name, got ${quoted(values.repo)}`);
+// Before anything prints the URL: a URL with credentials is refused without echoing them.
+if (values.url !== undefined) {
+  let url;
+  try {
+    url = new URL(values.url);
+  } catch {
+    fail('--url is not a URL; pass an https:// URL without credentials, or a file:// URL');
+  }
+  if (url.username || url.password) fail('--url must not carry credentials (a user or password before @); the upstream is fetched anonymously');
+}
 if (values.names && values.json) fail('pass --names or --json, not both');
 if (values.checkout && !statSync(values.checkout, { throwIfNoEntry: false })?.isDirectory()) fail(`--checkout ${quoted(values.checkout)} is not a directory`);
 
@@ -136,7 +146,7 @@ if (values.file) {
 const upstream = values.checkout
   ? { checkout: values.checkout, rev: values.rev }
   : { url: values.url ?? `https://github.com/${values.repo}.git`, branch: values.ref };
-if (upstream.url) console.error(`fetching ${upstream.url}${upstream.branch ? ` ${upstream.branch}` : ''} ...`);
+if (upstream.url) console.error(`fetching ${printable(upstream.url)}${upstream.branch ? ` ${printable(upstream.branch)}` : ''} ...`);
 
 let facts;
 try {

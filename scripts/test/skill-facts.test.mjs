@@ -295,10 +295,14 @@ test('skill-facts.mjs refuses bad option sets before any work', async () => {
     [['--file', 'a.md', '--url', up.url, '--names', '--json'], /pass --names or --json, not both/],
     [['--file', path.join(up.root, 'missing.md'), '--url', up.url], /cannot read/],
     [['--file', 'a.md', '--checkout', path.join(up.root, 'nowhere')], /--checkout ".*nowhere" is not a directory/],
+    [['--file', 'a.md', '--url', 'https://user:TOKEN-1@github.com/valkey-io/valkey.git'], /--url must not carry credentials/],
+    [['--file', 'a.md', '--url', 'https://TOKEN-1@github.com/valkey-io/valkey.git'], /--url must not carry credentials/],
+    [['--file', 'a.md', '--url', 'TOKEN-1 is not a url'], /--url is not a URL/],
   ]) {
     const r = await runScript('skill-facts.mjs', args, { env: cli.env });
     assert.equal(r.code, 1, args.join(' '));
     assert.match(r.stderr, message, args.join(' '));
+    assert.ok(!`${r.stdout}${r.stderr}`.includes('TOKEN-1'), `no credential is echoed: ${args.join(' ')}`);
   }
   assert.deepEqual(cli.calls(), []);
 });
