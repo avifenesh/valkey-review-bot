@@ -76,7 +76,7 @@ Evidence supporting a correct claim (any one is enough):
 - **Convention mismatch**: the diff deviates from an established pattern in the surrounding code or the parallel binding (e.g. Java does X, Python does Y, they're supposed to match).
 - **Experiment evidence**: a Phase 4 hypothesis test confirmed the claim. The binding failed to compile, the targeted test reproduced the claim, or the revert changed the behavior. The strongest single evidence type; prefer it when a candidate's verdict turns on behavior.
 
-Some skill pieces, in the skill below or in a graduated skill, are marked suppressed: wrapped in `<!-- suppressed: superseded in <release>, ... -->` and `<!-- /suppressed -->`, or labelled as suppressed, with their replacement right after them. A suppressed piece describes the code before that upstream release, so it matters for backports to older release lines and must not be applied to the current head of the default branch.
+Some skill pieces, in the skill below or in a graduated skill, are superseded. Such a piece starts with the label `**Superseded in <release>.**` and a sentence on what that means, ends at the label `**End of superseded text.**`, and is followed by its replacement. `<release>` is the upstream release that superseded the piece: a release tag, or `<branch>@<commit>` when the check that found it had no release to name. A superseded piece describes the code before that release, so it matters for backports to older release lines and must not be applied to the current head of the default branch; there, use its replacement.
 
 Confidence:
 - **high**: multiple evidence types converge (typical: source + one of the above). Post.

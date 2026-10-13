@@ -4,6 +4,7 @@ import { readFileSync } from 'node:fs';
 import test from 'node:test';
 
 const { renderPrOverview } = await import('../../common/src/workspace.ts');
+const { labelSuppressedPieces } = await import('../../common/src/graduated-skills.ts');
 
 // Every optional section of the overview present.
 const ctx = {
@@ -58,14 +59,25 @@ test('a wrong finding is dropped, not resolved, by one rule in the prompt and th
   assert.ok(renderPrOverview(ctx).includes('marked resolved if it is fixed at the current head or else still open. Drop one only if it is shown to be wrong, and give the reason in `summary`.'));
 });
 
-test('the prompt keeps suppressed skill pieces for older release lines only', () => {
+test('the prompt describes superseded skill pieces as the reviewer sees them', () => {
   const prompt = readFileSync(new URL('../config/prompt.md', import.meta.url), 'utf8');
   const para = prompt.split('\n').find((l) => l.startsWith('Some skill pieces, '));
   assert.ok(para, 'the paragraph is in "The correctness bar"');
-  // The markers as the skill check writes them.
-  assert.ok(para.includes('`<!-- suppressed: superseded in <release>, ... -->` and `<!-- /suppressed -->`'));
-  assert.match(para, /describes the code before that upstream release/);
-  assert.match(para, /matters for backports to older release lines and must not be applied to the current head/);
+  // A block as the release check writes it, and as the renderer labels it.
+  const marker = (release) => `<!-- suppressed: superseded in ${release}, 2026-10-13; \`a\` is now \`b\`; evidence: valkey-io/valkey@${'0'.repeat(40)}:src/a.c:1 -->`;
+  const block = (release) => [marker(release), 'old', '<!-- /suppressed -->', 'new'].join('\n');
+  const [open, piece, close, replacement] = labelSuppressedPieces(block('9.1.2')).split('\n');
+  assert.deepEqual([piece, replacement], ['old', 'new']);
+  // The prompt quotes the labels, with the release as <release>, and never the raw markers.
+  const openLabel = open.slice(0, open.indexOf('.**') + 3).replace('9.1.2', '<release>');
+  assert.equal(openLabel, '**Superseded in <release>.**');
+  assert.ok(para.includes(`\`${openLabel}\``) && para.includes(`\`${close}\``), para);
+  assert.doesNotMatch(para, /<!--|-->/);
+  // A check with no release names a branch and commit.
+  assert.ok(labelSuppressedPieces(block('unstable@0eb4ba3c1d2e')).startsWith('**Superseded in unstable@0eb4ba3c1d2e.**'));
+  assert.ok(para.includes('`<branch>@<commit>`'));
+  assert.match(para, /describes the code before that release/);
+  assert.match(para, /matters for backports to older release lines and must not be applied to the current head of the default branch; there, use its replacement\./);
   assert.ok(prompt.indexOf(para) < prompt.indexOf('\nConfidence:\n'));
 });
 
