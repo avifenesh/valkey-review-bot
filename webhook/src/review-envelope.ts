@@ -42,11 +42,6 @@ export interface ReviewEnvelope {
   readonly skip_drafts?: boolean;
 }
 
-/** A review of new commits, which src/delivery.ts marks with trigger "push". */
-export function isPushReview(envelope: Readonly<Record<string, unknown>>): boolean {
-  return envelope.trigger === 'push';
-}
-
 export interface PendingMarker {
   readonly repo: string;
   readonly prNumber: number;

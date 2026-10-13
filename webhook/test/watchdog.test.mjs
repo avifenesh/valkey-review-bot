@@ -3,7 +3,7 @@ import * as fs from 'node:fs';
 import test from 'node:test';
 import './support/ts-resolve.mjs';
 
-const { heartbeatRunKey, isPushReview, pendingMarkerOf, pullRequestRunPrefix } = await import('../src/review-envelope.ts');
+const { heartbeatRunKey, pendingMarkerOf, pullRequestRunPrefix } = await import('../src/review-envelope.ts');
 const { CURATOR_MAX_RECEIVES, decide, isCuratorMessage, liveRun, messageTag } = await import('../src/watchdog.ts');
 
 const MIN = 60_000;
@@ -278,7 +278,7 @@ test('the log tag names the message', () => {
   assert.match(messageTag({ ...maintenance, dry_run: 'true' }), / dry_run=false$/, 'only the boolean true is a dry run');
 });
 
-test('a review of new commits names the pending marker the worker clears', () => {
+test('an automatic review names the pending marker the worker clears', () => {
   assert.deepEqual(pendingMarkerOf({ ...review, pending_marker: 'm-1' }), { repo: 'example-org/valkey', prNumber: 7, markerId: 'm-1' });
   assert.equal(pendingMarkerOf(review), undefined);
   assert.equal(pendingMarkerOf(curator), undefined);
@@ -286,13 +286,6 @@ test('a review of new commits names the pending marker the worker clears', () =>
   assert.equal(pendingMarkerOf({ ...review, pending_marker: 5 }), undefined);
   assert.equal(pendingMarkerOf({ ...review, pr_number: '7', pending_marker: 'm-1' }), undefined);
   assert.equal(pendingMarkerOf({ pr_number: 7, pending_marker: 'm-1' }), undefined);
-});
-
-test('only trigger "push" marks a review of new commits', () => {
-  assert.equal(isPushReview({ ...review, trigger: 'push', skip_drafts: false }), true);
-  assert.equal(isPushReview(review), false);
-  assert.equal(isPushReview({ ...review, pending_marker: 'm-1' }), false);
-  assert.equal(isPushReview({ ...review, trigger: 'opened' }), false);
 });
 
 test('the pull request prefix starts every run key of that pull request and no other', () => {

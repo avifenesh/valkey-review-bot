@@ -2,7 +2,7 @@ import { BedrockAgentCoreClient, InvokeAgentRuntimeCommand } from '@aws-sdk/clie
 import { DynamoDBClient } from '@aws-sdk/client-dynamodb';
 import { DynamoDBDocumentClient, GetCommand, ScanCommand } from '@aws-sdk/lib-dynamodb';
 import { loadInvokerConfig } from './config.js';
-import { isPushReview, pendingMarkerOf, type PendingMarker } from './review-envelope.js';
+import { pendingMarkerOf, type PendingMarker } from './review-envelope.js';
 import { clearPendingReview, extendPendingReview, holdsPendingReview } from './store.js';
 import { decide, isCuratorMessage, messageTag, type HeartbeatRecord, type PullRequestRun } from './watchdog.js';
 
@@ -44,7 +44,7 @@ async function readHeartbeat(runKey: string): Promise<HeartbeatRecord | undefine
  * The running records of a pull request's runs. The heartbeat table is
  * keyed by run key alone, so this scans it with a filter on the key
  * prefix. That stays cheap: the table holds a day or two of runs (a
- * 24-hour TTL), and only a review of new commits that is about to start
+ * 24-hour TTL), and only an automatic review that is about to start
  * reads it.
  */
 async function readPullRequestRuns(prefix: string): Promise<PullRequestRun[]> {
@@ -135,6 +135,14 @@ async function handleOne(record: SqsRecord): Promise<void> {
     throw new Error(`HEARTBEAT_TABLE is not set; refusing to run ${tag}`);
   }
 
+  // Every automatic review has a pending marker, and waits while any
+  // other review of the pull request runs (src/watchdog.ts), so that two
+  // automatic runs of a pull request do not overlap. @mention runs,
+  // thread replies included, have no marker and do not wait: a
+  // maintainer asked for the run and watches its status comment, which
+  // would sit unanswered behind a review that can take an hour; and
+  // after a wait the worker could not tell that such a run never
+  // started, so it would run it on the fallback model.
   const marker = pendingMarkerOf(envelope);
   const held = await holdsMarker(marker, tag);
   const decision = await decide({
@@ -146,7 +154,7 @@ async function handleOne(record: SqsRecord): Promise<void> {
     staleMs: config.staleMs,
     readHeartbeat,
     holdsMarker: held,
-    ...(isPushReview(envelope) ? { readPullRequestRuns } : {}),
+    ...(marker ? { readPullRequestRuns } : {}),
   });
   if (decision.action === 'delete') {
     if (decision.error) console.error(`[abandoned] ${tag} attempt=${receiveCount}: ${decision.reason}`);

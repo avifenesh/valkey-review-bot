@@ -27,18 +27,20 @@ import { heartbeatRunKey, pullRequestRunPrefix } from './review-envelope.js';
  * holds it, the review has never run: any receive is its first attempt,
  * on the primary model, and its heartbeat is not read.
  *
- * A review of new commits does not start while another review of the
- * same pull request runs. Before it runs, on any attempt, the heartbeats
- * of the pull request's runs are read; while one of them is running and
+ * An automatic review does not start while another review of the same
+ * pull request runs. Before it runs, on any attempt, the heartbeats of
+ * the pull request's runs are read; while one of them is running and
  * fresh (any review, automatic or @mention), the message waits as it
- * does for its own live run, and keeps its marker, so later pushes still
- * join it. The wait and the push delay both count against the run
- * budget, from SentTimestamp: a review still waiting when the budget is
- * used up is dropped with an error, and one that starts late is watched
- * only until the budget ends (the run itself goes on, without the
- * fallback). A run shows up once its runtime writes the first heartbeat,
- * a few seconds after its worker invokes it; with no push delay, a review
- * of new commits that starts in those seconds can still run alongside.
+ * does for its own live run, and keeps its marker, so later events still
+ * join it. @mention runs do not wait; src/invoker.ts says why. The wait
+ * and the push delay both count against the run budget, from
+ * SentTimestamp: a review still waiting when the budget is used up is
+ * dropped with an error, and one that starts late is watched only until
+ * the budget ends (the run itself goes on, without the fallback). A run
+ * shows up once its runtime writes the first heartbeat, a few seconds
+ * after its worker invokes it; an automatic review that starts in those
+ * seconds can still run alongside it, most likely one with no queue
+ * delay, such as a reopen.
  *
  * Curator messages, feedback or maintenance, have no heartbeat. Each
  * receive runs the curator; the curator queue dead-letters after three
@@ -75,9 +77,9 @@ export interface WatchdogInput {
   /** True while the message still holds its pull request's pending marker. */
   readonly holdsMarker?: boolean;
   /**
-   * Reviews of new commits: the heartbeat records of the pull request's
-   * runs, keys starting with `prefix`. Records that are not running may
-   * be left out.
+   * Automatic reviews: the heartbeat records of the pull request's runs,
+   * keys starting with `prefix`. Records that are not running may be
+   * left out.
    */
   readonly readPullRequestRuns?: (prefix: string) => Promise<readonly PullRequestRun[]>;
 }

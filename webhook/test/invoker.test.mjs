@@ -84,13 +84,13 @@ function tables({ marker, heartbeat, pages = [[]], deleteError } = {}) {
 const ops = () => calls.map((c) => `${c.op}${c.input.TableName ? ` ${c.input.TableName}` : ''}`);
 const invoked = () => JSON.parse(new TextDecoder().decode(calls.find((c) => c.op === 'InvokeAgentRuntimeCommand').input.payload));
 
-test('a review of new commits that holds its marker clears it, then runs', async () => {
+test('an automatic review that holds its marker clears it, then runs', async () => {
   ddbAnswer = tables({ marker: 'marker-1' });
   const { result, lines } = await run(sqsEvent({ ...review, pending_marker: 'marker-1' }));
   assert.deepEqual(result, { batchItemFailures: [] });
-  assert.deepEqual(ops(), ['GetCommand idempotency', 'DeleteCommand idempotency', 'InvokeAgentRuntimeCommand']);
+  assert.deepEqual(ops(), ['GetCommand idempotency', 'ScanCommand heartbeat', 'DeleteCommand idempotency', 'InvokeAgentRuntimeCommand']);
   assert.deepEqual(calls[0].input, { TableName: 'idempotency', Key: MARKER_KEY, ConsistentRead: true });
-  assert.deepEqual(calls[1].input, {
+  assert.deepEqual(calls[2].input, {
     TableName: 'idempotency',
     Key: MARKER_KEY,
     ConditionExpression: '#m = :m',
@@ -105,21 +105,21 @@ test('a marker that a later push replaced is left alone, and the run goes ahead'
   ddbAnswer = tables({ marker: 'marker-2' });
   const { result } = await run(sqsEvent({ ...review, pending_marker: 'marker-1' }));
   assert.deepEqual(result, { batchItemFailures: [] });
-  assert.deepEqual(ops(), ['GetCommand idempotency', 'InvokeAgentRuntimeCommand']);
+  assert.deepEqual(ops(), ['GetCommand idempotency', 'ScanCommand heartbeat', 'InvokeAgentRuntimeCommand']);
 });
 
 test('a failed clear stops the run, and the retry runs it on the primary model', async () => {
   ddbAnswer = tables({ marker: 'marker-1', deleteError: Object.assign(new Error('throttled'), { name: 'ThrottlingException' }) });
   const failed = await run(sqsEvent({ ...review, pending_marker: 'marker-1' }));
   assert.deepEqual(failed.result, { batchItemFailures: [{ itemIdentifier: 'm1' }] });
-  assert.deepEqual(ops(), ['GetCommand idempotency', 'DeleteCommand idempotency'], 'not invoked: the marker still says it never ran');
+  assert.deepEqual(ops(), ['GetCommand idempotency', 'ScanCommand heartbeat', 'DeleteCommand idempotency'], 'not invoked: the marker still says it never ran');
   assert.ok(failed.lines.some((l) => /^\[fail\] messageId=m1: throttled$/.test(l)), failed.lines.join('\n'));
   assert.equal(failed.lines.some((l) => l.startsWith('[invoke]')), false);
 
   ddbAnswer = tables({ marker: 'marker-1' });
   const retried = await run(sqsEvent({ ...review, pending_marker: 'marker-1' }, 2));
   assert.deepEqual(retried.result, { batchItemFailures: [] });
-  assert.deepEqual(ops(), ['GetCommand idempotency', 'DeleteCommand idempotency', 'InvokeAgentRuntimeCommand'], 'no heartbeat read');
+  assert.deepEqual(ops(), ['GetCommand idempotency', 'ScanCommand heartbeat', 'DeleteCommand idempotency', 'InvokeAgentRuntimeCommand'], 'no heartbeat read');
   assert.equal(invoked().use_fallback_model, undefined);
 });
 
@@ -133,11 +133,12 @@ test('a failed marker read leaves the message for a retry', async () => {
 test('a worker not allowed to read the marker runs the review like any other', async () => {
   ddbAnswer = async (command) => {
     if (command.constructor.name === 'GetCommand') throw Object.assign(new Error('not authorized'), { name: 'AccessDeniedException' });
+    if (command.constructor.name === 'ScanCommand') return { Items: [] };
     throw new Error(`unexpected ${command.constructor.name}`);
   };
   const { result, lines } = await run(sqsEvent({ ...review, pending_marker: 'marker-1' }));
   assert.deepEqual(result, { batchItemFailures: [] });
-  assert.deepEqual(ops(), ['GetCommand idempotency', 'InvokeAgentRuntimeCommand']);
+  assert.deepEqual(ops(), ['GetCommand idempotency', 'ScanCommand heartbeat', 'InvokeAgentRuntimeCommand']);
   assert.ok(lines.some((l) => /may not read idempotency; the pending marker stays until it expires/.test(l)), lines.join('\n'));
 });
 
@@ -149,7 +150,7 @@ test('a redelivery whose marker is gone is watched like any review', async () =>
 
   ddbAnswer = tables({});
   await run(sqsEvent({ ...review, pending_marker: 'marker-1' }, 2));
-  assert.deepEqual(ops(), ['GetCommand idempotency', 'GetCommand heartbeat', 'InvokeAgentRuntimeCommand']);
+  assert.deepEqual(ops(), ['GetCommand idempotency', 'GetCommand heartbeat', 'ScanCommand heartbeat', 'InvokeAgentRuntimeCommand']);
   assert.equal(invoked().use_fallback_model, true, 'a run that died is retried on the fallback model');
 });
 
@@ -168,14 +169,14 @@ test('without IDEMPOTENCY_TABLE the marker is left to expire', async () => {
     } finally {
       Object.assign(console, original);
     }
-    assert.deepEqual(ops(), ['InvokeAgentRuntimeCommand']);
+    assert.deepEqual(ops(), ['ScanCommand heartbeat', 'InvokeAgentRuntimeCommand']);
     assert.ok(lines.some((l) => /IDEMPOTENCY_TABLE is not set; the pending marker stays until it expires/.test(l)));
   } finally {
     process.env.IDEMPOTENCY_TABLE = saved;
   }
 });
 
-const pushed = { ...review, pending_marker: 'marker-1', trigger: 'push', skip_drafts: false };
+const pushed = { ...review, run_nonce: 'push', pending_marker: 'marker-1', trigger: 'push', skip_drafts: false };
 const running = (runKey, agoMs = 60_000) => ({ run_key: runKey, status: 'running', last_activity: Date.now() - agoMs });
 
 test('a review of new commits looks for other runs of its pull request before it runs', async () => {
@@ -216,6 +217,20 @@ test('after waiting, a review of new commits runs on the primary model', async (
   assert.equal(invoked().use_fallback_model, undefined);
 });
 
+test('an opened, reopened or ready review waits too, then runs on the primary model', async () => {
+  const opened = { ...review, pending_marker: 'marker-1' };
+  ddbAnswer = tables({ marker: 'marker-1', pages: [[running('Example-Org/Valkey#7#aaa#push')]] });
+  const waited = await run(sqsEvent(opened));
+  assert.deepEqual(waited.result, { batchItemFailures: [{ itemIdentifier: 'm1' }] });
+  assert.deepEqual(ops(), ['GetCommand idempotency', 'ScanCommand heartbeat', 'UpdateCommand idempotency'], 'not invoked; marker kept');
+
+  ddbAnswer = tables({ marker: 'marker-1' });
+  const ran = await run(sqsEvent({ ...opened, run_nonce: 'ready' }, 3));
+  assert.deepEqual(ran.result, { batchItemFailures: [] });
+  assert.deepEqual(ops(), ['GetCommand idempotency', 'ScanCommand heartbeat', 'DeleteCommand idempotency', 'InvokeAgentRuntimeCommand']);
+  assert.equal(invoked().use_fallback_model, undefined);
+});
+
 test('a running review on a later page of the scan is found', async () => {
   ddbAnswer = tables({ marker: 'marker-1', pages: [[], [], [running('Example-Org/Valkey#7#aaa#m9')]] });
   const { result } = await run(sqsEvent(pushed));
@@ -247,7 +262,7 @@ test('reviews without a marker and curator messages make no store call', async (
   await run(sqsEvent(review));
   assert.deepEqual(calls.map((c) => c.op), ['InvokeAgentRuntimeCommand']);
   await run(sqsEvent({ ...review, run_nonce: 'm5', status_comment_id: 5, instruction: 'review' }));
-  assert.deepEqual(calls.map((c) => c.op), ['InvokeAgentRuntimeCommand'], 'only reviews of new commits look for other runs');
+  assert.deepEqual(calls.map((c) => c.op), ['InvokeAgentRuntimeCommand'], 'only automatic reviews look for other runs');
   await run(sqsEvent({ maintenance_id: 'check#valkey-review#r1#2026-10-13', reviewer_id: 'valkey-review' }));
   assert.deepEqual(calls.map((c) => c.op), ['InvokeAgentRuntimeCommand']);
 });
