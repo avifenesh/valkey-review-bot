@@ -7,6 +7,8 @@ const HALF_LIFE = 30 * DAY;
 const NOW = Date.parse('2026-06-01T00:00:00.000Z');
 const daysAgo = (n) => new Date(NOW - n * DAY * 1000).toISOString();
 const CONFIG = { tables: { 'valkey-review': 'concerns' }, halfLifeSeconds: HALF_LIFE, floor: 0.05 };
+const GRADUATED_HALF_LIFE = 180 * DAY;
+const LIFECYCLE = { ...CONFIG, graduatedHalfLifeSeconds: GRADUATED_HALF_LIFE };
 
 test('the score halves every half-life', () => {
   assert.equal(decayedScore(1, 0, HALF_LIFE), 1);
@@ -33,6 +35,7 @@ test('configuration is validated', () => {
     tables: { 'valkey-review': 't1' },
     halfLifeSeconds: HALF_LIFE,
     floor: 0.05,
+    graduatedHalfLifeSeconds: GRADUATED_HALF_LIFE,
   });
   assert.equal(loadDecayConfig({ CONCERNS_TABLES_JSON: tables, DECAY_HALF_LIFE_SECONDS: '86400' }).halfLifeSeconds, 86400);
   assert.throws(() => loadDecayConfig({}), /CONCERNS_TABLES_JSON is required/);
@@ -43,6 +46,10 @@ test('configuration is validated', () => {
   }
   assert.throws(() => loadDecayConfig({ CONCERNS_TABLES_JSON: tables, DECAY_FLOOR: '1' }), /below 1/);
   assert.throws(() => loadDecayConfig({ CONCERNS_TABLES_JSON: tables, DECAY_FLOOR: 'x' }), /DECAY_FLOOR/);
+  assert.equal(loadDecayConfig({ CONCERNS_TABLES_JSON: tables, DECAY_GRADUATED_HALF_LIFE_SECONDS: '7776000' }).graduatedHalfLifeSeconds, 90 * DAY);
+  for (const bad of ['0', '-1', 'soon']) {
+    assert.throws(() => loadDecayConfig({ CONCERNS_TABLES_JSON: tables, DECAY_GRADUATED_HALF_LIFE_SECONDS: bad }), /DECAY_GRADUATED_HALF_LIFE_SECONDS/, bad);
+  }
 });
 
 function fakeDdb(pages, onWrite = () => ({})) {
@@ -68,7 +75,7 @@ test('decayTable decays from the later of updated_at and decayed_at and keeps up
   ]);
   const stats = await decayTable(ddb, 'concerns', CONFIG, NOW);
 
-  assert.deepEqual(stats, { table: 'concerns', scanned: 2, decayed: 2, deleted: 0, skipped: 0, errors: 0 });
+  assert.deepEqual(stats, { table: 'concerns', scanned: 2, decayed: 2, deleted: 0, skipped: 0, errors: 0, keptRetired: 0 });
   const [fresh, stepped] = ddb.writes.map((w) => w.input);
   assert.equal(fresh.ExpressionAttributeValues[':s'], 0.5);
   assert.equal(fresh.ConditionExpression, '#ua = :ua AND attribute_not_exists(#da) AND #ds = :ds');
@@ -93,8 +100,8 @@ test('records below the floor are deleted only in the state the scan saw', async
   assert.equal(stats.deleted, 1);
   const { op, input } = ddb.writes[0];
   assert.equal(op, 'DeleteCommand');
-  assert.equal(input.ConditionExpression, '#ua = :ua AND attribute_not_exists(#da) AND #ds = :ds');
-  assert.deepEqual(input.ExpressionAttributeNames, { '#ua': 'updated_at', '#da': 'decayed_at', '#ds': 'decay_score' });
+  assert.equal(input.ConditionExpression, '#ua = :ua AND attribute_not_exists(#da) AND #ds = :ds AND attribute_not_exists(#grn)');
+  assert.deepEqual(input.ExpressionAttributeNames, { '#ua': 'updated_at', '#da': 'decayed_at', '#ds': 'decay_score', '#grn': 'graduated_record_name' });
 });
 
 test('records reinforced during the pass are skipped, malformed ones counted as errors', async () => {
@@ -106,7 +113,7 @@ test('records reinforced during the pass are skipped, malformed ones counted as 
     () => { throw Object.assign(new Error('conditional'), { name: 'ConditionalCheckFailedException' }); },
   );
   const stats = await decayTable(ddb, 'concerns', CONFIG, NOW);
-  assert.deepEqual(stats, { table: 'concerns', scanned: 2, decayed: 0, deleted: 0, skipped: 1, errors: 1 });
+  assert.deepEqual(stats, { table: 'concerns', scanned: 2, decayed: 0, deleted: 0, skipped: 1, errors: 1, keptRetired: 0 });
 });
 
 test('every write is also conditioned on the decay_score as read, or its absence', async () => {
@@ -141,4 +148,53 @@ test('a record the curator re-scored after the scan is skipped', async () => {
   const stats = await decayTable(ddb, 'concerns', CONFIG, NOW);
   assert.equal(stats.skipped, 1);
   assert.equal(stats.decayed, 0);
+});
+
+test('an unreinforced graduated record crosses the floor after about 778 days', () => {
+  assert.ok(decayedScore(1, 777 * DAY, GRADUATED_HALF_LIFE) >= 0.05);
+  assert.ok(decayedScore(1, 779 * DAY, GRADUATED_HALF_LIFE) < 0.05);
+});
+
+const graduated = (fields) => ({ area_bucket: 'src', graduated_record_name: 'rdb-load-rules', graduated_at: daysAgo(400), ...fields });
+
+test('graduated records decay on their own half-life and are never deleted', async () => {
+  const ddb = fakeDdb([[
+    graduated({ record_id: 'skill', decay_score: 1, updated_at: daysAgo(180) }),
+    graduated({ record_id: 'faded', decay_score: 1, updated_at: daysAgo(2000) }),
+    { area_bucket: 'src', record_id: 'plain', decay_score: 1, updated_at: daysAgo(180) },
+  ]]);
+  const stats = await decayTable(ddb, 'concerns', LIFECYCLE, NOW);
+  assert.deepEqual(stats, { table: 'concerns', scanned: 3, decayed: 2, deleted: 1, skipped: 0, errors: 0, keptRetired: 0 });
+  const [skill, faded, plain] = ddb.writes;
+  assert.equal(skill.op, 'UpdateCommand');
+  assert.equal(skill.input.ExpressionAttributeValues[':s'], 0.5);
+  assert.equal(faded.op, 'UpdateCommand', 'a graduated record below the floor keeps its provenance');
+  assert.ok(faded.input.ExpressionAttributeValues[':s'] < 0.05);
+  assert.equal(plain.op, 'DeleteCommand');
+  assert.equal(plain.input.Key.record_id, 'plain');
+});
+
+test('tombstones of retired skills get no write', async () => {
+  const ddb = fakeDdb([[
+    graduated({ record_id: 'gone', decay_score: 0.01, updated_at: daysAgo(900), retired_at: daysAgo(10), retired_reason: 'decayed' }),
+  ]]);
+  const stats = await decayTable(ddb, 'concerns', LIFECYCLE, NOW);
+  assert.deepEqual(stats, { table: 'concerns', scanned: 1, decayed: 0, deleted: 0, skipped: 0, errors: 0, keptRetired: 1 });
+  assert.equal(ddb.writes.length, 0);
+});
+
+test('the scan reads the lifecycle attributes it needs', async () => {
+  const ddb = fakeDdb([[]]);
+  const scans = [];
+  const send = ddb.send.bind(ddb);
+  ddb.send = async (command) => {
+    if (command.constructor.name === 'ScanCommand') scans.push(command.input);
+    return send(command);
+  };
+  await decayTable(ddb, 'concerns', LIFECYCLE, NOW);
+  const names = scans[0].ExpressionAttributeNames;
+  const projected = scans[0].ProjectionExpression.split(', ').map((n) => names[n]);
+  for (const attr of ['area_bucket', 'record_id', 'decay_score', 'updated_at', 'decayed_at', 'graduated_record_name', 'retired_at']) {
+    assert.ok(projected.includes(attr), attr);
+  }
 });
