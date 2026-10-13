@@ -240,7 +240,10 @@ test('pushes while a review of new commits waits are covered by it', async () =>
   await handler(delivery('pull_request', push('bbb')));
   const resp = await handler(delivery('pull_request', push('ccc')));
   assert.equal(body(resp).skipped, 'auto-review-pending');
-  assert.equal(logs.at(-1), `[delivery] event=pull_request action=synchronize repo=${REPO} actor=author status=200 decision=skipped:auto-review-pending`);
+  assert.deepEqual(logs.slice(-2), [
+    `[auto-review] route=valkey-review repo=${REPO} pr=7 head=ccc joins the waiting review; skipped`,
+    `[delivery] event=pull_request action=synchronize repo=${REPO} actor=author status=200 decision=skipped:auto-review-pending`,
+  ]);
   assert.equal(sent.length, 1);
   assert.equal(store.autoReviews.get(`${REPO}#7`), 1, 'no round used');
   assert.equal(store.slotsTaken, 1, 'no budget used');

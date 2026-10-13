@@ -195,7 +195,10 @@ export function createDeliveryHandler(
       let pendingMarker: string | undefined;
       if (pushed) {
         const marker = await deps.store.markReviewPending(repo, prNumber, config.pushReviewDelaySeconds);
-        if (marker === null) return skip('auto-review-pending');
+        if (marker === null) {
+          log(`[auto-review] route=${route.routeId} repo=${repo} pr=${prNumber} head=${headSha} joins the waiting review; skipped`);
+          return skip('auto-review-pending');
+        }
         pendingMarker = marker;
         taken.push(() => clearPendingQuietly(repo, prNumber, marker));
       }
