@@ -92,8 +92,10 @@ import type { SkillPublisher } from './tools/submit-skill.js';
  * "[maintenance] ..." report line, plus one line per proposed edit. A
  * dry run also writes nothing the feedback path or the decay job acts
  * on: no tombstone, no outcome, verification, names or standing. It
- * records only the audit's result for the operator (pending_revision)
- * and releases the claim, so the next real pass checks again.
+ * records only the audit's result for the operator (pending_revision,
+ * reason "dry run", never in place of a real check's), and releases
+ * the claim, so the next real pass checks again. Its decision is
+ * would-<outcome>: what a real run would record.
  */
 
 const RECORD_NAME_RE = /^[a-z0-9][a-z0-9-]{0,99}$/;
@@ -694,6 +696,23 @@ function pendingRevision(at: string, c: Checked, report: CheckReport, reason: st
   };
 }
 
+/** pending_revision.reason of a dry run's audit result. */
+const DRY_RUN_REASON = 'dry run';
+
+/**
+ * A dry run's end after an audit: the claim is released, and the audit's
+ * result goes into pending_revision, unless that holds a real check's
+ * result the operator still needs. True when it was written.
+ */
+async function dryRunEnd(run: Run, c: Checked, report: CheckReport): Promise<boolean> {
+  const held = run.item?.pending_revision as { reason?: unknown } | null | undefined;
+  const real = held != null && held.reason !== DRY_RUN_REASON;
+  const w = new Write().remove(...CLAIM);
+  if (!real) w.set('pending_revision', pendingRevision(run.nowIso, c, report, DRY_RUN_REASON));
+  await run.state(w);
+  return !real;
+}
+
 /** Log each proposed edit of a report, for the operator's review. */
 function logEdits(run: Run, c: Checked, report: CheckReport, applied: boolean): void {
   report.edits.forEach((e, i) => run.log('edit', {
@@ -1057,12 +1076,16 @@ async function* checkBody(run: Run, req: CheckRequest, c: Checked, skill: SkillR
   const unresolved = [...r.lost, ...r.newAbsent];
   const flaggedNote = (head: string) => note(`${head} at ${c.ref}`, unresolved.length ? unresolved : flagged);
 
-  // Dry run: record the audit's result for the operator and leave everything else.
+  // Dry run: report what a real run would record, keep the audit's result for the operator, and leave everything else.
   if (req.dry_run) {
-    await run.state(new Write().set('pending_revision', pendingRevision(run.nowIso, c, report, 'dry run')).remove(...CLAIM));
+    const would = report.verdict === 'accurate' && valid ? 'would-accurate'
+      : report.verdict === 'obsolete' && valid && await obsoleteCorroborated(c, areaGlobs(item)) ? 'would-obsolete'
+        : report.verdict === 'revise' && valid && report.skillMd !== null ? 'would-revise'
+          : 'would-suspect';
+    const written = await dryRunEnd(run, c, report);
     logEdits(run, c, report, false);
-    run.log('check', { outcome: `would-${report.verdict}`, ...fields, mode: 'report', valid, summary: report.summary });
-    return completed(report.verdict === 'revise' && valid ? 'would-revise' : 'suspect');
+    run.log('check', { outcome: would, verdict: report.verdict, ...fields, mode: 'report', valid, pending_revision: written ? 'written' : 'kept', summary: report.summary });
+    return completed(would);
   }
 
   if (report.verdict === 'accurate' && valid) {
@@ -1323,9 +1346,13 @@ async function* repoCheck(run: Run, req: RepoCheckRequest): AsyncGenerator<Strea
     const fieldsWith = { ...fields, verdict: report.verdict, valid, summary: report.summary };
 
     if (req.dry_run) {
+      const would = report.verdict === 'accurate' && valid ? 'would-accurate'
+        : report.verdict === 'revise' && valid && report.skillMd !== null ? 'would-revise'
+          : 'would-suspect';
+      const written = await dryRunEnd(run, c, report);
       logEdits(run, c, report, false);
-      return finish({ outcome: 'suspect', note: note(`${counts} at ${c.ref}`, unresolved) },
-        (w) => w.set('pending_revision', pendingRevision(run.nowIso, c, report, 'dry run')), { ...fieldsWith, mode: 'report' });
+      run.log('repo_check', { file: filePath, outcome: would, ...fieldsWith, mode: 'report', pending_revision: written ? 'written' : 'kept', note: note(`${counts} at ${c.ref}`, unresolved) });
+      return completed(would);
     }
     if (report.verdict === 'accurate' && valid) {
       return finish({ outcome: 'accurate', note: note(`${flagged.length} flagged name(s) judged accurate at ${c.ref}`, flagged) }, (w, it) => {

@@ -854,6 +854,42 @@ test('a dry run never writes the registry and leaves the verification and standi
   assert.ok(claimGone(after));
 });
 
+const REAL_PENDING = { at: '2026-10-01T00:00:00.000Z', verdict: 'revise', reason: 'CHECK_APPLY_EDITS is off', summary: 'real', edits: [] };
+
+test('a dry run keeps a real check\'s pending_revision, and replaces an earlier dry run\'s', async () => {
+  const s = setup({ item: record({ pending_revision: REAL_PENDING }), turns: [report('revise', [EDIT])] });
+  const { result, lines } = await run(checkMessage({ dry_run: true }), s.deps);
+  assert.equal(result.decision, 'would-revise');
+  const item = s.table.item(KEY);
+  assert.deepEqual(item.pending_revision, REAL_PENDING);
+  assert.ok(claimGone(item));
+  assert.ok(lines.some((l) => l.includes('outcome="would-revise"') && l.includes('pending_revision="kept"')), lines.join('\n'));
+
+  const again = setup({ item: record({ pending_revision: { ...REAL_PENDING, reason: 'dry run', summary: 'older dry run' } }), turns: [report('revise', [EDIT])] });
+  await run(checkMessage({ dry_run: true }), again.deps);
+  assert.equal(again.table.item(KEY).pending_revision.summary, 'MODEL SUMMARY emptyDB became emptyData');
+});
+
+test('a dry run\'s decision is what a real run would record', async () => {
+  const md = '---\nname: db-flush\ndescription: Use when.\n---\n\n- `serverCron` is never `old_placeholder_name`.\n';
+  const cases = [
+    ['would-accurate', { item: record({ audit_names: new Set(['serverCron']) }), skill: { name: NAME, skillMd: md }, turns: [report('accurate')] }],
+    ['would-obsolete', { item: record({ area: ['src/gone/**'] }), turns: [report('obsolete')] }],
+    ['would-suspect', { turns: [report('obsolete')] }],
+    ['would-suspect', { turns: [report('unsure')] }],
+  ];
+  for (const [decision, opts] of cases) {
+    const s = setup(opts);
+    const { result, lines } = await run(checkMessage({ dry_run: true }), s.deps);
+    assert.equal(result.decision, decision);
+    assert.ok(lines.some((l) => l.includes(`outcome="${decision}"`) && l.includes('mode="report"')), lines.join('\n'));
+    const item = s.table.item(KEY);
+    assert.equal(item.check_outcome, undefined);
+    assert.equal(item.ignored_names, undefined);
+    assert.equal(item.obsolete_release, undefined);
+  }
+});
+
 test('the audit sees the flagged names and the skill in fenced blocks, and only read-only tools', async () => {
   const seen = [];
   const model = new ScriptedModel([report('unsure')]);
@@ -982,12 +1018,19 @@ test('a repo check in a dry run proposes nothing and leaves the release unchecke
     settings: { skillsRepo: SKILLS_REPO, checkOpenPullRequests: true },
     repoSkills: async () => r.api,
   });
-  await run(repoMessage({ dry_run: true }), s.deps);
+  const { result } = await run(repoMessage({ dry_run: true }), s.deps);
+  assert.equal(result.decision, 'would-revise');
   assert.equal(r.calls.some((c) => c[0] === 'propose'), false);
   const item = s.table.item(REPO_SKILL_KEY);
   assert.equal(item.verified_release, '9.1.1');
+  assert.equal(item.check_outcome, undefined);
   assert.equal(item.pending_revision.reason, 'dry run');
   assert.ok(claimGone(item));
+
+  // A real check's result waiting for the operator stays.
+  const kept = setup({ item: repoItem({ pending_revision: REAL_PENDING }), turns: [report('revise', [EDIT])], settings: { skillsRepo: SKILLS_REPO }, repoSkills: async () => r.api });
+  await run(repoMessage({ dry_run: true }), kept.deps);
+  assert.deepEqual(kept.table.item(REPO_SKILL_KEY).pending_revision, REAL_PENDING);
 });
 
 test('a repo check without a skills repository records why, once per release', async () => {
