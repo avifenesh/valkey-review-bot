@@ -37,6 +37,16 @@ const curatorStatements = (): Statement[] => {
 const bySid = (statements: Statement[], sid: string) => statements.filter((st) => st.Sid === sid);
 const registryArn = (id: string) => `arn:aws:agent-registry:us-west-2:${ACCOUNT}:registry/${id}`;
 
+/** Every IAM policy statement in every stack, with the stack and the roles it is attached to. */
+function allStatements(x: Synthesized): { stack: string; roles: string[]; statement: Statement }[] {
+  return x.allStacks.flatMap((stack) => Object.values<any>(x.template(stack).findResources('AWS::IAM::Policy'))
+    .flatMap((policy) => (policy.Properties.PolicyDocument.Statement as Statement[]).map((statement) => ({
+      stack: stack.stackName,
+      roles: (policy.Properties.Roles ?? []).map((r: any) => r.Ref as string),
+      statement,
+    }))));
+}
+
 describe('no deployment-specific literals', () => {
   test('the only account id in any template is the configured one', () => {
     for (const stack of s.allStacks) {
@@ -212,6 +222,51 @@ describe('curator role', () => {
       SKILL_S3_KEY: 'curator/skill.md',
     });
   });
+
+  test('skill maintenance runs in report mode by default, with no skills repository', () => {
+    const env = runtimeEnv(s.template(s.stacks.curator));
+    expect(env).toMatchObject({
+      UPSTREAM_REPOS_JSON: JSON.stringify({ 'valkey-review': 'valkey-io/valkey', 'valkey-glide-review': 'valkey-io/valkey-glide' }),
+      CHECK_PROMPT_S3_KEY: 'curator/skill-check.md',
+      CHECK_MAX_ROUNDS: '25',
+      CHECK_APPLY_EDITS: 'false',
+      RETIRE_SKILLS: 'false',
+      CHECK_OPEN_PULL_REQUESTS: 'false',
+    });
+    expect(Object.keys(env).filter((k) => k.startsWith('SKILLS_REPO'))).toEqual([]);
+    // The checkout directory keeps the image's default.
+    expect(env).not.toHaveProperty('SKILL_CHECK_DIR');
+    expect(curatorStatements().flatMap(actionsOf).filter((a) => a.startsWith('lambda:'))).toEqual([]);
+  });
+
+  test('ships the audit prompt next to its prompt and skill', () => {
+    const t = s.template(s.stacks.curator);
+    const deployment = Object.values<any>(t.findResources('Custom::CDKBucketDeployment'))[0];
+    expect(deployment.Properties.DestinationBucketKeyPrefix).toBe('curator/');
+    const [key] = deployment.Properties.SourceObjectKeys as string[];
+    const staged = path.join((s.stacks.curator.node.root as cdk.App).outdir, `asset.${key!.replace(/\.zip$/, '')}`);
+    expect(fs.readdirSync(staged).sort()).toEqual(['prompt.md', 'skill-check.md', 'skill.md']);
+  });
+
+  test('maintenance may set record status on the reviewer registries, and only there', () => {
+    expect(actionsOf(bySid(curatorStatements(), 'WriteReviewerSkills')[0]!).sort()).toEqual([
+      'agent-registry:CreateRegistryRecord',
+      'agent-registry:GetRegistryRecord',
+      'agent-registry:ListRegistryRecords',
+      'agent-registry:UpdateRegistryRecord',
+      'agent-registry:UpdateRegistryRecordStatus',
+    ]);
+    const holders = allStatements(s).filter(({ statement }) => actionsOf(statement).includes('agent-registry:UpdateRegistryRecordStatus'));
+    const curatorRole = runtimeRoleId(s.template(s.stacks.curator));
+    expect(holders.map(({ stack, roles }) => ({ stack, roles }))).toEqual([{ stack: s.stacks.curator.stackName, roles: [curatorRole] }]);
+    expect(resourceStrings(holders.map(({ statement }) => statement)).sort()).toEqual([
+      registryArn('glideRegistry1'), `${registryArn('glideRegistry1')}/record/*`,
+      registryArn('valkeyRegistry1'), `${registryArn('valkeyRegistry1')}/record/*`,
+    ]);
+    for (const stack of s.allStacks.filter((st) => st !== s.stacks.curator)) {
+      expect(JSON.stringify(s.template(stack).toJSON())).not.toContain('UpdateRegistryRecordStatus');
+    }
+  });
 });
 
 describe('token broker', () => {
@@ -379,6 +434,14 @@ describe('decay', () => {
       RETIRE_SKILLS: 'true',
       MAX_RETIREMENTS_PER_DAY: '7',
       RETIRE_REFUSED_BACKOFF_SECONDS: String(14 * 86400),
+    });
+    // The curator runs what the decay job queues, under the same switch.
+    expect(runtimeEnv(custom.template(custom.stacks.curator))).toMatchObject({
+      UPSTREAM_REPOS_JSON: JSON.stringify({ 'valkey-glide-review': 'valkey-io/valkey-glide' }),
+      RETIRE_SKILLS: 'true',
+      CHECK_APPLY_EDITS: 'true',
+      CHECK_OPEN_PULL_REQUESTS: 'true',
+      CHECK_MAX_ROUNDS: '60',
     });
   });
 

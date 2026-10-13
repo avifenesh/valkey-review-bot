@@ -77,16 +77,19 @@ export function addValkeyReviewerStacks(
   const curatorRoot = path.join(repoRoot, 'agents', 'curator');
   const curator = new CuratorAgentStack(app, 'ValkeyReviewerCurator', {
     ...common(),
-    description: 'valkey-reviewer curator: turns maintainer feedback into concerns and graduated reviewer skills.',
+    description: 'valkey-reviewer curator: turns maintainer feedback into concerns and graduated reviewer skills, and checks and retires those skills.',
     agentSourcePath: repoRoot,
     promptPath: path.join(curatorRoot, 'config', 'prompt.md'),
     skillPath: path.join(curatorRoot, 'config', 'skill.md'),
+    checkPromptPath: path.join(curatorRoot, 'config', 'skill-check.md'),
     assetsBucket: substrate.assetsBucket,
     concernsTables,
     skillsRegistries: new Map(REVIEWER_IDS.map((r) => [r, config.skillsRegistries[r]] as const)),
     curatorSkillsRegistry: config.skillsRegistries.curator,
     agent: config.agents.curator,
     models: config.models,
+    upstreamRepos: config.upstreamRepos,
+    skillLifecycle: config.skillLifecycle,
   });
 
   const webhook = new WebhookStack(app, 'ValkeyReviewWebhook', {
