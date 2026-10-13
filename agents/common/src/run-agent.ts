@@ -370,17 +370,23 @@ export function createReviewHandler(opts: ReviewHandlerOpts): (payload: Payload)
       // end without relaying anything; for turns that already ended,
       // next() returns done at once.
       const review = turns();
+      // True once the relay loop ends by itself, by finishing or by an
+      // error turns() has logged. False means the consumer closed it.
+      let relayEnded = false;
       try {
         for (let r = await review.next(); !r.done; r = await review.next()) yield r.value;
+        relayEnded = true;
+      } catch (err) {
+        relayEnded = true;
+        throw err;
       } finally {
         try {
           let r = await review.next();
-          const closed = !r.done;
-          if (closed) console.warn('[stream] stream closed during the review; finishing it without relaying frames');
+          if (!r.done) console.warn('[stream] stream closed during the review; finishing it without relaying frames');
           while (!r.done) r = await review.next();
-          // The error after this finally never runs once the stream is
-          // closed, so log what it would have said.
-          if (closed && terminal.tool === null) {
+          // After a close, the error below this finally never runs, so
+          // log what it would have said.
+          if (!relayEnded && terminal.tool === null) {
             console.error(`[stream] review ended without a terminal tool; model_calls=${callLimit.used} final_text_preview=${finalText.slice(0, 400)}`);
           }
         } catch {

@@ -234,6 +234,17 @@ test('a model error after the terminal tool still completes the run', async (t) 
   assert.deepEqual(written, ['running', 'completed']);
 });
 
+test('a close at the last frame of a retry turn with no terminal tool still logs why the run failed', async (t) => {
+  const written = recordHeartbeats(t);
+  const errors = [];
+  t.mock.method(console, 'error', (...args) => { errors.push(args.join(' ')); });
+  const r = reviewRun([textTurn('Here is my review in prose.'), textTurn('Still prose, no tool.')]);
+  await consume(r.run(), (f) => f.event === 'message' && JSON.stringify(f.data).includes('Still prose'));
+  assert.equal(r.model.calls, 2);
+  assert.ok(errors.some((e) => /review ended without a terminal tool; model_calls=2 final_text_preview=/.test(e)), errors.join('\n'));
+  assert.deepEqual(written, ['running', 'failed']);
+});
+
 test('a run that never calls a terminal tool fails after the retry turn', async (t) => {
   const written = recordHeartbeats(t);
   const r = reviewRun([textTurn('Here is my review in prose.')]);
