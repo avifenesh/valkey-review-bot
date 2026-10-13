@@ -17,9 +17,10 @@ import { releaseQuietly, type DeliveryStore } from './store.js';
  *      repo#pr#head_sha (#ready or #push appended for ready_for_review
  *      and new commits), the pull request's pending marker, the pull
  *      request's cap on automatic reviews, the route's daily review
- *      budget, then the route's queue. A review of new commits waits in
- *      the queue first, holding the marker, and covers every push, reopen
- *      or ready_for_review that comes before its run starts.
+ *      budget, then the route's queue. The review holds the marker until
+ *      its run starts and covers every push, reopen or ready_for_review
+ *      that comes before then. A review of new commits first waits in
+ *      the queue for pushReviewDelaySeconds.
  *   3. issue_comment, pull_request_review_comment, pull_request_review:
  *      an @mention of the bot is a review request (src/mention.ts).
  *      Everything else, and a thread reply even when it also starts a
@@ -110,7 +111,7 @@ export function createDeliveryHandler(
     try {
       await deps.store.clearReviewPending(repo, prNumber, marker);
     } catch (err) {
-      console.error(`[store] could not clear the pending marker of ${repo}#${prNumber}; new commits are skipped until it expires`, err);
+      console.error(`[store] could not clear the pending marker of ${repo}#${prNumber}; automatic reviews are skipped until it expires`, err);
     }
   }
 
@@ -211,27 +212,17 @@ export function createDeliveryHandler(
     };
 
     try {
-      // A review of new commits waits in the queue, so that a burst of
-      // pushes gets one review: while it waits, the pull request's pending
-      // marker skips later pushes, and the runtime reviews the head as it
-      // is when the run starts.
-      //
-      // A reopen, or a draft marked ready, while such a review waits joins
-      // it too, so the two do not use a round each: the pull request is
-      // open and ready when that review runs. A push that marks a pending
-      // review just after this check still queues its own; the two use a
-      // round each, and the worker holds the push review until the other
-      // one ends. A reopen after the waiting review has started is queued
-      // too, and runs alongside it.
-      let pendingMarker: string | undefined;
-      if (pushed) {
-        const marker = await deps.store.markReviewPending(repo, prNumber, config.pushReviewDelaySeconds);
-        if (marker === null) return await joinWaitingReview();
-        pendingMarker = marker;
-        taken.push(() => clearPendingQuietly(repo, prNumber, marker));
-      } else if (action !== 'opened' && (await deps.store.reviewPending(repo, prNumber))) {
-        return await joinWaitingReview();
-      }
+      // Every automatic review holds the pull request's pending marker
+      // from here until the worker starts its run, so at most one waits
+      // at a time. A push, reopen or ready_for_review that comes while one
+      // waits joins it instead of using a round: the runtime reviews the
+      // head as it is when the run starts. A review of new commits also
+      // waits in the queue first, so that a burst of pushes gets one
+      // review. An event after the waiting review has started queues the
+      // next review.
+      const marker = await deps.store.markReviewPending(repo, prNumber, pushed ? config.pushReviewDelaySeconds : 0);
+      if (marker === null) return await joinWaitingReview();
+      taken.push(() => clearPendingQuietly(repo, prNumber, marker));
 
       const cap = config.maxAutomaticReviewsPerPr;
       const round = await deps.store.takeAutoReview(repo, prNumber, cap);
@@ -261,7 +252,7 @@ export function createDeliveryHandler(
         installation_id: target.installationId,
         head_sha: headSha,
         ...(nonce ? { run_nonce: nonce } : {}),
-        ...(pendingMarker ? { pending_marker: pendingMarker } : {}),
+        pending_marker: marker,
         ...(pushed ? { trigger: 'push', skip_drafts: route.skipDrafts } : {}),
       };
       const delay = pushed ? { delaySeconds: config.pushReviewDelaySeconds } : undefined;

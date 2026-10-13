@@ -11,8 +11,8 @@ import { decide, isCuratorMessage, messageTag, type HeartbeatRecord, type PullRe
  * route's AgentCore runtime (a reviewer or the curator). The receiver
  * shaped each envelope for its runtime, so this code stays agnostic of
  * the payload. src/watchdog.ts decides whether a message runs at all.
- * Just before it runs a review of new commits, it removes the pull
- * request's pending marker.
+ * Just before it runs an automatic review, it removes the pull request's
+ * pending marker.
  */
 
 const config = loadInvokerConfig(process.env);
@@ -67,9 +67,9 @@ async function readPullRequestRuns(prefix: string): Promise<PullRequestRun[]> {
 }
 
 /**
- * A review of new commits holds its pull request's pending marker until
- * its run starts (src/store.ts); from then on a push can queue the next
- * round. A message that still holds it has never run. Without
+ * An automatic review holds its pull request's pending marker until its
+ * run starts (src/store.ts); from then on the next event can queue the
+ * next round. A message that still holds it has never run. Without
  * IDEMPOTENCY_TABLE, or without the grant to read it, the worker cannot
  * tell: it runs the message like any review and the marker expires on
  * its own. Any other failed read throws, and the message is retried.
@@ -99,12 +99,12 @@ async function clearMarkerForRun(marker: PendingMarker, tag: string): Promise<vo
   console.log(`[pending] ${tag} marker=${marker.markerId} ${cleared ? 'cleared' : 'already gone'}`);
 }
 
-/** A review that gave up waiting lets go of its marker, so the next push can queue a review. */
+/** A review that gave up waiting lets go of its marker, so the next event can queue a review. */
 async function clearMarkerQuietly(marker: PendingMarker, tag: string): Promise<void> {
   try {
     await clearMarkerForRun(marker, tag);
   } catch (err) {
-    console.error(`[pending] ${tag} could not clear marker=${marker.markerId}; new commits are skipped until it expires`, err);
+    console.error(`[pending] ${tag} could not clear marker=${marker.markerId}; automatic reviews are skipped until it expires`, err);
   }
 }
 

@@ -48,7 +48,6 @@ test('other DynamoDB errors are not mistaken for duplicates', async () => {
   await assert.rejects(store.returnAutoReview('o/r', 1), /slow down/);
   await assert.rejects(store.markReviewPending('o/r', 1, 300), /slow down/);
   await assert.rejects(store.clearReviewPending('o/r', 1, 'm'), /slow down/);
-  await assert.rejects(store.reviewPending('o/r', 1), /slow down/);
 });
 
 test('the budget key names the route and the UTC day', () => {
@@ -183,28 +182,6 @@ test('a pending marker is cleared only by its own id', async () => {
   assert.deepEqual(del.Key, { key: 'pending#o/r#7' });
   assert.equal(del.ConditionExpression, '#m = :m');
   assert.notEqual(await store.markReviewPending('o/r', 7, 300), null, 'the next push can mark it again');
-});
-
-test('a pending review is seen until its marker is cleared or expires', async () => {
-  const ddb = fakeDdb();
-  let now = new Date('2026-10-13T08:00:00Z');
-  const store = createDeliveryStore(ddb, TABLE, () => now);
-  assert.equal(await store.reviewPending('o/r', 7), false);
-  const marker = await store.markReviewPending('o/r', 7, 300);
-  assert.equal(await store.reviewPending('O/R', 7), true);
-  assert.equal(await store.reviewPending('o/r', 8), false, 'pull requests are separate');
-
-  const get = ddb.calls.find((c) => c.op === 'GetCommand').input;
-  assert.deepEqual(get, { TableName: TABLE, Key: { key: 'pending#o/r#7' }, ConsistentRead: true });
-
-  now = new Date('2026-10-13T09:05:00Z');
-  assert.equal(await store.reviewPending('o/r', 7), true, 'live up to its expiry');
-  now = new Date('2026-10-13T09:05:01Z');
-  assert.equal(await store.reviewPending('o/r', 7), false, 'expired, though TTL has not deleted it');
-
-  now = new Date('2026-10-13T08:00:00Z');
-  await store.clearReviewPending('o/r', 7, marker);
-  assert.equal(await store.reviewPending('o/r', 7), false);
 });
 
 test('a worker holds the pending marker while it is still its own, expired or not', async () => {

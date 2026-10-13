@@ -22,10 +22,10 @@ import { heartbeatRunKey, pullRequestRunPrefix } from './review-envelope.js';
  * infra/lib/webhook-stack.ts sizes maxReceiveCount from the 90-minute
  * default and the 16-minute visibility timeout.
  *
- * A review of new commits holds its pull request's pending marker until
- * the worker removes it, just before the run starts. While the message
- * still holds it, the review has never run: any receive is its first
- * attempt, on the primary model, and its heartbeat is not read.
+ * An automatic review holds its pull request's pending marker until the
+ * worker removes it, just before the run starts. While the message still
+ * holds it, the review has never run: any receive is its first attempt,
+ * on the primary model, and its heartbeat is not read.
  *
  * A review of new commits does not start while another review of the
  * same pull request runs. Before it runs, on any attempt, the heartbeats

@@ -25,9 +25,10 @@ export interface ReviewEnvelope {
   readonly trigger_path?: string;
   readonly trigger_line?: number;
   /**
-   * Reviews of new commits: the id of the pull request's pending marker
-   * (src/store.ts), which the worker removes when it starts the run. The
-   * runtime ignores it.
+   * Automatic reviews (opened, reopened, ready_for_review and new
+   * commits): the id of the pull request's pending marker (src/store.ts),
+   * which the worker removes when it starts the run. The runtime ignores
+   * it.
    */
   readonly pending_marker?: string;
   /**
@@ -52,7 +53,7 @@ export interface PendingMarker {
   readonly markerId: string;
 }
 
-/** The pending marker a review of new commits holds, if the envelope names one. */
+/** The pending marker an automatic review holds, if the envelope names one. */
 export function pendingMarkerOf(envelope: Readonly<Record<string, unknown>>): PendingMarker | undefined {
   const { repo, pr_number: prNumber, pending_marker: markerId } = envelope;
   if (typeof markerId !== 'string' || !markerId) return undefined;

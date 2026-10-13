@@ -11,9 +11,9 @@ import { DeleteCommand, GetCommand, PutCommand, UpdateCommand, type DynamoDBDocu
  *     automatic reviews per route;
  *   - pull request counters, "autoreviews#OWNER/NAME#PR" (lowercased), which
  *     cap automatic reviews per pull request;
- *   - pending markers, "pending#OWNER/NAME#PR" (lowercased), held by a
- *     review of new commits while it waits in the queue, and while it
- *     waits for another review of the pull request to finish. The worker
+ *   - pending markers, "pending#OWNER/NAME#PR" (lowercased), held by an
+ *     automatic review while it waits in the queue, and while it waits
+ *     for another review of the pull request to finish. The worker
  *     removes the marker when it starts the review.
  */
 
@@ -55,13 +55,11 @@ export interface DeliveryStore {
   /** Gives back an automatic review taken for a review that was not queued. */
   returnAutoReview(repo: string, prNumber: number): Promise<void>;
   /**
-   * Marks a review of new commits as waiting in the queue for the pull
+   * Marks an automatic review as waiting in the queue for the pull
    * request. Returns the marker's id, or null while another review holds
    * the marker. The marker expires an hour after the delay.
    */
   markReviewPending(repo: string, prNumber: number, delaySeconds: number): Promise<string | null>;
-  /** True while a review of new commits holds the pull request's pending marker. */
-  reviewPending(repo: string, prNumber: number): Promise<boolean>;
   /** Removes the pull request's pending marker if it is still `markerId`. */
   clearReviewPending(repo: string, prNumber: number, markerId: string): Promise<boolean>;
 }
@@ -94,7 +92,7 @@ export function pendingReviewKey(repo: string, prNumber: number): string {
 /**
  * Removes the pull request's pending marker, only while it is still
  * `markerId`, so a late or repeated call cannot remove the marker of a
- * later push. The receiver calls it when a review is not queued after
+ * later review. The receiver calls it when a review is not queued after
  * all, the worker when it starts the review. False when the marker was
  * not there.
  */
@@ -125,7 +123,7 @@ export async function clearPendingReview(
  * worker removes its marker just before it starts the review, so a
  * message that finds its marker still there has never run. Expiry is not
  * checked: a marker that is still this one was not replaced by a later
- * push's.
+ * review's.
  */
 export async function holdsPendingReview(
   ddb: DocumentClient,
@@ -144,9 +142,9 @@ export async function holdsPendingReview(
 
 /**
  * Moves the expiry of the pull request's pending marker to an hour from
- * now, while it is still `markerId`. A review of new commits that waits
- * for another review of the pull request keeps its marker this way, so
- * later pushes keep joining it. False when the marker is not there.
+ * now, while it is still `markerId`. An automatic review that waits for
+ * another review of the pull request keeps its marker this way, so later
+ * events keep joining it. False when the marker is not there.
  */
 export async function extendPendingReview(
   ddb: DocumentClient,
@@ -273,17 +271,6 @@ export function createDeliveryStore(ddb: DocumentClient, tableName: string, now:
         if (isConditionFailure(err)) return null;
         throw err;
       }
-    },
-
-    async reviewPending(repo, prNumber) {
-      const resp = await ddb.send(new GetCommand({
-        TableName: tableName,
-        Key: { key: pendingReviewKey(repo, prNumber) },
-        ConsistentRead: true,
-      }));
-      const ttl = (resp.Item as { ttl?: unknown } | undefined)?.ttl;
-      // Expired the same way markReviewPending decides it.
-      return resp.Item !== undefined && !(typeof ttl === 'number' && ttl < epochSeconds());
     },
 
     clearReviewPending: (repo, prNumber, markerId) => clearPendingReview(ddb, tableName, repo, prNumber, markerId),

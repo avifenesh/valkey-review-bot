@@ -130,9 +130,6 @@ export function fakeStore({ budget = Infinity } = {}) {
       pending.set(prKey(repo, prNumber), `pending-${markers}`);
       return `pending-${markers}`;
     },
-    async reviewPending(repo, prNumber) {
-      return pending.has(prKey(repo, prNumber));
-    },
     async clearReviewPending(repo, prNumber, markerId) {
       if (pending.get(prKey(repo, prNumber)) !== markerId) return false;
       pending.delete(prKey(repo, prNumber));
