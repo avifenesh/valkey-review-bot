@@ -1,5 +1,5 @@
 import { createRegistryClient, GRADUATED_SKILLS_MAX_CHARS, loadSkills } from './skills-registry.js';
-import { parseSuppressed } from './skill-check/edits.js';
+import { parseSuppressed, skillLayout } from './skill-check/edits.js';
 
 /**
  * Load the reviewer's graduated skills from its AWS Agent Registry
@@ -72,36 +72,7 @@ function withoutCitation(line: string): string {
   return line.slice(0, m.index).trimEnd() + line.slice(m.index + m[0].length);
 }
 
-// `.` stops at a CR, so `\r?` lets fences of CRLF text match.
-const FENCE_RE = /^ {0,3}(`{3,}|~{3,})(.*)\r?$/;
 const HEADING_RE = /^( {0,3})(#{1,5})(?=\s|$)/;
-
-/** Whether each line belongs to a fenced code block, fence lines included. */
-function fencedLines(lines: readonly string[]): boolean[] {
-  const out: boolean[] = [];
-  let open: string | null = null;
-  for (const line of lines) {
-    const m = FENCE_RE.exec(line);
-    if (open !== null) {
-      out.push(true);
-      // A fence closes on the same character, at least as long, with nothing after it.
-      if (m && m[1][0] === open[0] && m[1].length >= open.length && m[2].trim() === '') open = null;
-    } else if (m && !(m[1][0] === '`' && m[2].includes('`'))) {
-      out.push(true);
-      open = m[1];
-    } else {
-      out.push(false);
-    }
-  }
-  return out;
-}
-
-/** Index of the first line after a complete leading `---` frontmatter block; 0 when there is none. */
-function bodyStartOf(lines: readonly string[]): number {
-  if (lines.length < 2 || lines[0].trimEnd() !== '---') return 0;
-  const end = lines.findIndex((line, i) => i > 0 && line.trimEnd() === '---');
-  return end < 0 ? 0 : end + 1;
-}
 
 /*
  * A release check that finds a stale piece of a skill keeps it in place
@@ -154,16 +125,16 @@ function suppressedLabels(markdown: string, lines: readonly string[]): Map<numbe
  */
 function rewriteLines(markdown: string, graduated: boolean): string {
   const all = markdown.split('\n');
-  // parseSuppressed takes the whole markdown and skips the frontmatter itself, as the release check does.
+  // Markers, frontmatter and fences as the release check reads them, so
+  // a line it treats as code is left as written here too.
   const labels = suppressedLabels(markdown, all);
-  const bodyStart = graduated ? bodyStartOf(all) : 0;
-  const lines = all.slice(bodyStart);
-  const fenced = fencedLines(lines);
-  return lines
+  const layout = skillLayout(markdown);
+  const bodyStart = graduated ? layout.bodyStart : 0;
+  return all.slice(bodyStart)
     .flatMap((line, i) => {
       const label = labels.get(bodyStart + i);
       if (label !== undefined) return [label];
-      if (!graduated || fenced[i]) return [line];
+      if (!graduated || layout.fenced[bodyStart + i]) return [line];
       // The record id means nothing to a reviewer. A line that held only
       // the citation goes with it.
       const uncited = withoutCitation(line);

@@ -5,7 +5,7 @@ import './support/ts-resolve.mjs';
 
 const { labelSuppressedPieces, loadGraduatedSkills, renderGraduatedSkills } = await import('../src/graduated-skills.ts');
 const { GRADUATED_SKILL_MAX_CHARS } = await import('../src/skills-registry.ts');
-const { listSuppressedBlocks } = await import('../src/skill-check/edits.ts');
+const { listSuppressedBlocks, skillLayout } = await import('../src/skill-check/edits.ts');
 
 /** Answers list and get calls from `records`, like the registry control plane. */
 function fakeRegistry(t, records) {
@@ -144,7 +144,6 @@ test('headings in fenced blocks are left alone', () => {
     '~~~',
     '# still inside the four-tilde fence',
     '~~~~',
-    '``` not a fence ` because the info string has a backtick',
     '# a heading again',
     '    ## indented four spaces: code, not a heading',
     '###### deepest level stays',
@@ -161,12 +160,44 @@ test('headings in fenced blocks are left alone', () => {
     '~~~',
     '# still inside the four-tilde fence',
     '~~~~',
-    '``` not a fence ` because the info string has a backtick',
     '## a heading again',
     '    ## indented four spaces: code, not a heading',
     '###### deepest level stays',
     '#hashtag is not a heading',
   ].join('\n')));
+});
+
+test('fenced blocks are the ones the release check reads', () => {
+  // The check opens a fence on three backticks even when the info string
+  // has a backtick, which CommonMark does not. The renderer follows it.
+  assert.ok(bodyOf(['## A', '``` a`b', '# in the fence', '```', '# a heading'].join('\n'))
+    .includes(['### A', '``` a`b', '# in the fence', '```', '## a heading'].join('\n')));
+  assert.deepEqual(skillLayout(['---', 'name: x', '---', '``` a`b', '# b', '```', '# c'].join('\n')),
+    { bodyStart: 3, fenced: [false, false, false, true, true, true, false] });
+  const docs = [
+    ['# a', '``` a`b', '# b', '```', '# c'],
+    // a tilde line does not close a backtick fence
+    ['# a', '```', '# b', '~~~', '# c', '```', '# d'],
+    // a shorter run does not close a fence, a longer one does
+    ['# a', '````', '# b', '```', '# c', '`````', '# d'],
+    // nor does a run with text after it
+    ['# a', '```', '# b', '``` x', '# c', '```', '# d'],
+    // fence lines in the frontmatter do not count
+    ['---', 'name: x', '```', '---', '# a', '```', '# b'],
+    // nor is there frontmatter when it never closes
+    ['---', '# a', '```', '# b'],
+    ['# a', '    ```', '# b', '   ~~~', '# c', '   ~~~', '# d'],
+    ['# a', '```', '# b'],
+  ];
+  for (const lines of docs) {
+    for (const eol of ['\n', '\r\n']) {
+      const md = lines.join(eol);
+      const { bodyStart, fenced } = skillLayout(md);
+      const want = md.split('\n').slice(bodyStart)
+        .map((line, i) => (fenced[bodyStart + i] ? line : line.replace(/^#/, '##')));
+      assert.ok(bodyOf(md).includes(want.join('\n')), md);
+    }
+  }
 });
 
 test('fences are found in CRLF text too', () => {
