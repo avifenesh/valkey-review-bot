@@ -245,6 +245,8 @@ interface Doc {
   readonly plain: readonly string[];
   /** Index of the first body line (after the frontmatter). */
   readonly bodyStart: number;
+  /** The first line opens a frontmatter block that never closes. */
+  readonly unclosedFrontmatter: boolean;
   readonly fenced: readonly boolean[];
   /** Per line, whether it belongs to a suppressed block, markers included. */
   readonly inBlock: readonly boolean[];
@@ -268,9 +270,11 @@ function parseDoc(skillMd: string): Doc {
   const lines = skillMd.split('\n');
   const plain = lines.map(stripCr);
   let bodyStart = 0;
+  let unclosedFrontmatter = false;
   if (plain[0]?.trimEnd() === '---') {
     const end = plain.findIndex((l, i) => i > 0 && l.trimEnd() === '---');
     if (end > 0) bodyStart = end + 1;
+    else unclosedFrontmatter = true;
   }
 
   const fenced = plain.map(() => false);
@@ -317,7 +321,7 @@ function parseDoc(skillMd: string): Doc {
 
   const inBlock = plain.map(() => false);
   for (const b of blocks) for (let i = b.start; i <= b.end; i++) inBlock[i] = true;
-  return { lines, plain, bodyStart, fenced, inBlock, blocks, problems };
+  return { lines, plain, bodyStart, unclosedFrontmatter, fenced, inBlock, blocks, problems };
 }
 
 /** The live lines after a block's closing marker, as many as it suppresses. */
@@ -673,8 +677,10 @@ function plan(skillMd: string, edits: readonly SuppressEdit[], ctx: EditContext)
     whole(`at most ${MAX_EDITS} edits per check, got ${edits.length}`);
     return { doc, problems, planned, checkable };
   }
+  // Where such a frontmatter ends is unknown, so no line is safely body.
+  if (doc.unclosedFrontmatter) whole('the frontmatter has no closing "---", so the skill cannot be edited automatically');
   for (const p of doc.problems) whole(`the skill's suppression markers are malformed (${p}), so it cannot be edited automatically`);
-  if (doc.problems.length > 0) return { doc, problems, planned, checkable };
+  if (doc.unclosedFrontmatter || doc.problems.length > 0) return { doc, problems, planned, checkable };
 
   edits.forEach((edit, index) => {
     const before = problems.length;

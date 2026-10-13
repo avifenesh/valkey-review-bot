@@ -339,6 +339,19 @@ test('the frontmatter is never edited', async () => {
   assert.equal((await problemsFor(description, { flagged: ['src/db.c'] }))[0], 'edit 1: the frontmatter is never edited');
 });
 
+test('a skill whose frontmatter never closes is not edited', async () => {
+  const unclosed = SKILL.replace('description: "Use when reviewing a PR that touches src/db.c."\n---\n', 'description: "Use when reviewing a PR that touches src/db.c."\n');
+  assert.ok(unclosed.startsWith('---\n') && !unclosed.slice(4).includes('\n---\n'));
+  const refused = ['the frontmatter has no closing "---", so the skill cannot be edited automatically'];
+  assert.deepEqual(await problemsFor({}, {}, UPSTREAM, unclosed), refused);
+  const description = {
+    original: 'description: "Use when reviewing a PR that touches src/db.c."',
+    replacement: 'description: "Use when reviewing a PR that touches src/dbx.c."',
+    evidence: [cite('src/db.c', 120)],
+  };
+  assert.deepEqual(checkEdits(unclosed, [description], ctx({ flagged: ['src/db.c'] })), refused);
+});
+
 test('pieces inside fenced blocks are not edited', async () => {
   const fenced = `${SKILL}\n\`\`\`\nemptyDB(-1, EMPTYDB_NO_FLAGS, NULL);\n\`\`\`\n`;
   const edit = { original: 'emptyDB(-1, EMPTYDB_NO_FLAGS, NULL);', replacement: 'emptyData(-1, EMPTYDB_NO_FLAGS, NULL);', evidence: [cite('src/db.c', 120)] };
