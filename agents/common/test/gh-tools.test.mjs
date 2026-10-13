@@ -188,6 +188,20 @@ test('on mention runs the reply replaces the status comment and the review body 
   assert.deepEqual(finished, ['Fixed in the latest push, one nit left.\n\nCurrent review state: https://github.com/state']);
 });
 
+test('on mention runs an empty reply falls back to a line that fits what was posted', async () => {
+  const finished = [];
+  const statusComment = { finish: async (body) => { finished.push(body); } };
+  const withComments = harness({ statusComment });
+  await withComments.post.invoke({ body: '  ', comments: [comment, { ...comment, line: 12 }], state: state() });
+  const bare = harness({ statusComment });
+  await bare.post.invoke({ body: '', comments: [], state: state() });
+  assert.equal(bare.reviews.length, 0);
+  assert.deepEqual(finished, [
+    'Review complete. See the 2 inline comment(s).\n\nCurrent review state: https://github.com/state',
+    'Review complete. Nothing new met the bar for an inline comment.\n\nCurrent review state: https://github.com/state',
+  ]);
+});
+
 test('model text in the status comment cannot carry the state marker', async () => {
   const { STATE_MARKER } = await import('../src/review-state.ts');
   const finished = [];
