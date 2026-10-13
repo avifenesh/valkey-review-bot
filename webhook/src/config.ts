@@ -90,7 +90,9 @@ export interface InvokerConfig {
    * The receiver's table, where a review of new commits holds its pull
    * request's pending marker until the worker starts the run. Empty on
    * the curator's worker. A review worker without it leaves markers to
-   * expire, and new commits on that pull request are skipped until then.
+   * expire, and new commits on that pull request are skipped until then;
+   * it also cannot tell a review that waited for another one from a run
+   * that died, so such a review runs on the fallback model.
    */
   readonly idempotencyTable: string;
 }

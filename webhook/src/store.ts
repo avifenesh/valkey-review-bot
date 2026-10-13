@@ -12,7 +12,8 @@ import { DeleteCommand, GetCommand, PutCommand, UpdateCommand, type DynamoDBDocu
  *   - pull request counters, "autoreviews#OWNER/NAME#PR" (lowercased), which
  *     cap automatic reviews per pull request;
  *   - pending markers, "pending#OWNER/NAME#PR" (lowercased), held by a
- *     review of new commits while it waits in the queue. The worker
+ *     review of new commits while it waits in the queue, and while it
+ *     waits for another review of the pull request to finish. The worker
  *     removes the marker when it starts the review.
  */
 
@@ -22,7 +23,10 @@ const DELIVERY_KEY_TTL_SECONDS = 24 * 3600;
 const BUDGET_TTL_SECONDS = 3 * 24 * 3600;
 /** Counted from the pull request's latest automatic review. */
 const AUTO_REVIEW_TTL_SECONDS = 180 * 24 * 3600;
-/** How long a pending marker outlives its queue delay, in case no worker removes it. */
+/**
+ * How long a pending marker outlives its queue delay, or the worker's
+ * latest extension, in case no worker removes it.
+ */
 const PENDING_TTL_SECONDS = 3600;
 
 function isConditionFailure(err: unknown): boolean {
@@ -136,6 +140,36 @@ export async function holdsPendingReview(
     ConsistentRead: true,
   }));
   return (resp.Item as { marker?: unknown } | undefined)?.marker === markerId;
+}
+
+/**
+ * Moves the expiry of the pull request's pending marker to an hour from
+ * now, while it is still `markerId`. A review of new commits that waits
+ * for another review of the pull request keeps its marker this way, so
+ * later pushes keep joining it. False when the marker is not there.
+ */
+export async function extendPendingReview(
+  ddb: DocumentClient,
+  tableName: string,
+  repo: string,
+  prNumber: number,
+  markerId: string,
+  now: Date = new Date(),
+): Promise<boolean> {
+  try {
+    await ddb.send(new UpdateCommand({
+      TableName: tableName,
+      Key: { key: pendingReviewKey(repo, prNumber) },
+      UpdateExpression: 'SET #ttl = :ttl',
+      ConditionExpression: '#m = :m',
+      ExpressionAttributeNames: { '#ttl': 'ttl', '#m': 'marker' },
+      ExpressionAttributeValues: { ':ttl': Math.floor(now.getTime() / 1000) + PENDING_TTL_SECONDS, ':m': markerId },
+    }));
+    return true;
+  } catch (err) {
+    if (isConditionFailure(err)) return false;
+    throw err;
+  }
 }
 
 export function createDeliveryStore(ddb: DocumentClient, tableName: string, now: () => Date = () => new Date()): DeliveryStore {

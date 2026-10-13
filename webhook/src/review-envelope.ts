@@ -60,6 +60,14 @@ export function pendingMarkerOf(envelope: Readonly<Record<string, unknown>>): Pe
 }
 
 /**
+ * The start of the heartbeat key of every run of the envelope's pull
+ * request, whatever the head SHA or nonce: repo#pr_number#.
+ */
+export function pullRequestRunPrefix(envelope: { readonly repo?: unknown; readonly pr_number?: unknown }): string {
+  return `${envelope.repo}#${envelope.pr_number}#`;
+}
+
+/**
  * Key of the run's heartbeat record. Must produce the same string as the
  * runKey in agents/common/src/run-agent.ts, which writes the record:
  * repo#pr_number#head_sha, "unknown" for a missing head SHA, and

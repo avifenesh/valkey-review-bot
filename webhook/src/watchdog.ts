@@ -1,4 +1,4 @@
-import { heartbeatRunKey } from './review-envelope.js';
+import { heartbeatRunKey, pullRequestRunPrefix } from './review-envelope.js';
 
 /**
  * What the invoker does with one queue message.
@@ -27,6 +27,19 @@ import { heartbeatRunKey } from './review-envelope.js';
  * still holds it, the review has never run: any receive is its first
  * attempt, on the primary model, and its heartbeat is not read.
  *
+ * A review of new commits does not start while another review of the
+ * same pull request runs. Before it runs, on any attempt, the heartbeats
+ * of the pull request's runs are read; while one of them is running and
+ * fresh (any review, automatic or @mention), the message waits as it
+ * does for its own live run, and keeps its marker, so later pushes still
+ * join it. The wait and the push delay both count against the run
+ * budget, from SentTimestamp: a review still waiting when the budget is
+ * used up is dropped with an error, and one that starts late is watched
+ * only until the budget ends (the run itself goes on, without the
+ * fallback). A run shows up once its runtime writes the first heartbeat,
+ * a few seconds after its worker invokes it; with no push delay, a review
+ * of new commits that starts in those seconds can still run alongside.
+ *
  * Curator messages, feedback or maintenance, have no heartbeat. Each
  * receive runs the curator; the curator queue dead-letters after three
  * receives, and a message seen more often than that (a queue without its
@@ -38,11 +51,16 @@ export const CURATOR_MAX_RECEIVES = 3;
 export type Decision =
   | { readonly action: 'invoke'; readonly useFallbackModel: boolean; readonly reason: string }
   | { readonly action: 'delete'; readonly reason: string; readonly error?: boolean }
-  | { readonly action: 'wait'; readonly reason: string };
+  /** otherRun: the run key of another review of the pull request that this one waits for. */
+  | { readonly action: 'wait'; readonly reason: string; readonly otherRun?: string };
 
 export interface HeartbeatRecord {
   readonly last_activity?: number;
   readonly status?: string;
+}
+
+export interface PullRequestRun extends HeartbeatRecord {
+  readonly run_key: string;
 }
 
 export interface WatchdogInput {
@@ -56,6 +74,12 @@ export interface WatchdogInput {
   readonly readHeartbeat: (runKey: string) => Promise<HeartbeatRecord | undefined>;
   /** True while the message still holds its pull request's pending marker. */
   readonly holdsMarker?: boolean;
+  /**
+   * Reviews of new commits: the heartbeat records of the pull request's
+   * runs, keys starting with `prefix`. Records that are not running may
+   * be left out.
+   */
+  readonly readPullRequestRuns?: (prefix: string) => Promise<readonly PullRequestRun[]>;
 }
 
 /**
@@ -80,6 +104,18 @@ export function messageTag(envelope: Readonly<Record<string, unknown>>): string 
   return `review repo=${envelope.repo} pr=${envelope.pr_number} head=${envelope.head_sha}`;
 }
 
+/** A run whose heartbeat says running and is no older than `staleMs`. */
+export function liveRun(
+  runs: readonly PullRequestRun[],
+  now: number,
+  staleMs: number,
+): (PullRequestRun & { readonly last_activity: number }) | undefined {
+  return runs.find((r): r is PullRequestRun & { readonly last_activity: number } =>
+    r.status === 'running' && typeof r.last_activity === 'number' && now - r.last_activity <= staleMs);
+}
+
+const minutes = (ms: number): number => Math.round(ms / 60_000);
+
 export async function decide(input: WatchdogInput): Promise<Decision> {
   const { receiveCount } = input;
   if (isCuratorMessage(input.envelope)) {
@@ -89,6 +125,26 @@ export async function decide(input: WatchdogInput): Promise<Decision> {
     return { action: 'invoke', useFallbackModel: false, reason: `attempt ${receiveCount}` };
   }
 
+  const decision = await reviewDecision(input);
+  if (decision.action !== 'invoke' || !input.readPullRequestRuns) return decision;
+
+  const other = liveRun(await input.readPullRequestRuns(pullRequestRunPrefix(input.envelope)), input.now, input.staleMs);
+  if (!other) return decision;
+  const age = `heartbeat ${Math.round((input.now - other.last_activity) / 1000)}s ago`;
+  const elapsedMs = input.sentAt ? input.now - input.sentAt : 0;
+  if (elapsedMs > input.runBudgetMs) {
+    return {
+      action: 'delete',
+      reason: `still waiting for ${other.run_key} (${age}) past the run budget: ${minutes(elapsedMs)} min > ${minutes(input.runBudgetMs)} min`,
+      error: true,
+    };
+  }
+  return { action: 'wait', reason: age, otherRun: other.run_key };
+}
+
+/** What a review message would do if no other run of its pull request mattered. */
+async function reviewDecision(input: WatchdogInput): Promise<Decision> {
+  const { receiveCount } = input;
   if (receiveCount <= 1) return { action: 'invoke', useFallbackModel: false, reason: 'first attempt' };
   if (input.holdsMarker) return { action: 'invoke', useFallbackModel: false, reason: 'first attempt, still holding the pending marker' };
 
@@ -99,7 +155,7 @@ export async function decide(input: WatchdogInput): Promise<Decision> {
   if (elapsedMs > input.runBudgetMs) {
     return {
       action: 'delete',
-      reason: `run budget exceeded: ${Math.round(elapsedMs / 60_000)} min > ${Math.round(input.runBudgetMs / 60_000)} min`,
+      reason: `run budget exceeded: ${minutes(elapsedMs)} min > ${minutes(input.runBudgetMs)} min`,
       error: true,
     };
   }

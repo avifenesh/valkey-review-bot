@@ -47,6 +47,13 @@ export function fakeDdb() {
         items.delete(input.Key.key);
         return {};
       }
+      if (op === 'UpdateCommand' && input.ConditionExpression === '#m = :m') {
+        const item = items.get(input.Key.key);
+        if (item?.marker !== input.ExpressionAttributeValues[':m']) throw conditionFailed();
+        if (input.UpdateExpression !== 'SET #ttl = :ttl') throw new Error(`unexpected update ${input.UpdateExpression}`);
+        item.ttl = input.ExpressionAttributeValues[':ttl'];
+        return {};
+      }
       if (op === 'UpdateCommand') {
         const item = items.get(input.Key.key) ?? { key: input.Key.key };
         const values = input.ExpressionAttributeValues;

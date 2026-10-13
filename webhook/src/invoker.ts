@@ -1,10 +1,10 @@
 import { BedrockAgentCoreClient, InvokeAgentRuntimeCommand } from '@aws-sdk/client-bedrock-agentcore';
 import { DynamoDBClient } from '@aws-sdk/client-dynamodb';
-import { DynamoDBDocumentClient, GetCommand } from '@aws-sdk/lib-dynamodb';
+import { DynamoDBDocumentClient, GetCommand, ScanCommand } from '@aws-sdk/lib-dynamodb';
 import { loadInvokerConfig } from './config.js';
-import { pendingMarkerOf, type PendingMarker } from './review-envelope.js';
-import { clearPendingReview, holdsPendingReview } from './store.js';
-import { decide, isCuratorMessage, messageTag, type HeartbeatRecord } from './watchdog.js';
+import { isPushReview, pendingMarkerOf, type PendingMarker } from './review-envelope.js';
+import { clearPendingReview, extendPendingReview, holdsPendingReview } from './store.js';
+import { decide, isCuratorMessage, messageTag, type HeartbeatRecord, type PullRequestRun } from './watchdog.js';
 
 /**
  * Queue worker: one message per invocation, forwarded unchanged to the
@@ -29,12 +29,41 @@ interface SqsEvent {
   readonly Records: readonly SqsRecord[];
 }
 
-/** Thrown to leave the message on the queue without invoking: the prior attempt is still alive. */
+/**
+ * Thrown to leave the message on the queue without invoking: the prior
+ * attempt, or another review of the pull request, is still alive.
+ */
 class StillRunning extends Error {}
 
 async function readHeartbeat(runKey: string): Promise<HeartbeatRecord | undefined> {
   const resp = await ddb.send(new GetCommand({ TableName: config.heartbeatTable, Key: { run_key: runKey } }));
   return resp.Item as HeartbeatRecord | undefined;
+}
+
+/**
+ * The running records of a pull request's runs. The heartbeat table is
+ * keyed by run key alone, so this scans it with a filter on the key
+ * prefix. That stays cheap: the table holds a day or two of runs (a
+ * 24-hour TTL), and only a review of new commits that is about to start
+ * reads it.
+ */
+async function readPullRequestRuns(prefix: string): Promise<PullRequestRun[]> {
+  const runs: PullRequestRun[] = [];
+  let start: Record<string, unknown> | undefined;
+  do {
+    const resp = await ddb.send(new ScanCommand({
+      TableName: config.heartbeatTable,
+      FilterExpression: 'begins_with(#k, :prefix) AND #s = :running',
+      ProjectionExpression: '#k, #a, #s',
+      ExpressionAttributeNames: { '#k': 'run_key', '#a': 'last_activity', '#s': 'status' },
+      ExpressionAttributeValues: { ':prefix': prefix, ':running': 'running' },
+      ConsistentRead: true,
+      ...(start ? { ExclusiveStartKey: start } : {}),
+    }));
+    runs.push(...((resp.Items ?? []) as PullRequestRun[]));
+    start = resp.LastEvaluatedKey;
+  } while (start);
+  return runs;
 }
 
 /**
@@ -63,6 +92,30 @@ async function clearMarkerForRun(marker: PendingMarker, tag: string): Promise<vo
   console.log(`[pending] ${tag} marker=${marker.markerId} ${cleared ? 'cleared' : 'already gone'}`);
 }
 
+/** A review that gave up waiting lets go of its marker, so the next push can queue a review. */
+async function clearMarkerQuietly(marker: PendingMarker, tag: string): Promise<void> {
+  try {
+    await clearMarkerForRun(marker, tag);
+  } catch (err) {
+    console.error(`[pending] ${tag} could not clear marker=${marker.markerId}; new commits are skipped until it expires`, err);
+  }
+}
+
+/**
+ * A review that waits for another one keeps its marker an hour past
+ * this receive. The next receive comes after the visibility timeout, so
+ * the marker outlives the wait, and expires soon after the message ends
+ * some other way.
+ */
+async function extendMarkerQuietly(marker: PendingMarker, tag: string): Promise<void> {
+  try {
+    const kept = await extendPendingReview(ddb, config.idempotencyTable, marker.repo, marker.prNumber, marker.markerId);
+    if (!kept) console.warn(`[pending] ${tag} marker=${marker.markerId} is gone while the review waits`);
+  } catch (err) {
+    console.error(`[pending] ${tag} could not extend marker=${marker.markerId}; it may expire while the review waits`, err);
+  }
+}
+
 async function handleOne(record: SqsRecord): Promise<void> {
   const envelope = JSON.parse(record.body) as Record<string, unknown>;
   const curator = isCuratorMessage(envelope);
@@ -86,14 +139,21 @@ async function handleOne(record: SqsRecord): Promise<void> {
     staleMs: config.staleMs,
     readHeartbeat,
     holdsMarker: held,
+    ...(isPushReview(envelope) ? { readPullRequestRuns } : {}),
   });
   if (decision.action === 'delete') {
     if (decision.error) console.error(`[abandoned] ${tag} attempt=${receiveCount}: ${decision.reason}`);
     else console.log(`[watchdog] ${tag}: ${decision.reason}; nothing to do`);
+    if (marker && held) await clearMarkerQuietly(marker, tag);
     return;
   }
   if (decision.action === 'wait') {
-    console.log(`[watchdog] ${tag} prior attempt alive (${decision.reason}); checking again after the visibility timeout`);
+    if (decision.otherRun) {
+      console.log(`[watchdog] ${tag} waits for ${decision.otherRun} (${decision.reason}); checking again after the visibility timeout`);
+    } else {
+      console.log(`[watchdog] ${tag} prior attempt alive (${decision.reason}); checking again after the visibility timeout`);
+    }
+    if (marker && held) await extendMarkerQuietly(marker, tag);
     throw new StillRunning();
   }
 

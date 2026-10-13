@@ -211,8 +211,10 @@ export function createDeliveryHandler(
       // A reopen, or a draft marked ready, while such a review waits joins
       // it too, so the two do not use a round each: the pull request is
       // open and ready when that review runs. A push that marks a pending
-      // review just after this check still queues its own, and so does a
-      // reopen once the waiting review has started.
+      // review just after this check still queues its own; the two use a
+      // round each, and the worker holds the push review until the other
+      // one ends. A reopen after the waiting review has started is queued
+      // too, and runs alongside it.
       let pendingMarker: string | undefined;
       if (pushed) {
         const marker = await deps.store.markReviewPending(repo, prNumber, config.pushReviewDelaySeconds);

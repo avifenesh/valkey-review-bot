@@ -4,7 +4,8 @@ import './support/ts-resolve.mjs';
 import { fakeDdb } from './support/fakes.mjs';
 
 const {
-  autoReviewKey, budgetKey, clearPendingReview, createDeliveryStore, holdsPendingReview, pendingReviewKey, releaseQuietly,
+  autoReviewKey, budgetKey, clearPendingReview, createDeliveryStore, extendPendingReview, holdsPendingReview, pendingReviewKey,
+  releaseQuietly,
 } = await import('../src/store.ts');
 
 const TABLE = 'idempotency';
@@ -226,6 +227,33 @@ test('a worker holds the pending marker while it is still its own, expired or no
 
   const throttled = { send: async () => { throw Object.assign(new Error('slow down'), { name: 'ThrottlingException' }); } };
   await assert.rejects(holdsPendingReview(throttled, TABLE, 'o/r', 7, marker), /slow down/);
+});
+
+test('a waiting worker keeps its own marker an hour past now, and no other', async () => {
+  const ddb = fakeDdb();
+  let now = new Date('2026-10-13T08:00:00Z');
+  const store = createDeliveryStore(ddb, TABLE, () => now);
+  const marker = await store.markReviewPending('o/r', 7, 300);
+  assert.equal(await extendPendingReview(ddb, TABLE, 'O/R', 7, marker, new Date('2026-10-13T08:50:00Z')), true);
+  assert.equal(ddb.items.get('pending#o/r#7').ttl, Date.parse('2026-10-13T09:50:00Z') / 1000);
+  const update = ddb.calls.find((c) => c.op === 'UpdateCommand').input;
+  assert.deepEqual(update, {
+    TableName: TABLE,
+    Key: { key: 'pending#o/r#7' },
+    UpdateExpression: 'SET #ttl = :ttl',
+    ConditionExpression: '#m = :m',
+    ExpressionAttributeNames: { '#ttl': 'ttl', '#m': 'marker' },
+    ExpressionAttributeValues: { ':ttl': Date.parse('2026-10-13T09:50:00Z') / 1000, ':m': marker },
+  });
+
+  now = new Date('2026-10-13T09:30:00Z');
+  assert.equal(await store.markReviewPending('o/r', 7, 300), null, 'past its first expiry, the marker still holds later pushes');
+  assert.equal(await extendPendingReview(ddb, TABLE, 'o/r', 7, 'some-other-marker'), false);
+  assert.equal(await extendPendingReview(ddb, TABLE, 'o/r', 8, marker), false);
+  assert.equal(ddb.items.has('pending#o/r#8'), false, 'no marker is created');
+
+  const throttled = { send: async () => { throw Object.assign(new Error('slow down'), { name: 'ThrottlingException' }); } };
+  await assert.rejects(extendPendingReview(throttled, TABLE, 'o/r', 7, marker), /slow down/);
 });
 
 test('releaseQuietly logs a failed release instead of throwing', async () => {
