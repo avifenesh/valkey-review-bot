@@ -20,6 +20,7 @@ test('common read commands pass', () => {
   ok(['blame', '-L', '10,20', 'src/server.c']);
   ok(['grep', '-n', '-e', 'dictFind', '--', 'src']);
   ok(['grep', '-nC3', 'zmalloc']);
+  ok(['grep', '-nw', 'dictFind']);
   ok(['rev-list', '--filter=blob:none', '--count', 'HEAD']);
   ok(['status', '--short']);
   ok(['merge-base', 'HEAD', 'origin/unstable']);
