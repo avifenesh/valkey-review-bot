@@ -86,10 +86,19 @@ export function validateReviewState(state: ReviewState, releaseBranches?: readon
 
 const RISK_LABEL: Record<ReviewState['risk'], string> = { low: 'Low', medium: 'Medium', high: 'High' };
 
+/** Folds text onto one line, so it cannot start a heading or list item. */
+function oneLine(text: string): string {
+  return text.replace(/\s*[\r\n]+\s*/g, ' ').trim();
+}
+
 function findingLine(f: ReviewState['findings'][number]): string {
-  const where = f.location.trim() ? `\`${f.location.trim()}\` ` : '';
+  // A location names a PR file, which the author chose. Without newlines
+  // or backticks it stays inside its code span, here and when the comment
+  // is shown to the next run.
+  const location = oneLine(f.location).replace(/`/g, "'");
+  const where = location ? `\`${location}\` ` : '';
   const minor = f.blocking ? '' : '(minor) ';
-  return `- ${minor}${where}${f.summary.trim()}`;
+  return `- ${minor}${where}${oneLine(f.summary)}`;
 }
 
 export function renderReviewState(state: ReviewState, headSha: string, now: Date = new Date()): string {
