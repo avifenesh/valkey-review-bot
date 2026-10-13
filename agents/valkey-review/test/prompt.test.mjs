@@ -68,7 +68,7 @@ test('the prompt describes superseded skill pieces as the reviewer sees them', (
   const para = prompt.split('\n').find((l) => l.startsWith('Some skill pieces, '));
   assert.ok(para, 'the paragraph is in "The correctness bar"');
   // A block as the release check writes it, and as the renderer labels it.
-  const marker = (release) => `<!-- suppressed: superseded in ${release}, 2026-10-13; \`a\` is now \`b\`; evidence: valkey-io/valkey@${'0'.repeat(40)}:src/a.c:1 -->`;
+  const marker = (release) => `<!-- suppressed: superseded in ${release}, 2026-10-13; \`emptyDB\` is now \`emptyData\`; evidence: valkey-io/valkey@${'0'.repeat(40)}:src/a.c:1 -->`;
   const block = (release) => [marker(release), 'old', '<!-- /suppressed -->', 'new'].join('\n');
   const [open, piece, close, replacement] = labelSuppressedPieces(block('9.1.2')).split('\n');
   assert.deepEqual([piece, replacement], ['old', 'new']);
