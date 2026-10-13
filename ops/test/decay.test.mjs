@@ -746,7 +746,12 @@ test('report lines strip invisible format and line-separator characters from tab
     for (const c of invisible) assert.ok(!line.includes(c), `U+${c.codePointAt(0).toString(16)} in ${JSON.stringify(line)}`);
     if (line.includes(' id=') && !isDump(line) && !isReserved(line)) assert.ok(line.includes(` bucket=${shown} id="`), `bucket shown: ${JSON.stringify(line)}`);
   }
-  assert.ok(lines.includes(`[decay] reserved-bucket concerns bucket=${JSON.stringify(`#${JSON.parse(shown)}`)} id="NotASlug": not a concern record, left as it is`));
+  const reservedLine = lines.find(isReserved);
+  const head = `[decay] reserved-bucket concerns bucket=${JSON.stringify(`#${JSON.parse(shown)}`)} id="NotASlug": not a concern record, left as it is; exact key `;
+  assert.ok(reservedLine.startsWith(head), reservedLine);
+  const exact = reservedLine.slice(head.length);
+  assert.match(exact, /^[\x20-\x26\x28-\x7e]+$/, 'printable ASCII without a single quote');
+  assert.deepEqual(JSON.parse(exact), { area_bucket: { S: `#${bucket}` }, record_id: { S: name } }, 'the key as stored');
   assert.ok(lines.some((l) => l.includes('graduated_record_name "NotASlug" is not')), 'the rejected name is stripped');
   assert.ok(lines.some((l) => isDump(l) && l.includes(`"area_bucket":${shown}`)), 'the record dump is stripped');
 });

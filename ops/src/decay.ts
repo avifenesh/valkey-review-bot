@@ -376,6 +376,14 @@ const printable = (text: string): string => text.replace(INVISIBLE_RE, '');
  */
 const quoted = (value: string): string => JSON.stringify(printable(value));
 
+/**
+ * `value` as JSON with every character outside printable ASCII, and the
+ * single quote, written as a \u escape: exact, safe in a log line, and
+ * safe to paste between single quotes in a shell.
+ */
+const asciiJson = (value: unknown): string =>
+  JSON.stringify(value).replace(/[^\x20-\x26\x28-\x7e]/g, (c) => `\\u${c.charCodeAt(0).toString(16).padStart(4, '0')}`);
+
 /** A record's table and key, for a log line. */
 const recordRef = (tableName: string, key: { readonly area_bucket: string; readonly record_id: string }): string =>
   `${tableName} bucket=${quoted(key.area_bucket)} id=${quoted(key.record_id)}`;
@@ -735,7 +743,14 @@ export async function decayTable(
       if (isReservedBucket(areaBucket)) {
         reserved += 1;
         if (reserved <= MAX_RESERVED_LINES) {
-          console.warn(`[decay] reserved-bucket ${tableName} bucket=${quoted(areaBucket)} id=${quoted(String(recordId))}: not a concern record, left as it is`);
+          const id = String(recordId);
+          let line = `[decay] reserved-bucket ${tableName} bucket=${quoted(areaBucket)} id=${quoted(id)}: not a concern record, left as it is`;
+          // The quoted key lacks what printable() stripped, so a get-item
+          // or delete-item built from it would miss; give the exact key too.
+          if (printable(areaBucket) !== areaBucket || printable(id) !== id) {
+            line += `; exact key ${asciiJson({ area_bucket: { S: areaBucket }, record_id: { S: id } })}`;
+          }
+          console.warn(line);
         }
         continue;
       }
