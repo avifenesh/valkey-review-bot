@@ -60,6 +60,35 @@ The curator records each piece of feedback as a concern. Each maintainer counts 
 pull request, and when the same point has been made enough times the concern graduates
 into a skill that every later review loads. Feedback from other accounts is not used.
 
+Standing decays without reinforcement. A concern that never graduates loses half its
+standing every 30 days and is deleted after about 130 days. A graduated skill decays on
+its own, slower half-life, 180 days by default, and every reinforcement resets it. A
+skill nobody reinforces for about 26 months (180 x log2(20) days) is retired: reviewers
+stop loading it, and its concern record stays as a tombstone. A later reinforcement
+brings it back under a new name.
+
+Skills are also checked against the code. After each GA release of the upstream
+project, and at least every 90 days, the file paths, symbols and config names a skill
+cites are looked up on the upstream default branch. A skill whose names are all there,
+and whose names the code changes since the last check did not touch, is confirmed
+without a model. Otherwise a read-only audit reads the upstream code to find out what
+happened, and the check then does one of these:
+
+- **Confirms** the skill.
+- **Revises** it, without overwriting any fact. The stale lines stay, marked as
+  superseded in that release, with the upstream line that proves the change, and the
+  corrected lines follow. The edit can only swap a code name or number for one that
+  appears on the cited line. Reviewers keep using the superseded text for backports to
+  older release lines.
+- **Retires** it, when deterministic evidence shows its subject is gone from the code.
+
+The built-in skill files in this repository (`agents/*/config/skill.md`) get the same
+check once per release, but are changed only by pull request: the check opens one
+against this repository for maintainers to review. Revisions, retirements and pull
+requests are each off until the operator turns them on. Until then the checks record
+and log what they find, but change no skill text, retire nothing and open no pull
+request.
+
 ## Architecture
 
 ```text
@@ -76,7 +105,9 @@ API Gateway -> receiver Lambda ---- verify signature, filter, budget, dedupe
                      |                              token broker (repo-scoped GitHub token)
                      v
               curator queue -> AgentCore runtime (curator) -> concerns (DynamoDB)
-                                                           -> skills (AWS Agent Registry)
+                     ^                                     -> skills (AWS Agent Registry)
+                     |                                     -> upstream code (read-only checks)
+              decay job (daily)
 ```
 
 - `agents/common`: shared runtime for the reviewers: workspace preparation, the agent
@@ -84,11 +115,13 @@ API Gateway -> receiver Lambda ---- verify signature, filter, budget, dedupe
 - `agents/valkey-review`, `agents/valkey-glide-review`: one reviewer per project, each
   with its container image, prompt (`config/prompt.md`) and project knowledge
   (`config/skill.md`).
-- `agents/curator`: turns maintainer feedback into concerns and graduated skills.
-- `webhook`: the receiver, the per-route invoker and the token broker.
-- `ops`: the daily job that decays old concerns.
+- `agents/curator`: turns maintainer feedback into concerns and graduated skills, and
+  runs the release checks and retirements of those skills.
+- `webhook`: the receiver, the per-route invoker and the token brokers.
+- `ops`: the daily job that decays concerns and schedules skill checks and retirements.
 - `infra`: the AWS CDK app that deploys all of it.
-- `scripts`: operator tools, for example publishing curator reference skills.
+- `scripts`: operator tools, for example publishing curator reference skills, queuing a
+  skill check, or checking a skill file against upstream code.
 
 See [docs/architecture.md](docs/architecture.md) for the request flow in detail, and
 [SECURITY.md](SECURITY.md) for how credentials are kept away from the code under review.
@@ -103,6 +136,9 @@ key, and the deploy
 commands. All deployment-specific values live in `infra/deploy.config.json`, which is not
 committed. Use an AWS account that runs nothing else: code from the pull requests under
 review can use the reviewer runtime's AWS role, as [SECURITY.md](SECURITY.md) describes.
+Skill checks start in report mode. [infra/README.md](infra/README.md#skill-lifecycle-operations)
+describes how to review their reports, how to turn on edits, retirements and pull
+requests, and the optional second GitHub App those pull requests need.
 
 ## Contributing
 
