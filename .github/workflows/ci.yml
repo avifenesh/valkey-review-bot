@@ -58,7 +58,7 @@ jobs:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       - uses: agent-sh/agnix@2c0e4efede3181599eca37619e8067ae2d941c00 # v0.57.0
         with:
-          version: '0.57.0'
+          version: 'v0.57.0'
 
   secret-scan:
     name: Secret scan (scrump)

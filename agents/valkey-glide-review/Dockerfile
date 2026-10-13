@@ -162,7 +162,7 @@ RUN case "$(dpkg --print-architecture)" in \
  && tar -xJf /tmp/cargo-zigbuild.tar.xz -C /usr/local/bin --strip-components=1 \
       "cargo-zigbuild-${arch}-unknown-linux-gnu/cargo-zigbuild" \
  && rm /tmp/zig.tar.xz /tmp/cargo-zigbuild.tar.xz \
- && zig version && cargo zigbuild --version
+ && zig version && cargo-zigbuild --version
 
 # The agent runs as an unprivileged user that owns the clone, so git
 # needs no safe.directory exception. The agent's code goes in a
