@@ -305,6 +305,18 @@ test('a given revision is checked instead of HEAD', async () => {
   r.cleanup();
 });
 
+test('a failing git call names its subcommand, not its first option', async () => {
+  const r = repo({ 'a.c': 'int some_name_x;\n' }, { 'a.c': 'int some_name_x = 1;\n' });
+  const n = names('`some_name_x`');
+  // A runner that gives `result` for calls holding `marker`, and runs the rest.
+  const failing = (marker, result) => async (args, opts) => (args.includes(marker) ? { stdout: '', stderr: '', truncated: false, ...result } : r.git(args, opts));
+  await assert.rejects(checkSkill(failing('grep', { code: 128, stderr: 'fatal: boom' }), { names: n }), { message: 'git grep exited 128: fatal: boom' });
+  await assert.rejects(checkSkill(failing('grep', { code: -1, truncated: true }), { names: n }), { message: /^git grep output passed \d+ bytes$/ });
+  await assert.rejects(checkSkill(failing('diff', { code: 128, stderr: 'fatal: bad object' }), { names: n, baseSha: r.baseSha }),
+    { message: 'git diff exited 128: fatal: bad object' });
+  r.cleanup();
+});
+
 test('globs match paths, or basenames when they have no slash', () => {
   assert.equal(globToRegExp('glide-core/src/client/**').test('glide-core/src/client/mod.rs'), true);
   assert.equal(globToRegExp('glide-core/src/client/**').test('glide-core/src/clientx/mod.rs'), false);

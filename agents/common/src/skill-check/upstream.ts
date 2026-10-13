@@ -77,6 +77,16 @@ export function upstreamGitEnv(base: NodeJS.ProcessEnv = process.env): NodeJS.Pr
   };
 }
 
+/** The git subcommand in an argv: the first argument that is not an option or the value of -c or -C. */
+function subcommand(args: readonly string[]): string {
+  for (let i = 0; i < args.length; i++) {
+    const a = args[i]!;
+    if (a === '-c' || a === '-C') i++;
+    else if (!a.startsWith('-')) return a;
+  }
+  return args[0] ?? '';
+}
+
 export function createGitRunner(cwd: string, env: NodeJS.ProcessEnv = upstreamGitEnv()): GitRunner {
   return (args, opts = {}) => new Promise((resolve, reject) => {
     const timeoutMs = opts.timeoutMs ?? GIT_TIMEOUT_MS;
@@ -92,7 +102,7 @@ export function createGitRunner(cwd: string, env: NodeJS.ProcessEnv = upstreamGi
       if (!err) return resolve({ code: 0, stdout, stderr, truncated: false });
       const e = err as NodeJS.ErrnoException & { code?: string | number; killed?: boolean; signal?: string | null };
       if (e.code === 'ERR_CHILD_PROCESS_STDIO_MAXBUFFER') return resolve({ code: -1, stdout, stderr, truncated: true });
-      if (e.killed || e.signal) return reject(new Error(`git ${args[0] ?? ''} timed out after ${Math.round(timeoutMs / 1000)}s`));
+      if (e.killed || e.signal) return reject(new Error(`git ${subcommand(args)} timed out after ${Math.round(timeoutMs / 1000)}s`));
       if (typeof e.code === 'number') return resolve({ code: e.code, stdout, stderr, truncated: false });
       reject(new Error(`could not run git: ${e.message}`));
     });

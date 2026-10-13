@@ -108,10 +108,20 @@ const SHA_RE = /^(?:[0-9a-f]{40}|[0-9a-f]{64})$/;
 const WORD_CHARS = 'A-Za-z0-9_';
 const WORD_CHAR_RE = /[A-Za-z0-9_]/;
 
+/** The git subcommand in an argv: the first argument that is not an option or the value of -c or -C. */
+function subcommand(args: readonly string[]): string {
+  for (let i = 0; i < args.length; i++) {
+    const a = args[i]!;
+    if (a === '-c' || a === '-C') i++;
+    else if (!a.startsWith('-')) return a;
+  }
+  return args[0] ?? '';
+}
+
 async function run(git: GitRunner, args: readonly string[], okCodes: readonly number[] = [0]): Promise<string> {
   const r = await git(args, { maxBytes: GREP_MAX_BYTES });
-  if (r.truncated) throw new Error(`git ${args[0]} output passed ${GREP_MAX_BYTES} bytes`);
-  if (!okCodes.includes(r.code)) throw new Error(`git ${args[0]} exited ${r.code}: ${(r.stderr || r.stdout).trim().slice(0, 2000)}`);
+  if (r.truncated) throw new Error(`git ${subcommand(args)} output passed ${GREP_MAX_BYTES} bytes`);
+  if (!okCodes.includes(r.code)) throw new Error(`git ${subcommand(args)} exited ${r.code}: ${(r.stderr || r.stdout).trim().slice(0, 2000)}`);
   return r.stdout;
 }
 

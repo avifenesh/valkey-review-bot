@@ -253,7 +253,7 @@ test('the runner returns exit codes, marks output past the cap and throws on a t
   const cut = await git(['cat-file', 'blob', 'HEAD:big.txt'], { maxBytes: 1000 });
   assert.equal(cut.truncated, true);
   assert.ok(cut.stdout.length <= 1000);
-  await assert.rejects(git(['-c', 'alias.wait=!sleep 5', 'wait'], { timeoutMs: 200 }), /timed out/);
+  await assert.rejects(git(['-c', 'alias.wait=!sleep 5', 'wait'], { timeoutMs: 200 }), { message: 'git wait timed out after 0s' });
   rmSync(dir, { recursive: true, force: true });
 });
 
