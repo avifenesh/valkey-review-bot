@@ -3,10 +3,11 @@ import test from 'node:test';
 import { z } from 'zod';
 import { tool } from '@strands-agents/sdk';
 import { DynamoDBDocumentClient } from '@aws-sdk/lib-dynamodb';
+import { BedrockAgentCoreApp } from 'bedrock-agentcore/runtime';
 import './support/ts-resolve.mjs';
 import { failingTurn, ScriptedModel, textOf, textTurn, toolTurn } from './support/scripted-model.mjs';
 
-const { createReviewHandler } = await import('../src/run-agent.ts');
+const { asBusyTask, createReviewHandler } = await import('../src/run-agent.ts');
 const { loadEnv } = await import('../src/config.ts');
 const { buildPostReviewTool, buildSkipTool, createTerminalGate } = await import('../src/tools/gh.ts');
 
@@ -259,4 +260,30 @@ test('the terminal-retry turn still sees the PR overview and the whole review', 
   assert.match(textOf(retryCall[0]), /^# PR #7 in valkey-io\/valkey/);
   assert.match(textOf(retryCall.at(-1)), /ended without calling a terminal review tool/);
   assert.deepEqual(written, ['running', 'completed']);
+});
+
+test('/ping reports HealthyBusy until the review ends, also after the stream is closed', async (t) => {
+  recordHeartbeats(t);
+  const app = new BedrockAgentCoreApp({ invocationHandler: { process: async () => '' } });
+  const seen = [];
+  // Records what /ping would report at the start of each model call.
+  const probed = (turn) => async function* (n) {
+    seen.push(app.getCurrentPingStatus());
+    yield* turn(n);
+  };
+  const r = reviewRun([probed(narratedNoopTurn), probed(skipTurn), probed(textTurn('Done.'))]);
+  assert.equal(app.getCurrentPingStatus(), 'Healthy');
+  await consume(asBusyTask(app, 'review', r.run()), (f) => f.event === 'message');
+  // The last two calls ran after the stream was closed.
+  assert.deepEqual(seen, ['HealthyBusy', 'HealthyBusy', 'HealthyBusy']);
+  assert.equal(r.stateBodies.length, 1);
+  assert.equal(app.getCurrentPingStatus(), 'Healthy');
+});
+
+test('/ping goes back to Healthy when a review fails', async (t) => {
+  recordHeartbeats(t);
+  const app = new BedrockAgentCoreApp({ invocationHandler: { process: async () => '' } });
+  const r = reviewRun([failingTurn(new Error('model unavailable'))]);
+  await assert.rejects(consume(asBusyTask(app, 'review', r.run())), /model unavailable/);
+  assert.equal(app.getCurrentPingStatus(), 'Healthy');
 });

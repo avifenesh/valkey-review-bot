@@ -411,6 +411,25 @@ export function createReviewHandler(opts: ReviewHandlerOpts): (payload: Payload)
   };
 }
 
+/** The part of BedrockAgentCoreApp that decides what /ping reports. */
+export type AsyncTaskTracker = Pick<BedrockAgentCoreApp, 'addAsyncTask' | 'completeAsyncTask'>;
+
+/**
+ * Relays a run's frames with the run registered as an async task on the
+ * app, so the runtime's /ping reports HealthyBusy until the run ends.
+ * AgentCore stops a session that reports Healthy for 15 minutes, and a
+ * review goes on after the worker that started it has disconnected.
+ */
+export async function* asBusyTask<T>(app: AsyncTaskTracker, name: string, frames: AsyncGenerator<T, void, unknown>): AsyncGenerator<T, void, unknown> {
+  const task = app.addAsyncTask(name);
+  try {
+    // yield* passes a close on to frames and waits for it to finish.
+    yield* frames;
+  } finally {
+    app.completeAsyncTask(task);
+  }
+}
+
 export async function bootstrap(config: RunAgentConfig): Promise<void> {
   const env = loadEnv();
   const { prompt: PROMPT_MD, skill: SKILL_MD } = await loadAssets(env);
@@ -418,10 +437,11 @@ export async function bootstrap(config: RunAgentConfig): Promise<void> {
 
   console.log(`[boot] model=${env.modelId} fallback=${env.fallbackModelId} region=${env.region} bucket=${env.assetsBucket}`);
 
-  const app = new BedrockAgentCoreApp({
+  const review = createReviewHandler({ env, systemPrompt, assembleTools: config.assembleTools });
+  const app: BedrockAgentCoreApp = new BedrockAgentCoreApp({
     invocationHandler: {
       requestSchema,
-      process: createReviewHandler({ env, systemPrompt, assembleTools: config.assembleTools }),
+      process: (payload: Payload) => asBusyTask(app, 'review', review(payload)),
     },
   });
 
