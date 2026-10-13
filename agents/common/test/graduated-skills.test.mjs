@@ -3,7 +3,7 @@ import test from 'node:test';
 import { AgentRegistryControlClient } from '@aws-sdk/client-agent-registry-control';
 import './support/ts-resolve.mjs';
 
-const { loadGraduatedSkills } = await import('../src/graduated-skills.ts');
+const { loadGraduatedSkills, renderGraduatedSkills } = await import('../src/graduated-skills.ts');
 const { GRADUATED_SKILL_MAX_CHARS } = await import('../src/skills-registry.ts');
 
 /** Answers list and get calls from `records`, like the registry control plane. */
@@ -41,4 +41,96 @@ test('the warning counts every skill the budget left out, not only older ones', 
   assert.deepEqual(skills.map((s) => s.name), ['new', 'old']);
   assert.equal(warnings.length, 1);
   assert.match(warnings[0], /loaded 2; 1 skill\(s\) left out by the limits \(30 skills, 1000 characters\)/);
+});
+
+const skill = (overrides = {}) => ({
+  recordArn: 'arn:lock-order',
+  name: 'lock-order',
+  description: 'Use when reviewing a PR that touches `src/networking.c`.\n\nGraduated from concern record_id=3f2a9c1e-0b7d-4e55-9a51-2c6f0d8e7b10.',
+  status: 'DRAFT',
+  skillMd: [
+    '---',
+    'name: lock-order',
+    'description: "Use when reviewing a PR that touches `src/networking.c`."',
+    '---',
+    '',
+    '## Use when',
+    'A diff takes `c->lock` in `src/networking.c`.',
+    '',
+    '## Patterns',
+    '',
+    '### Lock order',
+    'Skip unless: `lockClient` appears in the diff.',
+  ].join('\n'),
+  ...overrides,
+});
+
+test('rendering drops the frontmatter and nests the skill headings under the skill name', () => {
+  const out = renderGraduatedSkills([skill()]);
+  assert.doesNotMatch(out, /name: lock-order|description: "/);
+  assert.ok(out.includes('## lock-order\n'));
+  assert.ok(out.includes('\n### Use when\nA diff takes `c->lock` in `src/networking.c`.\n\n### Patterns\n\n#### Lock order\nSkip unless:'));
+  assert.doesNotMatch(out, /^## (Use when|Patterns)$/m);
+});
+
+test('the description is one plain Scope line without the record id sentence', () => {
+  const out = renderGraduatedSkills([skill()]);
+  assert.ok(out.includes('## lock-order\nScope: Use when reviewing a PR that touches `src/networking.c`.\n\n'));
+  assert.doesNotMatch(out, /record_id|Graduated from concern/);
+  assert.doesNotMatch(out, /^_.*_$/m);
+  const wrapped = renderGraduatedSkills([skill({ description: 'Use when reviewing\n  `src/db.c`.\nDoes NOT apply to `src/rdb.c`.' })]);
+  assert.ok(wrapped.includes('\nScope: Use when reviewing `src/db.c`. Does NOT apply to `src/rdb.c`.\n'));
+  const idOnly = renderGraduatedSkills([skill({ description: 'Graduated from concern record_id=abc.' })]);
+  assert.ok(idOnly.includes('## lock-order\n\n'));
+  assert.doesNotMatch(idOnly, /Scope:/);
+});
+
+test('the introduction says the code at the PR head wins', () => {
+  const out = renderGraduatedSkills([skill()]);
+  assert.doesNotMatch(out, /Treat as established conventions/);
+  assert.ok(out.includes('Several maintainers confirmed each of these rules, and each is re-checked against the upstream default branch after releases. '
+    + 'A rule is a reason to look; the code at the PR head wins. '
+    + 'Confirm that the files and names a rule cites exist in this checkout before relying on it.'));
+  assert.equal(renderGraduatedSkills([]), '');
+});
+
+test('headings in fenced blocks are left alone', () => {
+  const md = [
+    '## Always-on checks',
+    '```sh',
+    '# a shell comment',
+    '```',
+    '~~~~markdown',
+    '## Example heading',
+    '~~~',
+    '# still inside the four-tilde fence',
+    '~~~~',
+    '``` not a fence ` because the info string has a backtick',
+    '# a heading again',
+    '    ## indented four spaces: code, not a heading',
+    '###### deepest level stays',
+    '#hashtag is not a heading',
+  ].join('\n');
+  const out = renderGraduatedSkills([skill({ skillMd: md })]);
+  assert.ok(out.includes([
+    '### Always-on checks',
+    '```sh',
+    '# a shell comment',
+    '```',
+    '~~~~markdown',
+    '## Example heading',
+    '~~~',
+    '# still inside the four-tilde fence',
+    '~~~~',
+    '``` not a fence ` because the info string has a backtick',
+    '## a heading again',
+    '    ## indented four spaces: code, not a heading',
+    '###### deepest level stays',
+    '#hashtag is not a heading',
+  ].join('\n')));
+});
+
+test('markdown without a complete frontmatter block is kept whole', () => {
+  const out = renderGraduatedSkills([skill({ skillMd: '---\nname: broken\n## Use when\nbody' })]);
+  assert.ok(out.includes('---\nname: broken\n### Use when\nbody'));
 });

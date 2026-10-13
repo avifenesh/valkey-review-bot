@@ -46,6 +46,61 @@ export async function loadGraduatedSkills(opts: LoadGraduatedOpts): Promise<read
   }
 }
 
+const INTRO = 'These rules graduated from the concerns store after repeated reinforcement. '
+  + 'Several maintainers confirmed each of these rules, and each is re-checked against the upstream default branch after releases. '
+  + 'A rule is a reason to look; the code at the PR head wins. '
+  + 'Confirm that the files and names a rule cites exist in this checkout before relying on it.';
+
+/** The provenance sentence submit_skill appends to a description, for operators. */
+const RECORD_ID_SENTENCE_RE = /\s*Graduated from concern record_id=\S*\s*$/;
+
+const FENCE_RE = /^ {0,3}(`{3,}|~{3,})(.*)$/;
+const HEADING_RE = /^( {0,3})(#{1,5})(?=\s|$)/;
+
+/** Whether each line belongs to a fenced code block, fence lines included. */
+function fencedLines(lines: readonly string[]): boolean[] {
+  const out: boolean[] = [];
+  let open: string | null = null;
+  for (const line of lines) {
+    const m = FENCE_RE.exec(line);
+    if (open !== null) {
+      out.push(true);
+      // A fence closes on the same character, at least as long, with nothing after it.
+      if (m && m[1][0] === open[0] && m[1].length >= open.length && m[2].trim() === '') open = null;
+    } else if (m && !(m[1][0] === '`' && m[2].includes('`'))) {
+      out.push(true);
+      open = m[1];
+    } else {
+      out.push(false);
+    }
+  }
+  return out;
+}
+
+/** The markdown without its leading `---` frontmatter block, when it has a complete one. */
+function stripFrontmatter(skillMd: string): string {
+  if (!/^---\r?\n/.test(skillMd)) return skillMd;
+  const lines = skillMd.split('\n');
+  const end = lines.findIndex((line, i) => i > 0 && line.trimEnd() === '---');
+  return end < 0 ? skillMd : lines.slice(end + 1).join('\n');
+}
+
+/**
+ * A skill's body as it sits under its own `##` heading: no frontmatter,
+ * and its headings one level down, so its `## Patterns` does not read
+ * as a sibling of the skill. Lines in fenced blocks are left alone.
+ */
+function renderSkillBody(skillMd: string): string {
+  const lines = stripFrontmatter(skillMd).split('\n');
+  const fenced = fencedLines(lines);
+  return lines.map((line, i) => (fenced[i] ? line : line.replace(HEADING_RE, '$1#$2'))).join('\n').trim();
+}
+
+/** The description on one line, without the record id sentence that means nothing to a reviewer. */
+function scopeLine(description: string): string {
+  return description.replace(RECORD_ID_SENTENCE_RE, '').replace(/\s+/g, ' ').trim();
+}
+
 /**
  * Render graduated skills as a markdown block to append to the system
  * prompt's skill section. Each skill becomes its own subsection.
@@ -57,13 +112,14 @@ export function renderGraduatedSkills(skills: readonly GraduatedSkill[]): string
   lines.push('');
   lines.push('# Graduated skills (curator-published)');
   lines.push('');
-  lines.push('These rules graduated from the concerns store after repeated reinforcement. Treat as established conventions for the area.');
+  lines.push(INTRO);
   lines.push('');
   for (const s of skills) {
     lines.push(`## ${s.name}`);
-    if (s.description) lines.push(`_${s.description}_`);
+    const scope = scopeLine(s.description);
+    if (scope) lines.push(`Scope: ${scope}`);
     lines.push('');
-    lines.push(s.skillMd.trim());
+    lines.push(renderSkillBody(s.skillMd));
     lines.push('');
   }
   return lines.join('\n');
