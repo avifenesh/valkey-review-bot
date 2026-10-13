@@ -135,7 +135,7 @@ test('an opened PR is queued on its route with the runtime payload', async () =>
   await handler(delivery('pull_request', prEvent('opened')));
   assert.deepEqual(sent, [{
     queueUrl: 'q-valkey',
-    body: { repo: REPO, pr_number: 7, installation_id: 42, head_sha: 'abc123', pending_marker: 'pending-1' },
+    body: { repo: REPO, pr_number: 7, installation_id: 42, head_sha: 'abc123', pending_marker: 'pending-1', trigger: 'opened', skip_drafts: false },
     attributes: { repo: REPO, pr_number: 7, action: 'opened' },
   }]);
   assert.equal(store.slotsTaken, 1);
@@ -426,18 +426,18 @@ test('a reopen or a draft marked ready joins a waiting review of new commits', a
   assert.equal(store.pending.get(`${REPO}#7`), 'pending-1', 'the marker stays with the waiting review');
 });
 
-test('reviews that are not from new commits hold the marker but have no delay or trigger', async () => {
-  const { handler, sent, store } = setup();
+test('reviews that are not from new commits hold the marker and name their trigger, with no delay', async () => {
+  const { handler, sent } = setup();
   await handler(delivery('pull_request', prEvent('opened')));
-  await handler(delivery('pull_request', prEvent('opened', { number: 8 })));
+  await handler(delivery('pull_request', prEvent('reopened', { number: 8 })));
   await handler(delivery('pull_request', prEvent('ready_for_review', {}, GLIDE)));
-  assert.equal(sent.length, 3);
-  for (const [i, marker] of ['pending-1', 'pending-2', 'pending-3'].entries()) {
-    assert.equal(sent[i].options, undefined);
-    assert.equal(sent[i].body.pending_marker, marker);
-    assert.equal(sent[i].body.trigger, undefined);
-    assert.equal(sent[i].body.skip_drafts, undefined);
-  }
+  await handler(delivery('pull_request', prEvent('opened', { number: 9 }, GLIDE)));
+  assert.deepEqual(sent.map((s) => [s.body.pending_marker, s.body.trigger, s.body.skip_drafts, s.options]), [
+    ['pending-1', 'opened', false, undefined],
+    ['pending-2', 'reopened', false, undefined],
+    ['pending-3', 'ready_for_review', true, undefined],
+    ['pending-4', 'opened', true, undefined],
+  ], 'the runtime skips the run if the pull request is closed, or a draft on a skipDrafts route, by then');
 });
 
 test('a push or a reopen while a reopened pull request\'s review waits joins it', async () => {

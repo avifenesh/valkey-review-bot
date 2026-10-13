@@ -32,15 +32,20 @@ export interface ReviewEnvelope {
    */
   readonly pending_marker?: string;
   /**
-   * "push" on reviews of new commits, which wait in the queue. The pull
-   * request may have changed meanwhile, so the runtime skips such a run
-   * when the pull request is closed or merged, or is a draft and
-   * skip_drafts is true.
+   * Automatic reviews: the event that started the review. An automatic
+   * review can wait a long time before it runs (the queue delay of a
+   * review of new commits, or another review of the pull request), so
+   * the runtime skips the run when the pull request is closed or merged
+   * by then, or is a draft and skip_drafts is true. @mention runs have
+   * no trigger and run in any state.
    */
-  readonly trigger?: 'push';
-  /** Reviews of new commits: the route's skipDrafts setting. */
+  readonly trigger?: AutomaticTrigger;
+  /** Automatic reviews: the route's skipDrafts setting. */
   readonly skip_drafts?: boolean;
 }
+
+/** "push" is pull_request synchronize: new commits. */
+export type AutomaticTrigger = 'opened' | 'reopened' | 'ready_for_review' | 'push';
 
 export interface PendingMarker {
   readonly repo: string;

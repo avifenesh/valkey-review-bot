@@ -3,7 +3,7 @@ import { curatorEnvelope, extractFeedback } from './feedback.js';
 import { fetchReviewComment, type GitHubApi, type WebhookPayload } from './github.js';
 import { classifyCommentBody, isAuthorReplyOutsideBotThread } from './heuristics.js';
 import { detectMention, handleMention, type Mention, type Verdict } from './mention.js';
-import type { ReviewEnvelope } from './review-envelope.js';
+import type { AutomaticTrigger, ReviewEnvelope } from './review-envelope.js';
 import { lowercaseHeaders, rawBody, verifySignature, type ApiGatewayEvent } from './signature.js';
 import { releaseQuietly, type DeliveryStore } from './store.js';
 
@@ -72,7 +72,13 @@ interface Target {
 }
 
 const FEEDBACK_EVENTS: ReadonlySet<string> = new Set(['issue_comment', 'pull_request_review_comment', 'pull_request_review']);
-const REVIEW_ACTIONS: ReadonlySet<string> = new Set(['opened', 'reopened', 'ready_for_review', 'synchronize']);
+/** The pull_request actions that start an automatic review, and the trigger each sends. */
+const REVIEW_TRIGGERS: ReadonlyMap<string, AutomaticTrigger> = new Map([
+  ['opened', 'opened'],
+  ['reopened', 'reopened'],
+  ['ready_for_review', 'ready_for_review'],
+  ['synchronize', 'push'],
+]);
 
 const skip = (reason: string): Outcome => ({ status: 200, body: { ok: true, skipped: reason } });
 const fail = (status: number, error: string): Outcome => ({ status, body: { error } });
@@ -142,7 +148,8 @@ export function createDeliveryHandler(
     const { repo } = target;
     const action = payload.action ?? '';
     // Narrowed further per route below; anything else never reviews.
-    if (!REVIEW_ACTIONS.has(action)) return skip(`action=${action}`);
+    const trigger = REVIEW_TRIGGERS.get(action);
+    if (!trigger) return skip(`action=${action}`);
 
     // Dependency bumps and other automated PRs are not reviewed.
     const pr = payload.pull_request;
@@ -180,8 +187,8 @@ export function createDeliveryHandler(
     // as its duplicate, or its run be taken for done by the worker. The
     // cost: a reopen at a head that a review of new commits did cover is
     // reviewed again, using a round.
-    const ready = action === 'ready_for_review';
-    const pushed = action === 'synchronize';
+    const ready = trigger === 'ready_for_review';
+    const pushed = trigger === 'push';
     const nonce = ready ? 'ready' : pushed ? 'push' : undefined;
     const key = `${repo}#${prNumber}#${headSha}${nonce ? `#${nonce}` : ''}`;
     if (!(await deps.store.claim(key, { action }))) return skip('duplicate');
@@ -255,6 +262,9 @@ export function createDeliveryHandler(
       // the marker of a review that will still run: the pull request can
       // then get one automatic review more than the cap, and the worker,
       // finding no marker, runs that review like any other.
+      //
+      // trigger and skip_drafts let the runtime skip the run if the pull
+      // request is closed, or a draft on this route, by the time it starts.
       const envelope: ReviewEnvelope = {
         repo,
         pr_number: prNumber,
@@ -262,7 +272,8 @@ export function createDeliveryHandler(
         head_sha: headSha,
         ...(nonce ? { run_nonce: nonce } : {}),
         pending_marker: marker,
-        ...(pushed ? { trigger: 'push', skip_drafts: route.skipDrafts } : {}),
+        trigger,
+        skip_drafts: route.skipDrafts,
       };
       const delay = pushed ? { delaySeconds: config.pushReviewDelaySeconds } : undefined;
       await deps.sendMessage(route.queueUrl, envelope, { repo, pr_number: prNumber, action }, delay);
