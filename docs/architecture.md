@@ -34,20 +34,26 @@ HTTP API -> receiver -+-> route queue -> route worker -> reviewer runtime -> Git
 
 ### Automatic pull request review
 
-1. A pull request on a review route is opened or reopened, or, on a
-   `skipDrafts` route, marked ready for review. GitHub sends a
-   `pull_request` delivery to the HTTP API.
+1. A pull request on a review route is opened, reopened or gets new
+   commits (`synchronize`), or, on a `skipDrafts` route, is marked ready for
+   review. GitHub sends a `pull_request` delivery to the HTTP API.
 2. The receiver checks the signature, applies the route's gates, claims the
-   idempotency key and takes a slot from the route's daily budget
+   idempotency key, takes the pull request's pending marker and one of its
+   automatic review rounds, and takes a slot from the route's daily budget
    (`pullRequest` in `webhook/src/delivery.ts`). It sends a review envelope
-   (`webhook/src/review-envelope.ts`) to the route's queue.
-3. The route's worker calls `InvokeAgentRuntime` on the route's reviewer
-   runtime with the envelope as the payload and reads the event stream
-   (`handleOne` in `webhook/src/invoker.ts`).
+   (`webhook/src/review-envelope.ts`) to the route's queue, with an SQS
+   delay when new commits started it.
+3. The route's worker waits while another review of the same pull request
+   runs. Then it writes the run's start record, removes the pending marker,
+   calls `InvokeAgentRuntime` on the route's reviewer runtime with the
+   envelope as the payload and reads the event stream (`handleOne` in
+   `webhook/src/invoker.ts`).
 4. The runtime (`bootstrap` in `agents/common/src/run-agent.ts`) starts a
-   heartbeat record, gets a token from its token broker, fetches the pull
-   request into the clone in its image, loads graduated skills and runs the
-   model with its tools.
+   heartbeat record, gets a token from its token broker and reads the pull
+   request. If the pull request was closed or merged since, or is a draft
+   on a `skipDrafts` route, the run ends there, posts nothing and is
+   recorded completed. Otherwise it fetches the pull request into the clone
+   in its image, loads graduated skills and runs the model with its tools.
 5. The model ends with `post_review` (a `COMMENT` review with inline
    comments) or `skip_review`. Both rewrite the pull request's review state
    comment.
@@ -77,8 +83,11 @@ HTTP API -> receiver -+-> route queue -> route worker -> reviewer runtime -> Git
    reply at the end.
 6. A tag in a reply inside a review thread starts a run only on routes with
    `threadReplyReview`. If the App started that thread, the instruction quotes
-   the App's comment and asks the run to check the claimed fix. The reply is
-   handled as feedback either way.
+   the App's comment and asks the run to answer the reply from the code at
+   the current head: verify a claimed fix (confirm it, or say what remains),
+   re-check a disputed finding (withdraw it if the reply is right, or show
+   the evidence), or answer a question. In a thread someone else started the
+   reply is an ordinary summons. The reply is handled as feedback either way.
 
 ### Curator feedback
 
@@ -117,8 +126,12 @@ which `scripts/dump-hour.sh` summarizes.
 `dispatch` in `webhook/src/delivery.ts`:
 
 - `ping`: answered with 200.
-- `pull_request`: the automatic review path. Only `opened`, `reopened` and
-  `ready_for_review` can start a review. New commits (`synchronize`) never do.
+- `pull_request`: the automatic review path. `opened`, `reopened`,
+  `synchronize` (new commits) and `ready_for_review` can start a review.
+  `closed`, and `converted_to_draft` on a `skipDrafts` route, never review;
+  while a review waits they release the key of a later reopen or
+  `ready_for_review` at that head (`pullRequestLeft`), so that event is not
+  dropped as a duplicate if the waiting review is skipped.
 - `issue_comment` and `pull_request_review_comment`: @mention detection,
   then the feedback path.
 - `pull_request_review`: the feedback path only (action `submitted`). A tag
@@ -136,16 +149,45 @@ authors and feedback authors.
 
 In order (`pullRequest`):
 
-1. The action is one of the three above.
+1. The action is one of the four above.
 2. The pull request author is not a bot.
 3. The repository has a review route (case-insensitive).
 4. The route is not `mentionOnly`.
-5. Drafts: on `skipDrafts` routes a draft is skipped when opened and reviewed
-   on `ready_for_review`. Other routes review on open, draft or not, and
-   ignore `ready_for_review`.
+5. Drafts: on `skipDrafts` routes a draft is skipped when opened or pushed
+   to, and reviewed on `ready_for_review`. Other routes review on open and
+   on new commits, draft or not, and ignore `ready_for_review`.
 6. When the route's `authorAllowlist` is not empty, the author is on it.
 7. The idempotency key is new.
-8. The route's daily budget has a slot.
+8. No other automatic review of the pull request waits: the receiver takes
+   the pull request's pending marker (`markReviewPending` in
+   `webhook/src/store.ts`). When another review holds it, this event joins
+   that review and is skipped as `auto-review-pending`.
+9. The pull request has an automatic review round left
+   (`takeAutoReview`), else `auto-review-cap`.
+10. The route's daily budget has a slot.
+
+The pending marker, `pending#owner/name#pr`, is a conditional put with a
+random id. The review holds it from step 8 until its worker starts the run,
+so at most one automatic review of a pull request waits at a time. A push,
+reopen or `ready_for_review` while it waits uses no round or budget, and
+the run reviews the head the pull request has when it starts. A review of
+new commits waits in the queue for `PUSH_REVIEW_DELAY_SECONDS` (default 300,
+at most 900), so a burst of pushes becomes one review. The marker expires
+an hour after that delay, or after the worker's latest extension, in case
+no worker removes it.
+
+The round counter, `autoreviews#owner/name#pr`, is an atomic `ADD`
+conditioned on the count being below `MAX_AUTOMATIC_REVIEWS_PER_PR`
+(default 3, 1 to 20), counting the first review. It expires 180 days after
+the pull request's latest automatic review. @mentions and thread replies
+take no round. Open pull requests at the time of the deploy start with no
+counter.
+
+A review that is not queued (at the cap, at the budget, or on a failed
+send) gives back what it took, newest first: the round, the marker and the
+idempotency key. A send that errors after SQS accepted the message gives them back for
+a review that still runs, so the pull request can get one review more than
+the cap.
 
 ### Gates for @mentions
 
@@ -166,8 +208,10 @@ is new, and the pull request is open.
 The safety gate (`createSafetyGate`) sends at most 4,000 characters of
 instruction to the model in `HAIKU_MODEL_ID` through Converse, between two
 random marker lines, with a 5 second timeout. No verdict, an unparsable
-verdict, an error or a timeout all deny. A bare tag has no instruction, skips
-the gate, and gets a standard full review. Failures a redelivery could fix
+verdict, an error or a timeout all deny. The gate allows a reply that says one
+of the bot's findings is fixed, argues that it is wrong or asks about it,
+unless part of the reply attempts something it denies. A bare tag has no
+instruction, skips the gate, and gets a standard full review. Failures a redelivery could fix
 (reading the pull request, posting the acknowledgement, queuing) release the
 claim and return 500; a failed queue send also edits the acknowledgement to
 say so.
@@ -177,18 +221,23 @@ say so.
 `takeReviewSlot` (`webhook/src/store.ts`) increments the item
 `budget#<route id>#<YYYY-MM-DD>` (UTC) in the idempotency table, on condition
 that it is below `DAILY_REVIEW_BUDGET` (default 40; 0 pauses automatic
-reviews). The slot is taken after the idempotency claim. When the budget is
-used up, the claim is released, so a redelivery after the day resets can
-still review. A slot whose queue send then fails is not returned. Only
-automatic reviews count.
+reviews). The slot is taken after the idempotency claim, the pending marker
+and the round. When the budget is used up, all three are given back, so a
+redelivery after the day resets can still review. A slot whose queue send
+then fails is not returned. Only automatic reviews count, reviews of new
+commits included. An event that joins a waiting review, or meets the cap,
+takes no slot.
 
 ### Idempotency
 
 `claim` is a conditional put on `key` with a 24 hour TTL. The keys are:
 
-- `owner/name#<pr>#<head sha>` for automatic reviews, with `#ready` appended
-  for `ready_for_review`, so the same head can be reviewed again once a draft
-  is marked ready;
+- `owner/name#<pr>#<head sha>` for automatic reviews, with `#reopened`,
+  `#ready` or `#push` appended for a reopen, `ready_for_review` and new
+  commits. Each trigger has its own key, so the review one trigger asks
+  for is never dropped as the duplicate of another trigger's review of the
+  same head. The cost: the first reopen at a head that was already
+  reviewed reviews it again and uses a round;
 - `mention#issue_comment-<id>` or `mention#review_comment-<id>`;
 - `curator#rc-<id>`, `curator#ic-<id>` or `curator#pr-<id>` for review
   comments, issue comments and reviews.
@@ -196,7 +245,8 @@ automatic reviews count.
 An existing key is a duplicate and is skipped with 200. When the work cannot
 be queued, the key is released and the receiver answers 500. GitHub does not
 retry failed deliveries; an operator can redeliver from the App's advanced
-settings.
+settings. The same table also holds the daily budget counters, the round
+counters and the pending markers described above; none of them is a claim.
 
 ### Feedback forwarded to the curator
 
@@ -246,17 +296,38 @@ in `agents/common/src/heartbeat.ts`): `last_activity` in milliseconds,
 It writes at most once a minute while agent events arrive, writes
 `completed` as soon as a terminal tool succeeds, and writes the final status
 after any write still in flight. The key is
-`owner/name#<pr>#<head sha>`, plus `#<nonce>` when the envelope has one: `ready`
-for a draft marked ready, `m<comment id>` for an @mention run. The nonce keeps
-a completed automatic review from making the watchdog drop a later run on the
-same head. `heartbeatRunKey` in `webhook/src/review-envelope.ts` and the run
-key in `run-agent.ts` must produce the same string.
+`owner/name#<pr>#<head sha>`, plus `#<nonce>` when the envelope has one:
+`reopened` for a reopen, `ready` for a draft marked ready, `push` for new
+commits, `m<comment id>` for an @mention run. The nonce keeps a completed
+automatic review from making the watchdog drop a later run on the same head.
+`heartbeatRunKey` in `webhook/src/review-envelope.ts` and the run key in
+`run-agent.ts` must produce the same string.
+
+The worker writes the first record of a run itself, just before it invokes
+the runtime: status `running`, `last_activity` and the SQS message id, with
+a conditional `UpdateItem` that is refused while the key holds a fresh
+running record or a completed one this message wrote (`claimRunStart` in
+`webhook/src/invoker.ts`). So another review of the pull request sees the
+run at once, not only after the runtime's first heartbeat, and only one
+receive of a message starts the run. A receive that loses is left on the
+queue and decides from the heartbeat at its next receive. The runtime's own
+writes keep the message id.
+
+An automatic review does not start while another review of the same pull
+request runs, so two automatic runs of a pull request do not overlap. Before
+it runs, on any attempt, the worker scans the heartbeat table for the
+running records whose key starts with `owner/name#<pr>#`. While one is fresh,
+the message waits like a live run of its own, and the worker moves its
+pending marker's expiry to an hour from then, so later events keep joining
+it. @mention runs, thread replies included, never wait: a maintainer is
+watching their status comment.
 
 A worker stops reading when its 15 minute limit ends, and the message comes
 back after the visibility timeout. For a review message, `decide` in
 `webhook/src/watchdog.ts` returns:
 
-- first receive: invoke on the primary model;
+- first receive, or a later receive that still holds its pending marker
+  (the review never ran): invoke on the primary model;
 - heartbeat `completed`: delete, at any age;
 - message older than the run budget (from `SentTimestamp`): delete it and log
   `[abandoned]`;
@@ -279,7 +350,11 @@ falls back per model call inside one invocation (section 6).
 
 ### Run budget and dead-letter queues
 
-`RUN_BUDGET_MINUTES` defaults to 90 and is not overridden by the CDK app. With
+`RUN_BUDGET_MINUTES` defaults to 90 and is not overridden by the CDK app. It
+counts from the message's `SentTimestamp`, so the push delay and any wait for
+another review come out of it: a review still waiting at the end of the
+budget is dropped with an `[abandoned]` error, and one that starts late is
+watched only until the budget ends. With
 a 16 minute visibility timeout a healthy long review is received at most
 seven times, so review queues dead-letter after eight receives. Curator
 messages have no heartbeat: every receive invokes the curator, the curator
@@ -294,7 +369,9 @@ policy). The webhook stack outputs every dead-letter queue name for alarms.
 When the container starts, `bootstrap` reads its settings (`loadEnv` in
 `agents/common/src/config.ts`) and loads `prompt.md` and `skill.md` from the
 assets bucket once. The base system prompt is the prompt, then a "Skill:
-institutional memory" section with the skill file.
+institutional memory" section with the skill file, whose suppressed pieces
+are labelled as graduated skills' are (`baseSystemPrompt`; see
+[Publishing skills](#publishing-skills-to-aws-agent-registry)).
 
 Each invocation validates the payload against `requestSchema` and picks the
 model. IDs that start with `openai.` go through the Bedrock Mantle
@@ -313,7 +390,13 @@ loads graduated skills, assembles the tools and starts the loop.
   `/workspace/valkey-glide`, cloned with `--filter=blob:limit=1m`). A warm
   container is reused across runs, so the clone may hold the previous run's
   state.
-- Reads the pull request, then runs the git work in parallel with listing
+- Reads the pull request. An automatic review (the envelope has a
+  `trigger`) stops here when the pull request is no longer open, or is a
+  draft and `skip_drafts` is set (`automaticReviewSkipReason`); the run
+  posts nothing and is recorded completed. An automatic review can wait a
+  long time first: the push delay, and any other review of the pull
+  request. @mention runs go ahead in any state.
+- Then runs the git work in parallel with listing
   reviews, review comments, issue comments and changed files (at most 3,000).
 - Points `origin` at the pull request's base repository with a URL that holds
   no credentials, force-fetches `pull/<n>/head`, runs `git reset --hard` and
@@ -366,8 +449,10 @@ tool.
 
 The two file paths the prompts write outside the fenced blocks are JSON
 strings, so a file name cannot close the sentence around it: the inline
-tag's path in `mentionBlock`, and the path in the re-review instruction that
-`webhook/src/mention.ts` builds. The base branch stays unfenced, because only
+tag's path in `mentionBlock`, and the path in the thread-reply instruction
+that `webhook/src/mention.ts` builds, cut to 300 characters. That
+instruction stays within 6,000 characters by shortening its quote of the
+App's comment, never the reply or the directive. The base branch stays unfenced, because only
 maintainers create branches in the base repository. The previous state
 comment is shown unfenced too. The App wrote it, and each finding in it is
 folded onto one line with no backticks in its location, so a file name the
@@ -412,7 +497,8 @@ model copied cannot start a heading there.
   idle timeout after the worker has gone. The reviewer runtimes end a
   session two hours after it starts at the latest (`lifecycleConfiguration`
   in `infra/lib/valkey-review-agent-stack.ts`), above the watchdog's
-  90-minute run budget. The curator has neither (section 6).
+  90-minute run budget. The curator reports `HealthyBusy` during
+  maintenance runs only, and has no lifecycle configuration (section 6).
 
 ### Tools
 
@@ -727,8 +813,8 @@ deprecated.
 
 | Store | Holds | Written by | Read by |
 | --- | --- | --- | --- |
-| Idempotency table (DynamoDB, webhook stack) | Delivery keys (24 hour TTL) and daily budget counters `budget#<route>#<date>` (3 day TTL) | Receiver | Receiver |
-| `valkey_reviewer_run_heartbeat` (DynamoDB, substrate stack) | One item per run key: `last_activity`, `status`, `model`, 24 hour TTL | Reviewer runtimes | Review workers |
+| Idempotency table (DynamoDB, webhook stack) | Delivery keys (24 hour TTL), daily budget counters `budget#<route>#<date>` (3 day TTL), round counters `autoreviews#owner/name#<pr>` (180 days from the latest automatic review) and pending markers `pending#owner/name#<pr>` (an hour after the queue delay) | Receiver; review workers extend and delete pending markers | Receiver, review workers (pending markers) |
+| `valkey_reviewer_run_heartbeat` (DynamoDB, substrate stack) | One item per run key: `last_activity`, `status`, `model`, `message_id`, 24 hour TTL | Reviewer runtimes; review workers write each run's start record | Review workers |
 | `valkey_review_concerns`, `valkey_glide_review_concerns` (DynamoDB, reviewer stacks) | Concern records. Customer-managed KMS key, point-in-time recovery, retained on stack deletion | Curator, decay job | Curator, decay job, `scripts/concerns-dump.sh` |
 | Assets bucket (S3, substrate stack) | `<agent>/prompt.md` and `<agent>/skill.md` for each reviewer and `curator/`. KMS encrypted and versioned | CDK deploy | Each runtime reads its own prefix at container start |
 | Reviewer skills registries (AWS Agent Registry, one per reviewer) | Graduated `SKILL` records | Curator (`submit_skill`) | That reviewer |
