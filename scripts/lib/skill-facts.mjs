@@ -14,15 +14,12 @@ import { printable, quoted } from './text.mjs';
 
 const SHA_RE = /^(?:[0-9a-f]{40}|[0-9a-f]{64})$/;
 
-/** The first git that honours GIT_NO_LAZY_FETCH; older git ignores it. */
-const NO_LAZY_FETCH_GIT = [2, 44];
-
 /**
  * Environment for git on a clone the operator already has. As for a fresh
  * checkout: no credentials, no inherited GIT_* settings and no system or
- * global config. Also GIT_NO_LAZY_FETCH, so in a partial clone an object
- * the clone lacks is an error, not a fetch from its promisor remote that
- * writes a pack into the clone.
+ * global config. Also GIT_NO_LAZY_FETCH, so that git 2.44 and later never
+ * fetch an object the clone lacks and write a pack into it. Partial
+ * clones are refused anyway (see cloneRunner); this is a second guard.
  */
 const cloneGitEnv = () => ({ ...upstreamGitEnv(), GIT_NO_LAZY_FETCH: '1' });
 
@@ -40,34 +37,24 @@ async function isPartialClone(git) {
   return (ext.code === 0 && ext.stdout.trim() !== '') || (remotes.code === 0 && remotes.stdout.trim() !== '');
 }
 
-/** [major, minor] of the git that runs, or null when its version cannot be read. */
-async function gitVersion(git) {
-  const m = /^git version (\d+)\.(\d+)/.exec((await git(['--version'])).stdout.trim());
-  return m ? [Number(m[1]), Number(m[2])] : null;
-}
-
-const atLeast = (version, [major, minor]) => version !== null && (version[0] > major || (version[0] === major && version[1] >= minor));
-
 /**
- * A runner for the top of the clone at `dir`, and whether it is a partial
- * clone. Refuses a partial clone when git is too old to turn off lazy
- * fetching.
+ * A runner for the top of the clone at `dir`. Refuses a partial clone,
+ * whatever the git version. Such a clone can lack objects the check reads,
+ * and git either fetches them into the clone or, with lazy fetching off,
+ * may skip them: git grep before 2.55 reports a blob it cannot read and
+ * still exits 0 or 1, so the names in it would count as absent.
  */
 async function cloneRunner(dir) {
   const env = cloneGitEnv();
   const top = await mustGit(createGitRunner(dir, env), ['rev-parse', '--show-toplevel']);
   // Check from the top of the work tree, as check.ts expects.
   const git = createGitRunner(top, env);
-  const partial = await isPartialClone(git);
-  if (partial) {
-    const version = await gitVersion(git);
-    if (!atLeast(version, NO_LAZY_FETCH_GIT)) {
-      throw new Error(`${top} is a partial clone, and git ${version ? version.join('.') : 'of an unknown version'} cannot turn off`
-        + ` its fetches of missing objects (git ${NO_LAZY_FETCH_GIT.join('.')} can). Use git ${NO_LAZY_FETCH_GIT.join('.')} or later,`
-        + ' a full clone, or --repo or --url.');
-    }
+  if (await isPartialClone(git)) {
+    throw new Error(`${top} is a partial clone (it has a promisor remote), so it can lack objects the check reads,`
+      + ' and skill-facts does not read one. Use a full clone (git clone without --filter), or --repo or --url,'
+      + ' which make a checkout of their own.');
   }
-  return { git, top, partial };
+  return { git, top };
 }
 
 async function mustGit(git, args) {
@@ -94,8 +81,7 @@ async function commitOf(git, rev) {
  * branch tip (the default branch unless given) in a temporary directory,
  * deleted afterwards, as the curator makes it; or { checkout, rev? }: the
  * committed tree at `rev` (default HEAD) of an existing clone, which is
- * only read: git runs there with lazy fetching off (see cloneRunner), so
- * in a partial clone an object it lacks is an error, never a fetch.
+ * only read. A partial clone is refused (see cloneRunner).
  *
  * record, when given, is the graduated concern record's check state, as
  * the curator uses it: audit_names is the baseline, ignored_names are not
@@ -109,7 +95,6 @@ export async function skillFacts({ skillMd, upstream, record = null, base }) {
   const recordSha = typeof record?.verified_sha === 'string' && SHA_RE.test(record.verified_sha) ? record.verified_sha : undefined;
   let baseSha = base ?? recordSha;
   let dir;
-  let partialClone = null;
   try {
     let git;
     let commit;
@@ -124,10 +109,8 @@ export async function skillFacts({ skillMd, upstream, record = null, base }) {
       baseAvailable = co.baseAvailable;
       where = { url: upstream.url, branch: co.defaultBranch, commit };
     } else {
-      const clone = await cloneRunner(upstream.checkout);
-      git = clone.git;
-      const { top, partial } = clone;
-      if (partial) partialClone = top;
+      let top;
+      ({ git, top } = await cloneRunner(upstream.checkout));
       const rev = upstream.rev ?? 'HEAD';
       commit = await commitOf(git, rev);
       if (!commit) throw new Error(`${JSON.stringify(rev)} names no commit in ${top}`);
@@ -136,7 +119,7 @@ export async function skillFacts({ skillMd, upstream, record = null, base }) {
         if (resolved) baseSha = resolved;
         baseAvailable = resolved !== null;
       }
-      where = { checkout: top, rev, commit, ...(partial ? { partial: true } : {}) };
+      where = { checkout: top, rev, commit };
     }
 
     let baseline = [];
@@ -170,13 +153,6 @@ export async function skillFacts({ skillMd, upstream, record = null, base }) {
       ignored,
       area: globs.map((glob, i) => ({ glob, files: counts[i] })),
     };
-  } catch (err) {
-    // Git's own words for an object a partial clone lacks while lazy fetching is off.
-    if (partialClone && err instanceof Error && /lazy fetching disabled|from promisor remote/.test(err.message)) {
-      err.message += `\n${partialClone} is a partial clone, and this reads only the objects it has. Fetch what the check needs there`
-        + ' yourself (checking out --rev and --base does), or use --repo or --url.';
-    }
-    throw err;
   } finally {
     if (dir) await removeCheckout(dir);
   }
@@ -196,8 +172,7 @@ export function factsReport(facts, { label, allNames = false }) {
   const lines = [`skill: ${printable(label)}`];
   lines.push(upstream.url
     ? `upstream: ${printable(upstream.url)} ${printable(upstream.branch)}@${short(upstream.commit)}`
-    : `upstream: checkout ${printable(upstream.checkout)} at ${printable(upstream.rev)} (${short(upstream.commit)})`
-      + (upstream.partial ? ', a partial clone, read without fetching' : ''));
+    : `upstream: checkout ${printable(upstream.checkout)} at ${printable(upstream.rev)} (${short(upstream.commit)})`);
   if (!base) lines.push('base: none, so no names are touched');
   else if (!base.available) lines.push(`base: ${quoted(base.sha)} is not available here, so no names are touched`);
   else lines.push(`base: ${short(base.sha)}, ${result.changedFiles} file(s) changed since`);

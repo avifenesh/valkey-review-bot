@@ -152,46 +152,44 @@ const objects = (dir) => {
   return readdirSync(root).flatMap((d) => (d === 'info' ? [] : readdirSync(path.join(root, d)).map((f) => `${d}/${f}`))).sort();
 };
 
-test('a partial clone is read without fetching: what it lacks is an error, and nothing is written to it', async () => {
+const PARTIAL_RE = /is a partial clone \(it has a promisor remote\), so it can lack objects the check reads, and skill-facts does not read one\. Use a full clone/;
+
+test('a partial clone is refused before any read, with any git version, and nothing is fetched into it', async () => {
+  // Git 2.44 to 2.54 with lazy fetching off: git grep reports a blob it lacks and goes on, so a read would be silently wrong.
   const dir = partialClone();
   const before = objects(dir);
-  const tip = await skillFacts({ skillMd: SKILL, upstream: { checkout: dir } });
-  assert.deepEqual(tip.upstream, { checkout: dir, rev: 'HEAD', commit: up.tipSha, partial: true });
-  assert.deepEqual(tip.result.newAbsent, ['emptyDB', 'old_counter', 'src/old.c', 'not_in_upstream']);
-  assert.ok(factsReport(tip, { label: 'x' }).includes(`upstream: checkout ${dir} at HEAD (${up.tipSha.slice(0, 12)}), a partial clone, read without fetching`));
-
-  // The base's blobs were never fetched.
-  for (const input of [{ upstream: { checkout: dir, rev: up.baseSha } }, { upstream: { checkout: dir }, base: up.baseSha }]) {
-    await assert.rejects(skillFacts({ skillMd: SKILL, ...input }), (err) => {
-      assert.match(err.message, /could not fetch [0-9a-f]+ from promisor remote/);
-      assert.match(err.message, /is a partial clone, and this reads only the objects it has\. Fetch what the check needs there yourself/);
-      return true;
-    });
+  for (const input of [
+    { upstream: { checkout: dir } },
+    { upstream: { checkout: path.join(dir, 'src') } },
+    { upstream: { checkout: dir, rev: up.baseSha } },
+    { upstream: { checkout: dir }, base: up.baseSha },
+  ]) {
+    await assert.rejects(skillFacts({ skillMd: SKILL, ...input }), PARTIAL_RE);
   }
   assert.deepEqual(objects(dir), before, 'no object was fetched into the clone');
-  await assert.rejects(skillFacts({ skillMd: SKILL, upstream: { checkout: dir, rev: 'no-such-rev' } }), (err) => {
-    assert.match(err.message, /names no commit/);
-    assert.ok(!err.message.includes('partial clone'), 'other errors get no partial-clone hint');
-    return true;
-  });
+
+  // A remote with only a filter set is a promisor remote too; so is extensions.partialClone alone.
+  const g = gitIn(dir);
+  g('config', '--unset', 'remote.origin.promisor');
+  await assert.rejects(skillFacts({ skillMd: SKILL, upstream: { checkout: dir } }), PARTIAL_RE);
+  g('config', '--unset', 'remote.origin.partialclonefilter');
+  g('config', 'extensions.partialClone', 'origin');
+  await assert.rejects(skillFacts({ skillMd: SKILL, upstream: { checkout: dir } }), PARTIAL_RE);
+  assert.deepEqual(objects(dir), before);
 });
 
-test('skill-facts.mjs refuses a partial clone with a git that cannot turn off lazy fetching', async () => {
-  const bin = tempDir('old-git-');
-  const realGit = execFileSync('sh', ['-c', 'command -v git'], { encoding: 'utf8' }).trim();
-  writeFileSync(path.join(bin, 'git'), `#!/bin/sh\nif [ "$1" = "--version" ]; then echo "git version 2.43.0"; exit 0; fi\nexec "${realGit}" "$@"\n`, { mode: 0o755 });
-  const env = { ...process.env, PATH: `${bin}:${process.env.PATH}` };
+test('skill-facts.mjs refuses a partial clone and prints no result', async () => {
   const dir = partialClone();
   const before = objects(dir);
-  const file = path.join(bin, 'skill.md');
+  const file = path.join(up.root, 'partial-skill.md');
   writeFileSync(file, SKILL);
-  const refused = await runScript('skill-facts.mjs', ['--file', file, '--checkout', dir, '--rev', up.baseSha], { env });
+  const refused = await runScript('skill-facts.mjs', ['--file', file, '--checkout', dir]);
   assert.equal(refused.code, 1);
-  assert.match(refused.stderr, /is a partial clone, and git 2\.43 cannot turn off its fetches of missing objects \(git 2\.44 can\)/);
+  assert.match(refused.stderr, PARTIAL_RE);
+  assert.equal(refused.stdout, '');
   assert.deepEqual(objects(dir), before);
-  const full = await runScript('skill-facts.mjs', ['--file', file, '--checkout', up.work], { env });
-  assert.equal(full.code, 2, `a full clone is fine: ${full.stderr}`);
-  rmSync(bin, { recursive: true, force: true });
+  const full = await runScript('skill-facts.mjs', ['--file', file, '--checkout', up.work]);
+  assert.equal(full.code, 2, `a full clone is read: ${full.stderr}`);
 });
 
 test('the report lists every cited name with --names, and the JSON carries the excerpts', async () => {

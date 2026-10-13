@@ -27,11 +27,11 @@
 //   --url        the same from any https:// URL without credentials, or file://.
 //   --checkout   the committed tree at --rev (default HEAD) of a clone you
 //                already have. Git runs there without your global and system
-//                config and with GIT_NO_LAZY_FETCH=1: it reads only the objects
-//                the clone has and writes nothing to it. In a partial clone
-//                (one with a promisor remote) a missing object is an error, so
-//                check out --rev and --base there first; git before 2.44
-//                ignores GIT_NO_LAZY_FETCH, so a partial clone is refused.
+//                config and with GIT_NO_LAZY_FETCH=1, and only reads it. A
+//                partial clone (one with a promisor remote, as git clone
+//                --filter makes) is refused, with any git version: it can
+//                lack objects the check reads. Use a full clone there, or
+//                --repo or --url.
 // Comparison:
 //   --base       the commit of the last check (default: the record's
 //                verified_sha). Without a record the baseline is the cited
