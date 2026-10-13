@@ -28,6 +28,8 @@ export const DEFAULT_KNOWN_BOT_LOGINS: readonly string[] = [
 ];
 
 export const DEFAULT_DAILY_REVIEW_BUDGET = 40;
+export const DEFAULT_MAX_AUTOMATIC_REVIEWS_PER_PR = 3;
+export const DEFAULT_PUSH_REVIEW_DELAY_SECONDS = 300;
 export const DEFAULT_RUN_BUDGET_MINUTES = 90;
 export const DEFAULT_HEARTBEAT_STALE_MINUTES = 12;
 
@@ -70,6 +72,10 @@ export interface ReceiverConfig {
   readonly safetyModelId: string;
   /** Automatic reviews per route per UTC day. 0 pauses automatic reviews. */
   readonly dailyReviewBudget: number;
+  /** Automatic reviews one pull request can get, the first one included. @mentions do not count. */
+  readonly maxAutomaticReviewsPerPr: number;
+  /** How long a review of new commits waits in the queue, so a burst of pushes gets one review. */
+  readonly pushReviewDelaySeconds: number;
 }
 
 export interface InvokerConfig {
@@ -88,13 +94,15 @@ function required(env: Env, name: string): string {
   return value;
 }
 
-function integer(env: Env, name: string, fallback: number, min: number): number {
+function integer(env: Env, name: string, fallback: number, min: number, max?: number): number {
   const raw = env[name]?.trim();
   if (!raw) return fallback;
-  if (!/^\d+$/.test(raw) || Number(raw) < min || !Number.isSafeInteger(Number(raw))) {
-    throw new Error(`${name} must be an integer >= ${min} (got ${JSON.stringify(raw)})`);
+  const value = Number(raw);
+  if (!/^\d+$/.test(raw) || value < min || (max !== undefined && value > max) || !Number.isSafeInteger(value)) {
+    const range = max === undefined ? `>= ${min}` : `from ${min} to ${max}`;
+    throw new Error(`${name} must be an integer ${range} (got ${JSON.stringify(raw)})`);
   }
-  return Number(raw);
+  return value;
 }
 
 function jsonObject(env: Env, name: string, fallback?: string): Record<string, unknown> {
@@ -183,6 +191,9 @@ export function loadReceiverConfig(env: Env): ReceiverConfig {
     ...(installationId ? { installationId: Number(installationId) } : {}),
     safetyModelId: required(env, 'HAIKU_MODEL_ID'),
     dailyReviewBudget: integer(env, 'DAILY_REVIEW_BUDGET', DEFAULT_DAILY_REVIEW_BUDGET, 0),
+    maxAutomaticReviewsPerPr: integer(env, 'MAX_AUTOMATIC_REVIEWS_PER_PR', DEFAULT_MAX_AUTOMATIC_REVIEWS_PER_PR, 1, 20),
+    // SQS takes a per-message delay of at most 900 seconds.
+    pushReviewDelaySeconds: integer(env, 'PUSH_REVIEW_DELAY_SECONDS', DEFAULT_PUSH_REVIEW_DELAY_SECONDS, 0, 900),
   };
 }
 

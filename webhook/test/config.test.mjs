@@ -25,6 +25,8 @@ const base = {
 test('a minimal receiver environment gets the documented defaults', () => {
   const config = loadReceiverConfig(base);
   assert.equal(config.dailyReviewBudget, 40);
+  assert.equal(config.maxAutomaticReviewsPerPr, 3);
+  assert.equal(config.pushReviewDelaySeconds, 300);
   assert.equal(config.installationId, undefined);
   assert.equal(config.curatorQueueUrl, '');
   assert.equal(config.curatorRoutes.size, 0);
@@ -70,6 +72,30 @@ test('the daily budget accepts 0 and rejects anything but a non-negative integer
   assert.equal(loadReceiverConfig({ ...base, DAILY_REVIEW_BUDGET: '7' }).dailyReviewBudget, 7);
   for (const bad of ['-1', '1.5', 'many', '1e3']) {
     assert.throws(() => loadReceiverConfig({ ...base, DAILY_REVIEW_BUDGET: bad }), /DAILY_REVIEW_BUDGET/, bad);
+  }
+});
+
+test('automatic reviews per PR range from 1 to 20', () => {
+  assert.equal(loadReceiverConfig({ ...base, MAX_AUTOMATIC_REVIEWS_PER_PR: '1' }).maxAutomaticReviewsPerPr, 1);
+  assert.equal(loadReceiverConfig({ ...base, MAX_AUTOMATIC_REVIEWS_PER_PR: '20' }).maxAutomaticReviewsPerPr, 20);
+  for (const bad of ['0', '21', '-1', '2.5', 'three']) {
+    assert.throws(
+      () => loadReceiverConfig({ ...base, MAX_AUTOMATIC_REVIEWS_PER_PR: bad }),
+      /MAX_AUTOMATIC_REVIEWS_PER_PR must be an integer from 1 to 20/,
+      bad,
+    );
+  }
+});
+
+test('the push review delay ranges from 0 to 900 seconds, the SQS maximum', () => {
+  assert.equal(loadReceiverConfig({ ...base, PUSH_REVIEW_DELAY_SECONDS: '0' }).pushReviewDelaySeconds, 0);
+  assert.equal(loadReceiverConfig({ ...base, PUSH_REVIEW_DELAY_SECONDS: '900' }).pushReviewDelaySeconds, 900);
+  for (const bad of ['901', '-5', '1e2', '5m']) {
+    assert.throws(
+      () => loadReceiverConfig({ ...base, PUSH_REVIEW_DELAY_SECONDS: bad }),
+      /PUSH_REVIEW_DELAY_SECONDS must be an integer from 0 to 900/,
+      bad,
+    );
   }
 });
 
