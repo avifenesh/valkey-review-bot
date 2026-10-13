@@ -2,6 +2,29 @@
 // the operator scripts. Reads go through an `aws` runner (aws-cli.mjs),
 // so tests can pass a fake.
 
+import { scanItems } from './aws-cli.mjs';
+
+/** Every graduated_record_name in a concerns table, tombstones included. */
+export function graduatedNames(aws, table) {
+  const items = scanItems(aws, table, {
+    projection: '#grn',
+    filter: 'attribute_exists(#grn)',
+    names: { '#grn': 'graduated_record_name' },
+  });
+  return new Set(items.map((i) => i.graduated_record_name).filter((n) => typeof n === 'string' && n));
+}
+
+/**
+ * Registry record summaries that are not retired and that no concern
+ * record names: the skills whose source record the decay job deleted
+ * before graduated records were kept. Sorted by name.
+ */
+export function findOrphans(summaries, referenced, isRetired) {
+  return summaries
+    .filter((r) => !isRetired(r.status) && !referenced.has(r.name))
+    .sort((a, b) => (a.name ?? '').localeCompare(b.name ?? '') || (a.recordId ?? '').localeCompare(b.recordId ?? ''));
+}
+
 /**
  * The record id `deprecate` acts on: the one given, which must exist,
  * or the only record with the name that is not already retired. Throws
