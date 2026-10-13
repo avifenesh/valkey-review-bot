@@ -434,7 +434,10 @@ describe('numbers', () => {
 
   test.each(['applyEdits', 'retireSkills', 'openPullRequests'])('skillLifecycle.%s is a boolean', (key) => {
     expect(problems(withSetting(`skillLifecycle.${key}`, 'true'))).toContain(`skillLifecycle.${key} must be true or false`);
-    expect(setting(parseDeploymentConfig(withSetting(`skillLifecycle.${key}`, true)), `skillLifecycle.${key}`)).toBe(true);
+    // openPullRequests needs a skills repository to open them against.
+    const on = withSetting(`skillLifecycle.${key}`, true);
+    if (key === 'openPullRequests') on.skillsRepo = { repo: 'example-org/valkey-review-bot' };
+    expect(setting(parseDeploymentConfig(on), `skillLifecycle.${key}`)).toBe(true);
   });
 
   test('skillLifecycle rejects unknown keys', () => {
@@ -520,6 +523,17 @@ describe('skillsRepo', () => {
     '',
   ])('signOff %j is rejected', (signOff) => {
     expect(problems(withSkillsRepo({ repo: 'example-org/x', signOff }))).toContain('skillsRepo.signOff must be one line of the form "Name <email>"');
+  });
+
+  test.each(['\u00a0\u00a0 <jane@example.com>', '\u3000 <jane@example.com>', 'Jane\u00a0 <jane@example.com>', '\u00a0Jane <jane@example.com>'])(
+    'signOff %j with only whitespace or Unicode spaces at the ends of the name is rejected', (signOff) => {
+      expect(problems(withSkillsRepo({ repo: 'example-org/x', signOff })))
+        .toContain('skillsRepo.signOff has whitespace at either end of the name, or a name that is only whitespace');
+    });
+
+  test('openPullRequests without skillsRepo is rejected', () => {
+    expect(problems(withChange((raw) => { delete raw.skillsRepo; raw.skillLifecycle = { ...(raw.skillLifecycle ?? {}), openPullRequests: true }; })))
+      .toContain('skillLifecycle.openPullRequests is true but skillsRepo is not set, so there is no repository to open pull requests against');
   });
 
   test('appSecretName is a secret name', () => {

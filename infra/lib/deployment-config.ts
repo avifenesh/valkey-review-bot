@@ -432,6 +432,9 @@ export function parseDeploymentConfig(raw: unknown, env: { readonly CDK_DEFAULT_
   const decay = parseDecay(r, top.decay);
   const skillLifecycle = parseSkillLifecycle(r, top.skillLifecycle);
   const skillsRepo = top.skillsRepo === undefined ? undefined : parseSkillsRepo(r, top.skillsRepo, github.appSecretName);
+  if (skillLifecycle.openPullRequests && skillsRepo === undefined) {
+    r.fail('skillLifecycle.openPullRequests', 'is true but skillsRepo is not set, so there is no repository to open pull requests against');
+  }
 
   const dailyReviewBudget = r.number(top.dailyReviewBudget, 'dailyReviewBudget', { fallback: 40, min: 0, max: 10_000, integer: true });
   // The receiver enforces the same ranges (webhook/src/config.ts); SQS
@@ -492,6 +495,12 @@ function parseSkillsRepo(r: Reader, value: unknown, defaultSecretName: string): 
   const signOff = o.signOff === undefined ? undefined : r.string(o.signOff, 'skillsRepo.signOff', {
     pattern: SIGN_OFF, hint: 'one line of the form "Name <email>"',
   });
+  // The curator trims the value and checks it again at boot; a name that is
+  // only Unicode whitespace would pass SIGN_OFF here and stop it from booting.
+  const signOffName = signOff === undefined ? '' : signOff.slice(0, signOff.lastIndexOf(' <'));
+  if (signOff !== undefined && (signOffName.trim() !== signOffName || signOffName.trim() === '')) {
+    r.fail('skillsRepo.signOff', 'has whitespace at either end of the name, or a name that is only whitespace');
+  }
   return {
     repo: r.string(o.repo, 'skillsRepo.repo', { pattern: REPO, hint: 'owner/name of the bot repository' }),
     baseBranch: r.string(o.baseBranch, 'skillsRepo.baseBranch', { pattern: BRANCH, hint: 'a branch name', fallback: 'main' }),

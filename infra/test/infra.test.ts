@@ -565,6 +565,7 @@ describe('decay', () => {
       ...fixture(),
       decay: { halfLifeDays: 10, floor: 0.1, graduatedHalfLifeDays: 365 },
       upstreamRepos: { 'valkey-review': '' },
+      skillsRepo: { repo: 'example-org/valkey-review-bot' },
       skillLifecycle: {
         checksPerDay: 0, recheckDays: 30, retireSkills: true, maxRetirementsPerDay: 7, retireRefusedBackoffDays: 14,
         applyEdits: true, openPullRequests: true, maxCheckRounds: 60,
