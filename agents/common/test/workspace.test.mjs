@@ -7,7 +7,7 @@ import test from 'node:test';
 import './support/ts-resolve.mjs';
 
 const { findStateComment, gitProcessEnv, maintainedReleaseLines, parseReleaseBranches, renderPrOverview, MAINTAINED_WINDOW_DAYS } = await import('../src/workspace.ts');
-const { STATE_MARKER } = await import('../src/review-state.ts');
+const { reviewStateSchema, STATE_MARKER, validateReviewState } = await import('../src/review-state.ts');
 
 test('release branches are picked out of ls-remote output', () => {
   const output = [
@@ -147,13 +147,25 @@ test('long comment lists keep the newest entries and say how many are shown', ()
 test('the release-line section covers fetched, empty, and failed states', () => {
   const fetched = renderPrOverview(baseCtx);
   assert.match(fetched, /Release branches of valkey-io\/valkey with a commit in the last 180 days\. This is a heuristic/);
-  assert.match(fetched, /`upstream\/9\.0` \(last commit 2026-09-21\)/);
+  assert.match(fetched, /`9\.0` \(ref `upstream\/9\.0`, last commit 2026-09-21\)/);
 
   const empty = renderPrOverview({ ...baseCtx, releaseLines: [] });
   assert.match(empty, /no release branch of valkey-io\/valkey has a commit in the last 180 days/);
 
   const failed = renderPrOverview({ ...baseCtx, releaseLines: null });
   assert.match(failed, /could not be fetched this run: set the backport verdict to `unclear`/);
+});
+
+test('release lines are listed by the names backport.branches accepts', () => {
+  const releaseLines = [{ branch: '9.0', lastCommit: '2026-09-21' }, { branch: '8.1', lastCommit: '2026-09-01' }];
+  const overview = renderPrOverview({ ...baseCtx, releaseLines });
+  const listed = [...overview.matchAll(/`([^`]+)` \(ref `upstream\/\1`/g)].map((m) => m[1]);
+  assert.deepEqual(listed, ['9.0', '8.1']);
+  const state = reviewStateSchema.parse({
+    status: 'needs_work', summary: 's', risk: 'low', risk_reason: 'r',
+    backport: { verdict: 'needed', branches: listed, reason: 'r' },
+  });
+  assert.equal(validateReviewState(state, releaseLines.map((r) => r.branch)), null);
 });
 
 test('the previous state is shown without its marker', () => {

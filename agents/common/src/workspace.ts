@@ -435,8 +435,8 @@ export function renderPrOverview(ctx: PrContext): string {
   } else if (ctx.releaseLines.length === 0) {
     lines.push(`(no release branch of ${ctx.upstreamRepo} has a commit in the last ${MAINTAINED_WINDOW_DAYS} days, so none is treated as maintained: use a backport verdict of \`not_needed\` or \`unclear\`)`);
   } else {
-    lines.push(`Release branches of ${ctx.upstreamRepo} with a commit in the last ${MAINTAINED_WINDOW_DAYS} days. This is a heuristic for "still maintained", not the project's support policy. Check each of them, and name only these in \`backport.branches\`.`);
-    lines.push(ctx.releaseLines.map((r) => `\`upstream/${r.branch}\` (last commit ${r.lastCommit})`).join(', '));
+    lines.push(`Release branches of ${ctx.upstreamRepo} with a commit in the last ${MAINTAINED_WINDOW_DAYS} days. This is a heuristic for "still maintained", not the project's support policy. Check each of them through its \`upstream/\` ref, and name only these in \`backport.branches\`, without the \`upstream/\` prefix.`);
+    lines.push(ctx.releaseLines.map((r) => `\`${r.branch}\` (ref \`upstream/${r.branch}\`, last commit ${r.lastCommit})`).join(', '));
   }
   lines.push('');
   lines.push('## Your previous review state');
