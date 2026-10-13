@@ -26,7 +26,12 @@
 //                in a temporary directory deleted afterwards.
 //   --url        the same from any https:// URL without credentials, or file://.
 //   --checkout   the committed tree at --rev (default HEAD) of a clone you
-//                already have; it is only read, never fetched or changed.
+//                already have. Git runs there without your global and system
+//                config and with GIT_NO_LAZY_FETCH=1: it reads only the objects
+//                the clone has and writes nothing to it. In a partial clone
+//                (one with a promisor remote) a missing object is an error, so
+//                check out --rev and --base there first; git before 2.44
+//                ignores GIT_NO_LAZY_FETCH, so a partial clone is refused.
 // Comparison:
 //   --base       the commit of the last check (default: the record's
 //                verified_sha). Without a record the baseline is the cited
