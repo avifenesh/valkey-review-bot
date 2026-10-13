@@ -64,6 +64,22 @@ test('configuration is validated', () => {
   }
 });
 
+/** The attributes a scan's ProjectionExpression names, or null when it projects everything. */
+function projectedAttributes(input) {
+  if (!input.ProjectionExpression) return null;
+  return input.ProjectionExpression.split(',').map((token) => {
+    const name = token.trim();
+    return name.startsWith('#') ? input.ExpressionAttributeNames[name] : name;
+  });
+}
+
+/** Each item as DynamoDB returns it under the scan's projection. */
+function project(items, input) {
+  const attributes = projectedAttributes(input);
+  if (!attributes || !items) return items;
+  return items.map((item) => Object.fromEntries(Object.entries(item).filter(([attr]) => attributes.includes(attr))));
+}
+
 function fakeDdb(pages, onWrite = () => ({})) {
   const writes = [];
   return {
@@ -72,7 +88,7 @@ function fakeDdb(pages, onWrite = () => ({})) {
       const op = command.constructor.name;
       if (op === 'ScanCommand') {
         const index = command.input.ExclusiveStartKey?.page ?? 0;
-        return { Items: pages[index], LastEvaluatedKey: index + 1 < pages.length ? { page: index + 1 } : undefined };
+        return { Items: project(pages[index], command.input), LastEvaluatedKey: index + 1 < pages.length ? { page: index + 1 } : undefined };
       }
       writes.push({ op, input: command.input });
       return onWrite(op, command.input);
@@ -197,7 +213,7 @@ test('tombstones of retired skills get no write', async () => {
   assert.equal(ddb.writes.length, 0);
 });
 
-test('the scan reads the lifecycle attributes it needs', async () => {
+test('the scan projects exactly the attributes the pass reads', async () => {
   const ddb = fakeDdb([[]]);
   const scans = [];
   const send = ddb.send.bind(ddb);
@@ -206,11 +222,22 @@ test('the scan reads the lifecycle attributes it needs', async () => {
     return send(command);
   };
   await decayTable(ddb, 'concerns', LIFECYCLE, NOW);
-  const names = scans[0].ExpressionAttributeNames;
-  const projected = scans[0].ProjectionExpression.split(', ').map((n) => names[n]);
-  for (const attr of ['area_bucket', 'record_id', 'decay_score', 'updated_at', 'decayed_at', 'graduated_record_name', 'retired_at']) {
-    assert.ok(projected.includes(attr), attr);
-  }
+  // The fake returns only projected attributes, as DynamoDB does, so an
+  // attribute dropped here also changes what the other tests see.
+  assert.deepEqual(projectedAttributes(scans[0]).sort(), [
+    'area_bucket',
+    'decay_score',
+    'decayed_at',
+    'graduated_at',
+    'graduated_record_name',
+    'maintenance_requested_at',
+    'obsolete_release',
+    'record_id',
+    'retired_at',
+    'updated_at',
+    'verified_at',
+    'verified_release',
+  ]);
 });
 
 // Skill maintenance: retire and check requests on the curator queue.
