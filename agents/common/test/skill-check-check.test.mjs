@@ -209,6 +209,31 @@ test('without a base nothing is touched; a base that is given but unusable makes
   r.cleanup();
 });
 
+test('a checkout that could not fetch the base is incomplete; one whose base is gone gives a presence check', async () => {
+  const r = repo({ 'a.c': 'int rare_co_name = 1;\n' }, { 'a.c': 'int rare_co_name = 2;\n' });
+  const calls = [];
+  const git = (args, opts) => {
+    calls.push(args.find((a, i) => !a.startsWith('-') && args[i - 1] !== '-c'));
+    return r.git(args, opts);
+  };
+  const check = (checkout) => checkSkill(git, { names: names('`rare_co_name`'), baseline: ['rare_co_name'], baseSha: r.baseSha, checkout });
+
+  const failed = await check({ baseAvailable: false, baseGone: false });
+  assert.deepEqual(failed.incomplete, [`the base commit ${r.baseSha} could not be fetched, so the diff since it was not examined`]);
+  assert.deepEqual([failed.compared, failed.baseGone, failed.clean, failed.touched], [false, false, false, []]);
+  assert.equal(confirmableCommit(failed), null);
+  assert.deepEqual(calls.filter((c) => c === 'diff' || c === 'cat-file'), [], 'git was asked about the base');
+
+  const gone = await check({ baseAvailable: false, baseGone: true });
+  assert.deepEqual([gone.compared, gone.baseGone, gone.incomplete, gone.touched, gone.clean], [false, true, [], [], true]);
+  assert.equal(confirmableCommit(gone), r.tipSha);
+  assert.deepEqual(calls.filter((c) => c === 'diff' || c === 'cat-file'), [], 'git was asked about a base that is gone');
+
+  const fetched = await check({ baseAvailable: true, baseGone: false });
+  assert.deepEqual([fetched.compared, fetched.baseGone, fetched.touched, fetched.incomplete], [true, false, ['rare_co_name'], []]);
+  r.cleanup();
+});
+
 test('only a complete result gives a commit to record as verified', async () => {
   const r = repo({ 'a.c': 'int rare_q_name = 1;\n' }, { 'a.c': 'int rare_q_name = 2;\n' });
   const n = names('`rare_q_name` `absent_q_name`');

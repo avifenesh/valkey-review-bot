@@ -217,6 +217,16 @@ export interface UpstreamCheckout {
    * is not a full SHA, or its fetch failed, timed out or could not start.
    */
   readonly baseAvailable: boolean;
+  /**
+   * The remote answered that it does not have verifiedSha ("not our
+   * ref" and the like, naming that SHA), as after a force-push or a
+   * history rewrite: it will not come back. False on a timeout, a
+   * network error, a failed blob batch or any other failure, which may
+   * pass, and whenever baseAvailable is true or no base was asked for.
+   * Only this makes a check without the base one that may confirm; see
+   * checkSkill's `checkout` input.
+   */
+  readonly baseGone: boolean;
   /** A runner in the checkout, with the same environment. The checkout is no longer a partial clone. */
   readonly git: GitRunner;
 }
@@ -244,21 +254,38 @@ function parseLsRemote(out: string): { head: string | null; refs: Map<string, st
   return { head, refs };
 }
 
-/** Run a best-effort git step: true when it exits 0, false on any failure, timeout or spawn error. */
-async function tryRun(git: GitRunner, args: readonly string[], timeoutMs: number): Promise<boolean> {
+/** Run a best-effort git step: its result, or null when the runner throws (a timeout, a signal, a spawn error). */
+async function tryRun(git: GitRunner, args: readonly string[], timeoutMs: number): Promise<GitResult | null> {
   try {
-    return (await git(args, { timeoutMs })).code === 0;
+    return await git(args, { timeoutMs });
   } catch {
-    return false;
+    return null;
   }
+}
+
+/**
+ * How git reports that the remote has no object `sha` to give: upload-pack's
+ * "not our ref" (protocol v2, and v0 when reachable SHAs may be asked for),
+ * the client's "unadvertised object" (v0 otherwise), and the ref lookups
+ * older git versions fall back to. Only on a line of git's own, which
+ * starts with "fatal:" or "error:"; what the server sends on the side
+ * band starts with "remote:".
+ */
+function remoteLacks(stderr: string, sha: string): boolean {
+  return stderr.split('\n').some((line) => {
+    const m = /^(?:fatal|error): .*(?:not our ref|unadvertised object|couldn't find remote ref|no such remote ref) ([0-9a-f]{40}|[0-9a-f]{64})$/.exec(line.trimEnd());
+    return m !== null && m[1] === sha;
+  });
 }
 
 /**
  * Create the checkout: init, register origin as a promisor remote with
  * blob:none, find the branch and its tip with ls-remote, fetch the tip
  * at depth 1 without blobs and check it out detached. Then, best effort,
- * fetch verifiedSha the same way and its blobs of the changed files.
- * Last, drop the promisor settings, so later commands never fetch.
+ * fetch verifiedSha the same way and its blobs of the changed files; when
+ * that fetch fails, tell a base the remote no longer has (baseGone) from
+ * a failure that may pass. Last, drop the promisor settings, so later
+ * commands never fetch.
  */
 export async function prepareUpstreamCheckout(opts: PrepareOptions): Promise<UpstreamCheckout> {
   checkUrl(opts.url);
@@ -290,13 +317,20 @@ export async function prepareUpstreamCheckout(opts: PrepareOptions): Promise<Ups
   await mustRun(git, ['-c', 'advice.detachedHead=false', 'checkout', '-q', '--detach', '--force', tipSha]);
 
   let baseFetched = false;
+  let baseGone = false;
   const base = opts.verifiedSha;
   if (base !== undefined && SHA_RE.test(base)) {
     const timeoutMs = opts.baseTimeoutMs ?? BASE_TIMEOUT_MS;
-    baseFetched = base === tipSha || (
-      await tryRun(git, [...fetchArgs, base], timeoutMs)
+    if (base === tipSha) {
+      baseFetched = true;
+    } else {
+      const fetched = await tryRun(git, [...fetchArgs, base], timeoutMs);
       // A diff that reads blobs fetches the missing ones (the base side of each changed file) in one batch.
-      && await tryRun(git, ['diff', '--shortstat', '--no-renames', '--no-ext-diff', '--no-textconv', base, tipSha], timeoutMs));
+      baseFetched = fetched?.code === 0
+        && (await tryRun(git, ['diff', '--shortstat', '--no-renames', '--no-ext-diff', '--no-textconv', base, tipSha], timeoutMs))?.code === 0;
+      // The tip came from the same remote moments ago, so this is its answer, not a network failure.
+      baseGone = fetched !== null && fetched.code !== 0 && remoteLacks(fetched.stderr, base);
+    }
   }
 
   // No longer a partial clone. Git before 2.44 ignores GIT_NO_LAZY_FETCH, and a
@@ -309,7 +343,7 @@ export async function prepareUpstreamCheckout(opts: PrepareOptions): Promise<Ups
 
   // The fetch's result decides; the probe only confirms, and can no longer fetch.
   const baseAvailable = baseFetched && (await git(['cat-file', '-e', `${base}^{commit}`])).code === 0;
-  return { defaultBranch: branch, tipSha, baseAvailable, git };
+  return { defaultBranch: branch, tipSha, baseAvailable, baseGone, git };
 }
 
 /** Delete a checkout directory. Refuses a relative path or a filesystem root. */

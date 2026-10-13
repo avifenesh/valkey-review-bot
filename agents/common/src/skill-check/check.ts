@@ -22,14 +22,23 @@ export interface CheckInput {
   /** Names an earlier audit judged accurate although absent (ignored_names). */
   readonly ignored?: readonly string[];
   /**
-   * Commit of the last check, to diff against. Pass it only when
-   * prepareUpstreamCheckout reported baseAvailable. One that is not a
-   * full SHA or not in the repository makes the result incomplete.
-   * Without it (no earlier check, or a base the remote no longer has,
-   * as after a force-push) the result is a presence check only:
-   * `compared` is false and `touched` empty.
+   * Commit of the last check (verified_sha), to diff against. One that
+   * is not a full SHA or not in the repository makes the result
+   * incomplete. Without it (no earlier check) the result is a presence
+   * check only: `compared` is false and `touched` empty.
    */
   readonly baseSha?: string;
+  /**
+   * What prepareUpstreamCheckout said about baseSha, for a check of its
+   * checkout: pass the checkout. With baseAvailable the diff is examined.
+   * With baseGone (the remote no longer has the base, as after a
+   * force-push) the result is a presence check only, which may confirm.
+   * Otherwise (a timeout or a network error, which may pass) the result
+   * is incomplete, and git is not asked for a diff whose blobs may be
+   * missing. Leave it out for a clone of your own, where baseSha is
+   * looked up as it is.
+   */
+  readonly checkout?: { readonly baseAvailable: boolean; readonly baseGone: boolean };
   /** The commit to check: HEAD by default, or any revision that names a commit (a full SHA, a tag). */
   readonly rev?: string;
 }
@@ -74,6 +83,8 @@ export interface CheckResult {
   readonly clean: boolean;
   /** The base was available and diffed; without it `touched` is empty. */
   readonly compared: boolean;
+  /** A base was given, and `checkout` said the remote no longer has it: a presence check only, which may confirm. */
+  readonly baseGone: boolean;
   /** Files changed between the base and the commit. */
   readonly changedFiles: number;
   /** The diff of the candidate files passed DIFF_MAX_BYTES, so `touched` may be incomplete. */
@@ -82,9 +93,9 @@ export interface CheckResult {
   readonly candidatesCapped: boolean;
   /**
    * Why `touched` may be incomplete, one line each: a capped candidate
-   * list, a truncated diff, a base that was given but is missing. Empty
-   * when the whole diff was examined, or none was asked for. See
-   * confirmableCommit.
+   * list, a truncated diff, a base that was given but is missing or
+   * could not be fetched. Empty when the whole diff was examined, or
+   * none was asked for. See confirmableCommit.
    */
   readonly incomplete: readonly string[];
 }
@@ -94,7 +105,11 @@ export interface CheckResult {
  * on a check: `result.commit`, or null when the result is incomplete.
  * On null the verification never moves, whatever an audit concludes,
  * because the hunks nobody examined would otherwise never be checked:
- * the next check diffs from the same base again.
+ * the next check diffs from the same base again. A check of a fresh
+ * checkout therefore passes baseSha and `checkout` whenever there is a
+ * verified_sha: a base that could not be fetched is then incomplete,
+ * and only one the remote no longer has (baseGone) gives a presence
+ * check that confirms.
  */
 export function confirmableCommit(result: CheckResult): string | null {
   return result.incomplete.length === 0 ? result.commit : null;
@@ -454,6 +469,7 @@ export async function checkSkill(git: GitRunner, input: CheckInput): Promise<Che
   const keptFraction = baseline.length === 0 ? 1 : (baseline.length - lost.length) / baseline.length;
 
   let compared = false;
+  let baseGone = false;
   let changedFiles = 0;
   let diffTruncated = false;
   let candidatesCapped = false;
@@ -461,8 +477,13 @@ export async function checkSkill(git: GitRunner, input: CheckInput): Promise<Che
   const touched: string[] = [];
   const excerpts: DiffExcerpt[] = [];
   const base = input.baseSha;
+  const checkout = input.checkout;
   if (base !== undefined && !SHA_RE.test(base)) {
     incomplete.push(`the base ${JSON.stringify(base)} is not a full commit SHA, so no diff was examined`);
+  } else if (base !== undefined && checkout && !checkout.baseAvailable && checkout.baseGone) {
+    baseGone = true;
+  } else if (base !== undefined && checkout && !checkout.baseAvailable) {
+    incomplete.push(`the base commit ${base} could not be fetched, so the diff since it was not examined`);
   } else if (base !== undefined && (await git(['cat-file', '-e', `${base}^{commit}`])).code !== 0) {
     incomplete.push(`the base commit ${base} is not in the repository, so the diff since it was not examined`);
   } else if (base !== undefined) {
@@ -555,6 +576,7 @@ export async function checkSkill(git: GitRunner, input: CheckInput): Promise<Che
     keptFraction,
     clean: lost.length === 0 && newAbsent.length === 0 && touched.length === 0 && incomplete.length === 0,
     compared,
+    baseGone,
     changedFiles,
     diffTruncated,
     candidatesCapped,

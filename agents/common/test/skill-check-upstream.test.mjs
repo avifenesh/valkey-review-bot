@@ -63,20 +63,31 @@ const REAL_GIT = execFileSync('sh', ['-c', 'command -v git'], { encoding: 'utf8'
  * ignores it, and fails (mode 'fail') or stalls (mode 'stall') any fetch
  * that names `base`. In mode 'stall-writer' the stalled fetch also starts
  * a child that appends a line to `root`/writer.log every 100 ms for 10 s.
+ * In mode 'say' that fetch prints `stderr` and exits 128. In mode
+ * 'blobs-fail' the fetch works and the diff that fetches the base's
+ * blobs exits 128.
  */
-function oldGitEnv(root, base, mode) {
+function oldGitEnv(root, base, mode, stderr = '') {
   const bin = path.join(root, 'bin');
   mkdirSync(bin);
   writeFileSync(path.join(bin, 'git'), [
     '#!/bin/sh',
     'unset GIT_NO_LAZY_FETCH',
-    'if [ "$1" = fetch ]; then',
+    'if [ "$1" = diff ] && [ "$2" = --shortstat ] && [ "$SKC_MODE" = blobs-fail ]; then',
+    '  echo "fatal: simulated blob batch failure" >&2',
+    '  exit 128',
+    'fi',
+    'if [ "$1" = fetch ] && [ "$SKC_MODE" != blobs-fail ]; then',
     '  for a in "$@"; do',
     '    if [ "$a" = "$SKC_BASE" ]; then',
     '      [ "$SKC_MODE" = stall ] && exec sleep 30',
     '      if [ "$SKC_MODE" = stall-writer ]; then',
     '        ( i=0; while [ $i -lt 100 ]; do echo x >> "$SKC_WRITER_LOG"; i=$((i + 1)); sleep 0.1; done ) &',
     '        exec sleep 30',
+    '      fi',
+    '      if [ "$SKC_MODE" = say ]; then',
+    '        printf \'%s\\n\' "$SKC_STDERR" >&2',
+    '        exit 128',
     '      fi',
     '      echo "fatal: simulated network failure" >&2',
     '      exit 128',
@@ -88,7 +99,7 @@ function oldGitEnv(root, base, mode) {
   ].join('\n'), { mode: 0o755 });
   return {
     ...upstreamGitEnv(), PATH: `${bin}:${process.env.PATH}`,
-    SKC_BASE: base, SKC_MODE: mode, SKC_REAL_GIT: REAL_GIT, SKC_WRITER_LOG: path.join(root, 'writer.log'),
+    SKC_BASE: base, SKC_MODE: mode, SKC_STDERR: stderr, SKC_REAL_GIT: REAL_GIT, SKC_WRITER_LOG: path.join(root, 'writer.log'),
   };
 }
 
@@ -99,6 +110,7 @@ test('the checkout finds the default branch, fetches tip and base at depth 1 and
   assert.equal(co.defaultBranch, 'unstable');
   assert.equal(co.tipSha, up.tipSha);
   assert.equal(co.baseAvailable, true);
+  assert.equal(co.baseGone, false);
 
   const g = gitIn(dir);
   assert.equal(g('rev-parse', 'HEAD'), up.tipSha);
@@ -132,6 +144,7 @@ test('a failed base fetch gives baseAvailable false even where git ignores GIT_N
   const env = oldGitEnv(up.root, up.baseSha, 'fail');
   const co = await prepareUpstreamCheckout({ dir: path.join(up.root, 'checkout'), url: up.url, verifiedSha: up.baseSha, env });
   assert.equal(co.baseAvailable, false);
+  assert.equal(co.baseGone, false, 'a network failure is not a base the remote dropped');
   assert.equal(co.tipSha, up.tipSha);
   // The same old git does not fetch the base when asked for it later.
   assert.notEqual((await co.git(['cat-file', '-e', `${up.baseSha}^{commit}`])).code, 0);
@@ -145,6 +158,7 @@ test('a base fetch that stalls times out to baseAvailable false and the checkout
   const co = await prepareUpstreamCheckout({ dir: path.join(up.root, 'checkout'), url: up.url, verifiedSha: up.baseSha, env, baseTimeoutMs: 500 });
   assert.ok(Date.now() - started < 10_000);
   assert.equal(co.baseAvailable, false);
+  assert.equal(co.baseGone, false, 'a timeout is not a base the remote dropped');
   assert.equal(gitIn(path.join(up.root, 'checkout'))('rev-parse', 'HEAD'), up.tipSha);
   await removeCheckout(up.root);
 });
@@ -165,11 +179,12 @@ test('a base fetch that times out is killed with everything it started', { timeo
   await removeCheckout(up.root);
 });
 
-test('an unknown verified SHA leaves baseAvailable false and still checks out the tip', async () => {
+test('an unknown verified SHA is gone, and the tip is still checked out', async () => {
   const up = makeUpstream();
   const dir = path.join(up.root, 'checkout');
   const co = await prepareUpstreamCheckout({ dir, url: up.url, verifiedSha: 'f'.repeat(40) });
   assert.equal(co.baseAvailable, false);
+  assert.equal(co.baseGone, true);
   assert.equal(co.tipSha, up.tipSha);
   assert.equal(gitIn(dir)('rev-parse', 'HEAD'), up.tipSha);
   await removeCheckout(up.root);
@@ -178,9 +193,9 @@ test('an unknown verified SHA leaves baseAvailable false and still checks out th
 test('without a verified SHA there is no base; a malformed one is not fetched', async () => {
   const up = makeUpstream();
   const a = await prepareUpstreamCheckout({ dir: path.join(up.root, 'a'), url: up.url });
-  assert.equal(a.baseAvailable, false);
+  assert.deepEqual([a.baseAvailable, a.baseGone], [false, false]);
   const b = await prepareUpstreamCheckout({ dir: path.join(up.root, 'b'), url: up.url, verifiedSha: '--upload-pack=touch /tmp/x' });
-  assert.equal(b.baseAvailable, false);
+  assert.deepEqual([b.baseAvailable, b.baseGone], [false, false]);
   await removeCheckout(up.root);
 });
 
@@ -188,6 +203,79 @@ test('the tip itself as the verified SHA counts as available', async () => {
   const up = makeUpstream();
   const co = await prepareUpstreamCheckout({ dir: path.join(up.root, 'c'), url: up.url, verifiedSha: up.tipSha });
   assert.equal(co.baseAvailable, true);
+  assert.equal(co.baseGone, false);
+  await removeCheckout(up.root);
+});
+
+test('a base a force-push dropped is gone once the upstream pruned it', async () => {
+  const up = makeUpstream();
+  const b = gitIn(new URL(up.url).pathname);
+  // The side branch was the only ref holding sideSha. Without it the
+  // commit is still in the upstream's objects, and it is still served.
+  b('update-ref', '-d', 'refs/heads/side');
+  const kept = await prepareUpstreamCheckout({ dir: path.join(up.root, 'kept'), url: up.url, verifiedSha: up.sideSha });
+  assert.deepEqual([kept.baseAvailable, kept.baseGone], [true, false]);
+  b('reflog', 'expire', '--expire=now', '--all');
+  b('gc', '-q', '--prune=now');
+  assert.throws(() => b('cat-file', '-e', up.sideSha), 'the upstream still has the commit');
+  const co = await prepareUpstreamCheckout({ dir: path.join(up.root, 'checkout'), url: up.url, verifiedSha: up.sideSha });
+  assert.deepEqual([co.baseAvailable, co.baseGone], [false, true]);
+  await removeCheckout(up.root);
+});
+
+test('over protocol v0, a base no branch reaches any more is gone', async () => {
+  const up = makeUpstream();
+  const b = gitIn(new URL(up.url).pathname);
+  b('config', '--unset', 'uploadpack.allowAnySHA1InWant');
+  b('config', 'uploadpack.allowReachableSHA1InWant', 'true');
+  // The commit stays in the upstream's objects, but nothing reaches it.
+  b('update-ref', '-d', 'refs/heads/side');
+  assert.doesNotThrow(() => b('cat-file', '-e', up.sideSha));
+  const env = { ...upstreamGitEnv(), GIT_CONFIG_COUNT: '1', GIT_CONFIG_KEY_0: 'protocol.version', GIT_CONFIG_VALUE_0: '0' };
+  const co = await prepareUpstreamCheckout({ dir: path.join(up.root, 'checkout'), url: up.url, verifiedSha: up.sideSha, env });
+  assert.equal(co.tipSha, up.tipSha);
+  assert.deepEqual([co.baseAvailable, co.baseGone], [false, true]);
+  await removeCheckout(up.root);
+});
+
+test('only git saying the remote lacks that very SHA makes the base gone', async () => {
+  const up = makeUpstream();
+  const other = 'e'.repeat(40);
+  const cases = [
+    [`fatal: remote error: upload-pack: not our ref ${up.baseSha}`, true],
+    [`fatal: couldn't find remote ref ${up.baseSha}`, true],
+    [`error: Server does not allow request for unadvertised object ${up.baseSha}`, true],
+    [`error: no such remote ref ${up.baseSha}\r`, true],
+    [`fatal: remote error: upload-pack: not our ref ${other}`, false],
+    [`remote: fatal: remote error: upload-pack: not our ref ${up.baseSha}`, false],
+    [`fatal: remote error: upload-pack: not our ref ${up.baseSha} (retry later)`, false],
+    ["fatal: unable to access 'https://github.com/a/b.git/': Could not resolve host: github.com", false],
+    ['fatal: the remote end hung up unexpectedly', false],
+    ['error: RPC failed; HTTP 503 curl 22 The requested URL returned error: 503', false],
+  ];
+  await Promise.all(cases.map(async ([stderr, gone], i) => {
+    const root = tempDir('skc-say-');
+    const co = await prepareUpstreamCheckout({ dir: path.join(root, 'checkout'), url: up.url, verifiedSha: up.baseSha, env: oldGitEnv(root, up.baseSha, 'say', stderr) });
+    assert.deepEqual([co.baseAvailable, co.baseGone], [false, gone], `case ${i}: ${stderr}`);
+    await removeCheckout(root);
+  }));
+  await removeCheckout(up.root);
+});
+
+test('a failed blob batch leaves the base unavailable but not gone, and the check says so', async () => {
+  const { checkSkill, confirmableCommit } = await import('../src/skill-check/check.ts');
+  const { extractNames } = await import('../src/skill-check/names.ts');
+  const up = makeUpstream();
+  const env = oldGitEnv(up.root, up.baseSha, 'blobs-fail');
+  const co = await prepareUpstreamCheckout({ dir: path.join(up.root, 'checkout'), url: up.url, verifiedSha: up.baseSha, env });
+  assert.deepEqual([co.baseAvailable, co.baseGone], [false, false]);
+  assert.equal((await co.git(['cat-file', '-e', `${up.baseSha}^{commit}`])).code, 0, 'the base commit came in its fetch');
+  // Its blobs did not, and the check does not try to diff without them.
+  const names = extractNames('Call `emptyData` from `src/db.c`.');
+  const result = await checkSkill(co.git, { names, baseline: ['emptyData', 'src/db.c'], baseSha: up.baseSha, checkout: co });
+  assert.deepEqual(result.incomplete, [`the base commit ${up.baseSha} could not be fetched, so the diff since it was not examined`]);
+  assert.equal(result.compared, false);
+  assert.equal(confirmableCommit(result), null);
   await removeCheckout(up.root);
 });
 
