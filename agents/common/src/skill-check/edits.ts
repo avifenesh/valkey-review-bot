@@ -11,7 +11,10 @@
  *   <!-- /suppressed -->
  *   <the replacement piece>
  *
- * Several citations are separated by ", ". The replacement may differ
+ * The reason is generated from the changed names ("`a` is now `b`",
+ * several joined by "; "); an edit cannot supply one, so no caller or
+ * model text reaches the skill. Several citations are separated by
+ * ", ". The replacement may differ
  * from the original only where a cited line supports it: both are split
  * on the token class [A-Za-z0-9_./:*>-]+, the text between tokens must
  * be identical and the token count equal, and every changed token must
@@ -45,8 +48,8 @@ export interface SuppressEdit {
   readonly replacement: string;
   /** The upstream lines that support the changes: 1 to MAX_CITATIONS_PER_EDIT. */
   readonly evidence: readonly Citation[];
-  /** One line for the marker. Default: generated from the changed names. */
-  readonly reason?: string;
+  // No reason: the marker's reason is generated from the changed names,
+  // so no caller or model text reaches the skill. An edit that has one is refused.
 }
 
 export interface EditContext {
@@ -96,7 +99,7 @@ export const MAX_EDIT_GROWTH_CHARS = 2_000;
 export const MAX_PIECE_LINES = 20;
 export const MAX_PIECE_CHARS = 2_000;
 export const MAX_CITATIONS_PER_EDIT = 5;
-export const MAX_REASON_CHARS = 300;
+const MAX_REASON_CHARS = 300;
 const DEFAULT_MAX_CHARS = 40_000;
 const NAME_MAX_CHARS = 120;
 
@@ -244,7 +247,7 @@ function stripCr(line: string): string {
 
 function parseHeader(text: string): Header | null {
   const m = HEADER_RE.exec(text);
-  if (!m || !isValidDate(m[2]!)) return null;
+  if (!m || !isValidDate(m[2]!) || reasonProblem(m[3]!) !== null) return null;
   const evidence = m[4]!.split(', ').map(parseCitation);
   if (evidence.some((c) => c === null)) return null;
   return { release: m[1]!, date: m[2]!, reason: m[3]!, evidence: evidence as Citation[] };
@@ -502,26 +505,31 @@ function assertContext(ctx: EditContext): void {
   }
 }
 
+/** Why a marker reason is malformed: it must be one line that cannot end the HTML comment early. */
 function reasonProblem(reason: string): string | null {
   if (reason.length === 0 || reason.length > MAX_REASON_CHARS) return `the reason must be 1-${MAX_REASON_CHARS} characters`;
   if (reason !== reason.trim() || /[\x00-\x1f\x7f]/.test(reason)) return 'the reason must be one line without surrounding spaces';
-  if (reason.includes('-->') || reason.includes('<!--')) return 'the reason must not contain "<!--" or "-->"';
+  if (/-->|--!>|<!--/.test(reason)) return 'the reason must not contain "<!--", "-->" or "--!>"';
   return null;
 }
 
-/** "`a` is now `b`, ..." for the marker when the edit gives no reason. */
-function defaultReason(changes: readonly Change[]): string {
+/**
+ * The marker's reason, built only from the validated changes:
+ * "`a` is now `b`; `c` is now `d`", with "; and N more" past
+ * MAX_REASON_CHARS.
+ */
+function generatedReason(changes: readonly Change[]): string {
   const parts = [...new Set(changes.map((c) => `\`${c.from}\` is now \`${c.to}\``))];
   let out = '';
   let used = 0;
   for (const part of parts) {
-    const next = out ? `${out}, ${part}` : part;
+    const next = out ? `${out}; ${part}` : part;
     if (next.length > MAX_REASON_CHARS - 20) break;
     out = next;
     used++;
   }
   if (!out) return 'code names changed upstream';
-  return used < parts.length ? `${out} and ${parts.length - used} more` : out;
+  return used < parts.length ? `${out}; and ${parts.length - used} more` : out;
 }
 
 export function suppressionHeader(release: string, date: string, reason: string, evidence: readonly Citation[]): string {
@@ -630,14 +638,18 @@ function plan(skillMd: string, edits: readonly SuppressEdit[], ctx: EditContext)
     const citationProblems = evidence.slice(0, MAX_CITATIONS_PER_EDIT).map((c) => citationProblem(c, ctx.upstream)).filter((p) => p !== null);
     citationProblems.forEach(fail);
 
+    if (Object.hasOwn(Object(edit), 'reason')) {
+      fail('an edit cannot give a reason; the marker\'s reason is generated from the changed names');
+    }
+
     let reason = '';
     if ('changes' in diff) {
       if (citationProblems.length === 0 && evidence.length > 0 && evidence.length <= MAX_CITATIONS_PER_EDIT) {
         checkable.set(index, { changes: diff.changes, evidence });
       }
-      reason = edit.reason === undefined ? defaultReason(diff.changes) : String(edit.reason);
+      reason = generatedReason(diff.changes);
       const bad = reasonProblem(reason);
-      if (bad) fail(bad);
+      if (bad) fail(`the generated reason is malformed: ${bad}`);
     }
     if (problems.length > before || !('changes' in diff)) return;
     growth += replacement.length - original.length;
