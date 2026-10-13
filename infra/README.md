@@ -9,11 +9,11 @@ secret names.
 
 | Stack | Contents |
 | --- | --- |
-| `ValkeyReviewerSubstrate` | KMS key, prompt and skill bucket, reference to the GitHub App secret, one token broker Lambda per reviewer, run heartbeat table |
+| `ValkeyReviewerSubstrate` | KMS key, prompt and skill bucket, reference to the GitHub App secret, one token broker Lambda per reviewer, the skills-repo token broker Lambda when `skillsRepo` is set, run heartbeat table |
 | `ValkeyReviewAgent`, `ValkeyGlideReviewAgent` | One reviewer each: AgentCore runtime, its execution role, its concerns table, prompt and skill upload |
-| `ValkeyReviewerCurator` | Curator runtime and its execution role |
+| `ValkeyReviewerCurator` | Curator runtime and its execution role, and the upload of `prompt.md`, `skill.md` and `skill-check.md` under `curator/` |
 | `ValkeyReviewWebhook` | HTTP API, receiver Lambda, idempotency table, one queue and worker per route, the curator queue and worker, dead-letter queues |
-| `ValkeyReviewerDecay` | Daily Lambda that decays and prunes concerns records |
+| `ValkeyReviewerDecay` | Daily Lambda that decays concerns and queues skill checks and retirements on the curator queue |
 
 Each runtime has its own role:
 
@@ -41,9 +41,30 @@ Each runtime has its own role:
   issues a short-lived token for one routed repository.
 - The curator role can call its models, read its own prefix in the
   assets bucket (and list the bucket), read and write the concerns
-  tables, write records in the reviewer registries, read its own
-  registry, write its own runtime log groups and pull from the same
-  container-assets repository.
+  tables, create, update and read records in the reviewer registries and
+  set their status (`agent-registry:UpdateRegistryRecordStatus`, which
+  retires a skill), read its own registry, invoke the skills-repo broker
+  when there is one, write its own runtime log groups and pull from the
+  same container-assets repository. It runs on the `PUBLIC` network mode
+  and holds no GitHub credentials. Its skill checks fetch the public
+  upstream repositories from `github.com` with git, and read the skill
+  files of the bot repository from `api.github.com` and
+  `raw.githubusercontent.com`, all without credentials.
+
+Other functions:
+
+- The decay Lambda can scan, update and delete items in the concerns
+  tables, use their key, and send messages to the curator queue
+  (`sqs:SendMessage`, `sqs:GetQueueAttributes` and `sqs:GetQueueUrl`, on
+  that queue only). It reads the GitHub releases API without credentials.
+- Each review worker can invoke its route's runtime, read the heartbeat
+  table and update its items (the run's start record), and get, update
+  and delete the receiver's `pending#` items in the idempotency table
+  (the grant is limited to that key prefix). The curator worker can only
+  invoke the curator runtime.
+- The skills-repo broker can read only its App secret
+  (`secretsmanager:GetSecretValue` on that secret). Only the curator role
+  may invoke it.
 
 Deploy into an AWS account used for nothing else, or at least give this
 app a bootstrap qualifier of its own (`aws.bootstrapQualifier`), so that
@@ -69,6 +90,9 @@ permissions are granted only when an `openai.*` model is configured.
    `issue_comment`. Subscribe it to the `pull_request`,
    `pull_request_review`, `pull_request_review_comment` and
    `issue_comment` events, and install it on the repositories you route.
+   It needs no Contents permission. The pull requests that propose edits
+   to the reviewers' skill files are opened by a second App; see
+   [The skills-repo App](#the-skills-repo-app).
 4. Store the App credentials in Secrets Manager, in the target account and
    region, under the name you set in `github.appSecretName`. The secret is a
    JSON object:
@@ -80,7 +104,14 @@ permissions are granted only when an `openai.*` model is configured.
    create them. Put their IDs or ARNs under `skillsRegistries`.
 6. Make sure the account can invoke every model in `models`.
 7. Copy `deploy.config.example.json` to `deploy.config.json` and fill it in.
-   `deploy.config.json` is ignored by git.
+   `deploy.config.json` is ignored by git. The example sets
+   `skillsRepo.repo` to the placeholder `your-org/valkey-review-bot`. Set it
+   to your bot repository, or remove the `skillsRepo` block until you set
+   up [the skills-repo App](#the-skills-repo-app). While it is set, the
+   substrate stack creates the skills-repo broker and the curator may
+   invoke it, even with `skillLifecycle.openPullRequests` off, and every
+   release's repo skill check reads the file from that repository. A
+   placeholder repository makes each of those checks end inconclusive.
 
 ## Commands
 
@@ -190,9 +221,9 @@ reviewer. The token broker issues tokens only for these repositories.
 | `id` | required | Route name: letters, digits and hyphens. It names the route's queue and worker, so keep it stable once deployed. Ids must stay unique after hyphens are removed. |
 | `reviewer` | required | `valkey-review` or `valkey-glide-review`. |
 | `repo` | required | `owner/name`, spelled as GitHub shows it. A repository can appear in one route only (compared case-insensitively). |
-| `threadReplyReview` | `false` | A maintainer tagging the bot in a reply inside any review thread starts a review; in a thread the bot started, that review checks the claimed fix. When `false`, tags in review-thread replies start nothing (the replies are still feedback). |
-| `skipDrafts` | `false` | Draft pull requests are not reviewed when opened; the review runs when the draft is marked ready. |
-| `mentionOnly` | `false` | No automatic reviews. Reviews run only when a maintainer tags the bot. |
+| `threadReplyReview` | `false` | A maintainer tagging the bot in a reply inside any review thread starts a review. In a thread the bot started, that review answers the reply from the code: it verifies a claimed fix, re-checks a disputed finding (and withdraws it if the reply is right), or answers a question. In any other thread the tag is an ordinary summons. When `false`, tags in review-thread replies start nothing (the replies are still feedback). Enable it on every route where maintainers should be able to answer the bot; the example does so on both routes. |
+| `skipDrafts` | `false` | Draft pull requests are not reviewed when opened or pushed to; the review runs when the draft is marked ready. |
+| `mentionOnly` | `false` | No automatic reviews, on open, reopen or new commits. Reviews run only when a maintainer tags the bot. |
 | `authorAllowlist` | `[]` | When not empty, only pull requests by these logins get automatic reviews. |
 
 ### `curatorOnlyRoutes`
@@ -203,9 +234,13 @@ cannot be both a route and a curator-only route.
 
 ### `upstreamRepos`
 
-The canonical repository each reviewer fetches release branches from, for
-backport checks. An empty string means "use the pull request's
-repository".
+The canonical repository of each reviewer's project. The reviewer fetches
+its release branches for backport checks. The skill lifecycle uses it too:
+its GitHub releases trigger skill checks, and the checks read its default
+branch. It must be public, because both are read without credentials. An
+empty string means "use the pull request's repository" for backport checks
+and turns skill checks off for that reviewer; decay and retirement still
+apply. A repository named `.` or `..` is refused.
 
 | Key | Default |
 | --- | --- |
@@ -284,22 +319,84 @@ would reject fails synthesis instead. The reviewers use the same ranges.
 
 | Key | Default | Meaning |
 | --- | --- | --- |
-| `halfLifeDays` | `30` | Days it takes an unreinforced record's `decay_score` to halve. Passed to the decay Lambda as `DECAY_HALF_LIFE_SECONDS`. Greater than 0 and at most 3650. |
-| `floor` | `0.05` | Records whose `decay_score` falls below this are deleted. Greater than 0 and less than 1. |
+| `halfLifeDays` | `30` | Days it takes the `decay_score` of an unreinforced record that never graduated to halve. Passed to the decay Lambda as `DECAY_HALF_LIFE_SECONDS`. Greater than 0 and at most 3650. |
+| `floor` | `0.05` | Records that never graduated are deleted when their `decay_score` falls below this; graduated records are retired instead. Greater than 0 and less than 1. |
+| `graduatedHalfLifeDays` | `180` | Half-life of records that graduated into a skill: the skill's standing. Passed as `DECAY_GRADUATED_HALF_LIFE_SECONDS`. Greater than 0, at most 3650, and at least `halfLifeDays`. |
 
 The curator sets a record's `decay_score` to 1 each time a maintainer
 reinforces the concern. Once a day the decay Lambda (`ops/src/decay.ts`)
 multiplies the score by `0.5 ^ (elapsed / halfLife)`, where `elapsed` is
-the time since the score was last set, and deletes the record if the
-result is below `floor`. A record nobody reinforces falls below the floor
-after `halfLifeDays * log2(1 / floor)` days. With the defaults that is
-`30 * log2(20)`, about 130 days, and the next daily run deletes it.
+the time since the score was last set. A record nobody reinforces falls
+below the floor after `halfLife * log2(1 / floor)` days.
+
+- A record that never graduated is deleted then. With the defaults that is
+  `30 * log2(20)`, about 130 days.
+- A graduated record is never deleted. Below the floor its skill is
+  retired, when `skillLifecycle.retireSkills` is on, and the record stays
+  as a tombstone. With the defaults that is `180 * log2(20)`, about 778
+  days. A release check that finds names missing also lowers the score,
+  and one that finds the skill's subject gone sets it to 0.
+
+Scores lowered under an earlier half-life keep their value; the new one
+applies from the next pass.
+
+### `skillLifecycle`
+
+How the decay job schedules skill maintenance and what the curator may
+change. Every switch that changes a skill, retires one or opens a pull
+request is off by default: report mode. See
+[Skill lifecycle operations](#skill-lifecycle-operations) before turning
+one on.
+
+| Key | Default | Meaning |
+| --- | --- | --- |
+| `checksPerDay` | `10` | Check requests per reviewer per daily pass, the repo skill check included (0 to 100). `0` turns checks off. Passed to the decay Lambda as `SKILL_CHECKS_PER_DAY`. |
+| `recheckDays` | `90` | A check is also due when the last one is older than this (7 to 3650). `SKILL_RECHECK_SECONDS`. |
+| `applyEdits` | `false` | Write validated edits to the registry skills. When `false`, they are kept in the record's `pending_revision` for the operator. Curator `CHECK_APPLY_EDITS`. |
+| `retireSkills` | `false` | Deprecate skills that decayed below the floor or whose subject is gone. When `false`, the decay job logs them as `would-retire`. `RETIRE_SKILLS`, on both the decay Lambda and the curator. |
+| `openPullRequests` | `false` | Propose edits to the reviewers' repo skill files by pull request against `skillsRepo.repo`. Does nothing without `skillsRepo`. Curator `CHECK_OPEN_PULL_REQUESTS`. |
+| `maxRetirementsPerDay` | `3` | Retire requests per reviewer per pass (1 to 50). `MAX_RETIREMENTS_PER_DAY`. |
+| `maxCheckRounds` | `25` | Tool rounds of one audit (5 to 100). Curator `CHECK_MAX_ROUNDS`. |
+| `retireRefusedBackoffDays` | `30` | After the registry refused a retirement, the decay job waits this long before it asks again (1 to 3650). `RETIRE_REFUSED_BACKOFF_SECONDS`. |
+
+### `skillsRepo`
+
+Optional. The bot's own repository, where the reviewers' repo skill files
+(`agents/<reviewer>/config/skill.md`) live. When it is absent, the repo
+skill check of each release is recorded as skipped, no skills-repo broker
+is created, and nothing is ever proposed. When it is set, the curator reads
+the files from it without credentials, so it must be public.
+
+| Key | Default | Meaning |
+| --- | --- | --- |
+| `repo` | required | `owner/name` of the bot repository, for example `valkey-io/valkey-review-bot`. Passed to the curator and the broker as `SKILLS_REPO`. |
+| `baseBranch` | `main` | The branch the files are read from and pull requests target: at most 100 characters, a name git accepts. `SKILLS_REPO_BASE_BRANCH`. |
+| `appSecretName` | `github.appSecretName` | Secrets Manager secret of the App that opens the pull requests, with `app_id` and `private_key` (the same JSON shape as the main App secret; `webhook_secret` is not needed). See [The skills-repo App](#the-skills-repo-app). Passed to the broker as `SKILLS_REPO_APP_SECRET_NAME`. |
+| `signOff` | the App's bot identity | `Name <email>` on one line for the commit's `Signed-off-by` line. The name is 1 to 100 characters, with no control characters, no `<` or `>`, and no space or other whitespace at either end. `SKILLS_REPO_SIGN_OFF`. |
 
 ### `dailyReviewBudget`
 
-Default `40`. Automatic reviews allowed per route per UTC day. Reviews
-beyond it are skipped and logged. Reviews summoned by a maintainer are not
-counted. `0` pauses automatic reviews.
+Default `40`. Automatic reviews allowed per route per UTC day, reviews of
+new commits included. Reviews beyond it are skipped and logged. Reviews
+summoned by a maintainer are not counted, and neither are events that join
+a waiting review. `0` pauses automatic reviews.
+
+### `maxAutomaticReviewsPerPr`
+
+Default `3`, from 1 to 20. Automatic reviews one pull request can get,
+counting the first: on open, reopen, `ready_for_review` and new commits.
+Further events are skipped as `auto-review-cap`. @mentions and thread
+replies are not counted. Passed to the receiver as
+`MAX_AUTOMATIC_REVIEWS_PER_PR`. The count lives in the idempotency table and
+expires 180 days after the pull request's latest automatic review.
+
+### `pushReviewDelaySeconds`
+
+Default `300`, from 0 to 900 (the SQS limit). How long a review that new
+commits started waits in the queue. Pushes, reopens and `ready_for_review`
+events while it waits join it, so a burst gets one review of the newest
+head. Passed to the receiver as `PUSH_REVIEW_DELAY_SECONDS`. The delay comes
+out of the review's 90-minute run budget.
 
 ## Operational limits
 
