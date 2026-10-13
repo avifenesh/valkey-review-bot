@@ -808,15 +808,92 @@ function outcomeWrite(run: Run, v: Outcome): Write {
     .remove(...CLAIM);
 }
 
+// Partial checks. A check whose diff since the base was examined only in
+// part (the diff budget ran out, or a file's diff was cut) does not
+// confirm by itself. The record counts such checks in a row in
+// partial_checks, and check.ts's confirmableCommit lets the check after
+// enough of them confirm, so a skill whose diff never fits still moves
+// on. Each maintenance message counts once: partial_check_id names the
+// message that counted last, so a redelivered copy adds nothing, and its
+// own count is not one of the checks before it. A write that moves
+// verified_sha removes both.
+
+const PARTIAL = ['partial_checks', 'partial_check_id'] as const;
+
+/** isPartial in check.ts (wp/fu2-skill-check): the diff since the base was examined, but only in part. */
+function isPartial(result: CheckResult): boolean {
+  return result.compared && result.incomplete.length > 0;
+}
+
+/**
+ * confirmableCommit with the ConfirmOptions of wp/fu2-skill-check. A
+ * library from before that change ignores the count, and a partial
+ * result then never confirms.
+ */
+const confirmable: (result: CheckResult, opts?: { readonly partialBefore?: number }) => string | null = confirmableCommit;
+
+function partialCount(item: Item): number {
+  const n = item.partial_checks;
+  return typeof n === 'number' && Number.isInteger(n) && n > 0 ? n : 0;
+}
+
+/** Earlier partial checks in a row, without the one this message recorded on an earlier receive. */
+function partialBefore(item: Item, id: string): number {
+  const n = partialCount(item);
+  return item.partial_check_id === id ? Math.max(0, n - 1) : n;
+}
+
+/** Count a partial result whose verification does not move, once per message. */
+function countPartial(w: Write, run: Run, c: Checked, item: Item): void {
+  if (!isPartial(c.result) || item.partial_check_id === run.req.maintenance_id) return;
+  w.set('partial_checks', partialCount(item) + 1).set('partial_check_id', run.req.maintenance_id);
+}
+
+interface Verification {
+  /** The commit the verification may move to; null when it stays. */
+  readonly commit: string | null;
+  /** The earlier partial checks counted. */
+  readonly before: number;
+  /** The commit was allowed past a partial diff. */
+  readonly escaped: boolean;
+}
+
+/**
+ * Whether the check's result may move the verification: decided once per
+ * check, from the original result (never an edited body's re-check) and
+ * the record as read.
+ */
+function verification(run: Run, c: Checked, item: Item): Verification {
+  const before = partialBefore(item, run.req.maintenance_id);
+  const commit = confirmable(c.result, { partialBefore: before });
+  return { commit, before, escaped: commit !== null && c.result.incomplete.length > 0 };
+}
+
+/** The note of an outcome that went past a partial diff says so first. */
+function advanced(ver: Verification, c: Checked, text: string): string {
+  if (!ver.escaped) return text;
+  return `advanced past a partial diff after ${ver.before} partial checks (${c.result.incomplete.join('; ')}); ${text}`.slice(0, CHECK_NOTE_MAX);
+}
+
+function logAdvance(run: Run, c: Checked, ver: Verification): void {
+  if (!ver.escaped) return;
+  console.log(`[maintenance] partial-advance ${quoted(subjectOf(run))} base=${(c.base ?? '').slice(0, 12)} tip=${c.co.tipSha.slice(0, 12)} partial_checks=${ver.before}`);
+}
+
 /**
  * The confirmation: verification moves to the checked commit, with
- * `present` as the new baseline, unless the result was incomplete
- * (confirmableCommit). This is the one place that decides it.
+ * `present` as the new baseline, when `ver` allows it. Otherwise the
+ * baseline stays and a partial result is counted.
  */
-function confirm(w: Write, c: Checked, present: readonly string[], item: Item, lost: readonly string[]): void {
-  const commit = confirmableCommit(c.result);
-  if (commit) w.set('verified_sha', commit).set('verified_ref', c.ref).setNames('audit_names', storedAudit(present));
-  else keepBaseline(w, item, lost);
+function confirm(w: Write, run: Run, c: Checked, present: readonly string[], item: Item, ver: Verification): void {
+  if (ver.commit) w.set('verified_sha', ver.commit).set('verified_ref', c.ref).setNames('audit_names', storedAudit(present)).remove(...PARTIAL);
+  else notMoved(w, run, c, item);
+}
+
+/** The verification stays: the baseline keeps all but this check's lost names, and a partial result is counted. */
+function notMoved(w: Write, run: Run, c: Checked, item: Item): void {
+  keepBaseline(w, item, c.result.lost);
+  countPartial(w, run, c, item);
 }
 
 /** The baseline stays at the old commit; only lost names leave it, so each loss is penalised once. */
@@ -843,13 +920,18 @@ function stale(w: Write, item: Item, list: readonly string[], nowIso: string): v
 }
 
 /** A check that ends without a result to act on: the claim is kept and the check is retried once it ages out. */
-async function inconclusive(run: Run, why: string, fields: LogFields = {}): Promise<MaintenanceResult> {
+async function inconclusive(run: Run, why: string, fields: LogFields = {}, c?: Checked): Promise<MaintenanceResult> {
   if (run.req.dry_run) {
     await run.release();
     run.log(run.req.reason, { outcome: 'inconclusive', ...fields, note: why, mode: 'report' });
     return completed('inconclusive');
   }
-  const recorded = await writeRetried(run, () => new Write().set('check_outcome', 'inconclusive').set('check_note', note(why)));
+  const recorded = await writeRetried(run, (it) => {
+    const w = new Write().set('check_outcome', 'inconclusive').set('check_note', note(why));
+    // A check that ran: a partial result counts, since the verification does not move.
+    if (c) countPartial(w, run, c, it);
+    return w;
+  });
   return ended(run, 'inconclusive', recorded, { ...fields, note: why });
 }
 
@@ -1074,11 +1156,19 @@ async function* checkBody(run: Run, req: CheckRequest, c: Checked, skill: SkillR
   // Lost names include those of earlier checks; the penalty counts this check's new losses only (c.result).
   const r = c.view;
   const item = run.item!;
+  const ver = verification(run, c, item);
   const counts = `${r.lost.length} lost, ${r.newAbsent.length} new and absent, ${r.touched.length} touched`;
   const fields = { release: c.label, ref: c.ref, lost: r.lost.length, new_absent: r.newAbsent.length, touched: r.touched.length };
 
-  if (r.clean) {
-    const v: Outcome = { outcome: 'clean', note: note(`${r.present.length} cited names present at ${c.ref}${r.compared ? ', no rare name touched since the last check' : ''}`) };
+  const flagged = flaggedNames(r);
+  if (flagged.length === 0 && !ver.commit) {
+    // Nothing flagged, but part of the diff went unexamined: no audit can
+    // confirm it, so the claim is kept and the check runs again once it ages out.
+    return inconclusive(run, notExamined(c), { ...fields, incomplete: r.incomplete.join('; ') }, c);
+  }
+  if (flagged.length === 0) {
+    // Clean, or a partial diff the count lets past.
+    const v: Outcome = { outcome: 'clean', note: advanced(ver, c, note(`${r.present.length} cited names present at ${c.ref}${r.compared ? ', no rare name touched since the last check' : ''}`)) };
     if (req.dry_run) {
       await run.release();
       run.log('check', { outcome: 'clean', ...fields, mode: 'report', note: v.note });
@@ -1086,25 +1176,19 @@ async function* checkBody(run: Run, req: CheckRequest, c: Checked, skill: SkillR
     }
     const recorded = await finishCheck(run, (it) => {
       const w = outcomeWrite(run, v).remove('pending_revision');
-      confirm(w, c, r.present, it, []);
+      confirm(w, run, c, r.present, it, ver);
       stale(w, it, [], run.nowIso);
       lostNames(w, []);
       return w;
     });
+    if (recorded) logAdvance(run, c, ver);
     return ended(run, 'clean', recorded, { ...fields, mode: 'apply', note: v.note });
   }
 
-  const flagged = flaggedNames(r);
-  if (flagged.length === 0) {
-    // Nothing flagged, but part of the diff went unexamined: no audit can
-    // confirm it, so the claim is kept and the check runs again once it ages out.
-    return inconclusive(run, notExamined(c), { ...fields, incomplete: r.incomplete.join('; ') });
-  }
-
-  if (!run.deps.audit.systemPrompt) return inconclusive(run, `${counts} at ${c.ref}; no audit prompt is configured`);
+  if (!run.deps.audit.systemPrompt) return inconclusive(run, `${counts} at ${c.ref}; no audit prompt is configured`, {}, c);
 
   const { report, why } = yield* audit(run, c, 'registry', GRADUATED_SKILL_MAX_CHARS, startMs);
-  if (!report) return inconclusive(run, `${counts} at ${c.ref}; ${why}`);
+  if (!report) return inconclusive(run, `${counts} at ${c.ref}; ${why}`, {}, c);
 
   const valid = report.problems.length === 0;
   const unresolved = [...r.lost, ...r.newAbsent];
@@ -1123,10 +1207,10 @@ async function* checkBody(run: Run, req: CheckRequest, c: Checked, skill: SkillR
   }
 
   if (report.verdict === 'accurate' && valid) {
-    const v: Outcome = { outcome: 'accurate', note: flaggedNote(`${flagged.length} flagged name(s) judged accurate`) };
+    const v: Outcome = { outcome: 'accurate', note: advanced(ver, c, flaggedNote(`${flagged.length} flagged name(s) judged accurate`)) };
     const recorded = await finishCheck(run, (it) => {
       const w = outcomeWrite(run, v).remove('pending_revision');
-      confirm(w, c, r.present, it, []);
+      confirm(w, run, c, r.present, it, ver);
       stale(w, it, [], run.nowIso);
       lostNames(w, []);
       // Never a name that was in the baseline: those are lost, not accurate.
@@ -1135,6 +1219,7 @@ async function* checkBody(run: Run, req: CheckRequest, c: Checked, skill: SkillR
       w.setNames('ignored_names', storedNames(ignored, IGNORED_NAMES_MAX));
       return w;
     });
+    if (recorded) logAdvance(run, c, ver);
     return ended(run, 'accurate', recorded, { ...fields, note: v.note, summary: report.summary });
   }
 
@@ -1147,17 +1232,18 @@ async function* checkBody(run: Run, req: CheckRequest, c: Checked, skill: SkillR
       if (!notReinforced) {
         // The record stays live and unverified; the finding waits for the operator.
         const w = outcomeWrite(run, { outcome: 'suspect', note: v.note }).set('pending_revision', pendingRevision(run.nowIso, c, report, REINFORCED_SINCE));
-        keepBaseline(w, it, c.result.lost);
+        notMoved(w, run, c, it);
         stale(w, it, unresolved, run.nowIso);
         lostNames(w, r.lost);
         return w;
       }
-      const w = outcomeWrite(run, v).remove('pending_revision');
-      confirm(w, c, r.present, it, c.result.lost);
+      const w = outcomeWrite(run, { outcome: 'obsolete', note: advanced(ver, c, v.note) }).remove('pending_revision');
+      confirm(w, run, c, r.present, it, ver);
       stale(w, it, unresolved, run.nowIso);
       lostNames(w, r.lost);
       return w.set('obsolete_release', c.label).set('decay_score', 0).is('updated_at', it.updated_at);
     });
+    if (recorded && written.outcome === 'obsolete') logAdvance(run, c, ver);
     return ended(run, written.outcome, recorded, {
       ...fields,
       ...(written.outcome === 'suspect' ? { why: REINFORCED_SINCE } : {}),
@@ -1167,7 +1253,7 @@ async function* checkBody(run: Run, req: CheckRequest, c: Checked, skill: SkillR
   }
 
   if (report.verdict === 'revise' && valid && report.skillMd !== null && run.deps.settings.checkApplyEdits) {
-    return yield* applyRevision(run, c, skill, report, fields);
+    return yield* applyRevision(run, c, skill, report, fields, ver);
   }
 
   // Suspect: the edits wait for the operator, or there are none.
@@ -1180,7 +1266,7 @@ async function* checkBody(run: Run, req: CheckRequest, c: Checked, skill: SkillR
   const recorded = await finishCheck(run, (it, penalty) => {
     const w = outcomeWrite(run, v).set('pending_revision', pendingRevision(run.nowIso, c, report, reason));
     // The verification does not move.
-    keepBaseline(w, it, c.result.lost);
+    notMoved(w, run, c, it);
     stale(w, it, unresolved, run.nowIso);
     lostNames(w, r.lost);
     if (penalty) penalize(w, it, c.result.keptFraction, c.result.lost.length);
@@ -1202,6 +1288,7 @@ async function* applyRevision(
   skill: SkillRecord,
   report: CheckReport,
   fields: Readonly<Record<string, string | number>>,
+  ver: Verification,
 ): AsyncGenerator<StreamFrame, MaintenanceResult> {
   const revisedAt = run.nowIso;
   const claimed = await run.state(new Write()
@@ -1220,7 +1307,9 @@ async function* applyRevision(
     console.warn(`[maintenance] registry update of ${quoted(run.name)} failed: ${errorText(err)}`);
     const v: Outcome = { outcome: 'error', note: note(`the edited skill could not be written to the registry at ${c.ref}`) };
     // The record was read live, so a leftover marker goes, as in every terminal write after a live read.
-    await run.afterEdit(outcomeWrite(run, v).set('pending_revision', pendingRevision(run.nowIso, c, report, 'the registry update failed')).remove(MARKER), revisedAt);
+    const w = outcomeWrite(run, v).set('pending_revision', pendingRevision(run.nowIso, c, report, 'the registry update failed')).remove(MARKER);
+    countPartial(w, run, c, run.item!);
+    await run.afterEdit(w, revisedAt);
     run.log('check', { outcome: 'error', ...fields, note: v.note });
     return completed('error');
   }
@@ -1242,13 +1331,14 @@ async function* applyRevision(
   const stillLost = c.view.lost.filter((n) => citedSet.has(n));
   const v: Outcome = {
     outcome: 'revised',
-    note: remaining.length
+    note: advanced(ver, c, remaining.length
       ? note(`${report.edits.length} edit(s) applied at ${c.ref}; still missing`, remaining)
-      : note(`${report.edits.length} edit(s) applied at ${c.ref}`),
+      : note(`${report.edits.length} edit(s) applied at ${c.ref}`)),
   };
   const build = (it: Item, penalty: boolean): Write => {
     const w = outcomeWrite(run, v).remove('pending_revision');
-    confirm(w, c, after.present, it, after.lost);
+    // Decided from the original check, never the re-check of the edited body.
+    confirm(w, run, c, after.present, it, ver);
     stale(w, it, remaining, run.nowIso);
     lostNames(w, stillLost);
     if (run.liveRead) w.remove(MARKER);
@@ -1263,6 +1353,7 @@ async function* applyRevision(
     }
   }
   logEdits(run, c, report, true);
+  if (written) logAdvance(run, c, ver);
   run.log('check', { outcome: 'revised', ...fields, recorded: written, note: v.note, summary: report.summary });
   return completed('revised');
 }
@@ -1322,7 +1413,7 @@ async function* repoCheck(run: Run, req: RepoCheckRequest): AsyncGenerator<Strea
     });
     return ended(run, v.outcome, recorded, { file: filePath, ...fields, note: v.note });
   };
-  const keep = (why: string, fields: LogFields = {}): Promise<MaintenanceResult> => inconclusive(run, why, { file: filePath, ...fields });
+  const keep = (why: string, fields: LogFields = {}, c?: Checked): Promise<MaintenanceResult> => inconclusive(run, why, { file: filePath, ...fields }, c);
 
   const upstream = settings.upstreamRepos[req.reviewer_id];
   if (!upstream) return skipWithRelease(run, `no upstream repository is configured for ${req.reviewer_id}`);
@@ -1349,28 +1440,33 @@ async function* repoCheck(run: Run, req: RepoCheckRequest): AsyncGenerator<Strea
     const unresolved = [...r.lost, ...r.newAbsent];
     const flagged = flaggedNames(r);
     const counts = `${r.lost.length} lost, ${r.newAbsent.length} new and absent, ${r.touched.length} touched`;
+    const ver = verification(run, c, item!);
     const confirmed = (w: Write, it: Item) => {
-      confirm(w, c, r.present, it, []);
+      confirm(w, run, c, r.present, it, ver);
       stale(w, it, [], run.nowIso);
       lostNames(w, []);
       w.set('skills_repo_sha', fetched.sha).remove('pending_revision');
     };
+    /** A confirming outcome's end: a recorded one that went past a partial diff says so. */
+    const confirming = async (v: Outcome, extra: (w: Write, it: Item) => void, logged: LogFields): Promise<MaintenanceResult> => {
+      const result = await finish({ ...v, note: advanced(ver, c, v.note) }, req.dry_run ? undefined : extra, logged);
+      if (!req.dry_run && result.status === 'completed') logAdvance(run, c, ver);
+      return result;
+    };
     const notConfirmed = (w: Write, it: Item, report: CheckReport | null, reason: string) => {
-      keepBaseline(w, it, c.result.lost);
+      notMoved(w, run, c, it);
       stale(w, it, unresolved, run.nowIso);
       lostNames(w, r.lost);
       w.set('skills_repo_sha', fetched.sha);
       if (report) w.set('pending_revision', pendingRevision(run.nowIso, c, report, reason));
     };
 
-    if (r.clean) {
-      return finish({ outcome: 'clean', note: note(`${r.present.length} cited names present at ${c.ref}`) }, req.dry_run ? undefined : confirmed, fields);
-    }
-    if (flagged.length === 0) return keep(notExamined(c), { ...fields, incomplete: r.incomplete.join('; ') });
-    if (!run.deps.audit.systemPrompt) return keep(`${counts} at ${c.ref}; no audit prompt is configured`);
+    if (flagged.length === 0 && !ver.commit) return keep(notExamined(c), { ...fields, incomplete: r.incomplete.join('; ') }, c);
+    if (flagged.length === 0) return confirming({ outcome: 'clean', note: note(`${r.present.length} cited names present at ${c.ref}`) }, confirmed, fields);
+    if (!run.deps.audit.systemPrompt) return keep(`${counts} at ${c.ref}; no audit prompt is configured`, {}, c);
 
     const { report, why } = yield* audit(run, c, 'repo', SKILL_MD_MAX_CHARS, startMs);
-    if (!report) return keep(`${counts} at ${c.ref}; ${why}`);
+    if (!report) return keep(`${counts} at ${c.ref}; ${why}`, {}, c);
     const valid = report.problems.length === 0;
     const fieldsWith = { ...fields, verdict: report.verdict, valid, summary: report.summary };
 
@@ -1384,7 +1480,7 @@ async function* repoCheck(run: Run, req: RepoCheckRequest): AsyncGenerator<Strea
       return completed(would);
     }
     if (report.verdict === 'accurate' && valid) {
-      return finish({ outcome: 'accurate', note: note(`${flagged.length} flagged name(s) judged accurate at ${c.ref}`, flagged) }, (w, it) => {
+      return confirming({ outcome: 'accurate', note: note(`${flagged.length} flagged name(s) judged accurate at ${c.ref}`, flagged) }, (w, it) => {
         confirmed(w, it);
         const audited = new Set([...names(it.audit_names), ...names(it.lost_names)]);
         w.setNames('ignored_names', storedNames(new Set([...names(it.ignored_names), ...r.newAbsent.filter((n) => !audited.has(n))]), IGNORED_NAMES_MAX));
@@ -1418,7 +1514,7 @@ async function* repoCheck(run: Run, req: RepoCheckRequest): AsyncGenerator<Strea
     } catch (err) {
       console.warn(`[maintenance] pull request for ${filePath} failed: ${errorText(err)}`);
       logEdits(run, c, report, false);
-      return keep(`${counts} at ${c.ref}; the pull request could not be opened`);
+      return keep(`${counts} at ${c.ref}; the pull request could not be opened`, {}, c);
     }
     logEdits(run, c, report, pr.action !== 'refused' && pr.action !== 'base-moved');
     const prFields = { ...fieldsWith, pr: pr.action, branch: pr.branch, url: pr.url ?? '' };

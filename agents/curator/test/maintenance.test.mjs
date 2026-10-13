@@ -14,6 +14,7 @@ import {
   skillPublisher,
 } from '../dist/curator/src/maintenance.js';
 import { prepareUpstreamCheckout } from '../dist/common/src/skill-check/upstream.js';
+import * as checkLib from '../dist/common/src/skill-check/check.js';
 import { captureLogs, drain, fakeRegistry, makeUpstream, memoryTable, ScriptedModel, tempDir } from './maintenance-fakes.mjs';
 
 const TABLE = 'valkey_review_concerns';
@@ -575,6 +576,97 @@ test('an accurate verdict on an incomplete result keeps the verification where i
   assert.equal(item.verified_ref, undefined);
   assert.deepEqual(set(item.audit_names), ['serverCron']);
   assert.deepEqual(set(item.ignored_names), ['old_placeholder_name']);
+});
+
+// --- Check: a diff read only in part -------------------------------------------
+
+// A diff past DIFF_MAX_BYTES: docs/big.txt holds `serverCron`, so it is diffed, and every other line changes.
+const filler = (tag) => Array.from({ length: 40_000 }, (_, i) => `${String(i).padStart(6, '0')} ${tag.repeat(56)}`).join('\n');
+const SERVER_C = 'int serverCron(void) {\n    return 0;\n}\n';
+const bigUp = makeUpstream([
+  { 'src/server.c': SERVER_C, 'docs/big.txt': `${filler('a')}\nserverCron is in src/server.c\n` },
+  { 'docs/big.txt': `${filler('b')}\nserverCron is in src/server.c\n` },
+]);
+after(() => bigUp.cleanup());
+const [BIG_BASE, BIG_TIP] = bigUp.shas;
+/** The way past a partial diff is in check.ts (wp/fu2-skill-check); without it a partial result never confirms. */
+const PARTIAL_ESCAPE = typeof checkLib.PARTIAL_CHECKS_BEFORE_CONFIRM === 'number';
+
+function partialSetup(overrides = {}, opts = {}) {
+  return setup({
+    item: record({ audit_names: new Set(['serverCron', 'src/server.c']), verified_sha: BIG_BASE, ...overrides }),
+    skill: { name: NAME, skillMd: CLEAN_MD },
+    upstreamUrl: () => bigUp.url,
+    ...opts,
+  });
+}
+
+test('a check whose diff was read only in part counts once per message and keeps the claim', async () => {
+  const s = partialSetup();
+  const { result, lines } = await run(checkMessage(), s.deps);
+  assert.equal(result.decision, 'inconclusive');
+  assert.equal(s.modelBuilds(), 0);
+  let item = s.table.item(KEY);
+  assert.equal(item.partial_checks, 1);
+  assert.equal(item.partial_check_id, MID);
+  assert.equal(item.maintenance_id, MID);
+  assert.equal(item.verified_sha, BIG_BASE);
+  assert.ok(lines.some((l) => l.includes('outcome="inconclusive"') && /incomplete="[^"]*4194304/.test(l)), lines.join('\n'));
+
+  // A redelivered copy of the same message counts nothing.
+  await run(checkMessage(), s.deps);
+  item = s.table.item(KEY);
+  assert.equal(item.partial_checks, 1);
+  assert.equal(item.maintenance_id, MID);
+
+  // The next message, once the claim aged out.
+  reclaim(s.table, KEY, MID2);
+  await run(checkMessage({ maintenance_id: MID2 }), s.deps);
+  item = s.table.item(KEY);
+  assert.equal(item.partial_checks, 2);
+  assert.equal(item.partial_check_id, MID2);
+  assert.equal(item.verified_sha, BIG_BASE);
+});
+
+test('a partial check with a flagged name counts too, whatever the audit says', async () => {
+  const md = `${CLEAN_MD}- \`serverCron\` once called \`emptyDB\`.\n`;
+  const s = partialSetup({ partial_checks: 4, partial_check_id: 'check#older' }, { skill: { name: NAME, skillMd: md }, turns: [report('unsure')] });
+  assert.equal((await run(checkMessage(), s.deps)).result.decision, 'suspect');
+  const item = s.table.item(KEY);
+  assert.equal(item.partial_checks, 5);
+  assert.equal(item.partial_check_id, MID);
+});
+
+test('a write that moves the verification clears the partial count', async () => {
+  const s = setup({
+    item: record({ audit_names: new Set(['serverCron', 'src/server.c']), partial_checks: 1, partial_check_id: 'check#older' }),
+    skill: { name: NAME, skillMd: CLEAN_MD },
+  });
+  assert.equal((await run(checkMessage(), s.deps)).result.decision, 'clean');
+  const item = s.table.item(KEY);
+  assert.equal(item.verified_sha, TIP_SHA);
+  assert.equal(item.partial_checks, undefined);
+  assert.equal(item.partial_check_id, undefined);
+});
+
+test('after two partial checks the next message confirms, and says it went past a partial diff', { skip: !PARTIAL_ESCAPE && 'needs the partial escape of check.ts (wp/fu2-skill-check)' }, async () => {
+  const s = partialSetup({ partial_checks: 2, partial_check_id: MID2 });
+  // A redelivery of the message that made the count 2 has only 1 earlier partial check.
+  reclaim(s.table, KEY, MID2);
+  assert.equal((await run(checkMessage({ maintenance_id: MID2 }), s.deps)).result.decision, 'inconclusive');
+  assert.equal(s.table.item(KEY).partial_checks, 2);
+
+  const MID3 = 'check#valkey-review#rec-1#2026-10-27T00:00:00.000Z';
+  reclaim(s.table, KEY, MID3);
+  const { result, lines } = await run(checkMessage({ maintenance_id: MID3 }), s.deps);
+  assert.equal(result.decision, 'clean');
+  const item = s.table.item(KEY);
+  assert.equal(item.verified_sha, BIG_TIP);
+  assert.equal(item.partial_checks, undefined);
+  assert.equal(item.partial_check_id, undefined);
+  assert.match(item.check_note, /^advanced past a partial diff after 2 partial checks/);
+  assert.ok(claimGone(item));
+  assert.ok(lines.includes(`[maintenance] partial-advance "db-flush" base=${BIG_BASE.slice(0, 12)} tip=${BIG_TIP.slice(0, 12)} partial_checks=2`), lines.join('\n'));
 });
 
 test('valid edits with applyEdits on are claimed, written update-only, then verified', async () => {
