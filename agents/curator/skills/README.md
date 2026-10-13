@@ -61,6 +61,19 @@ The curator's runtime role can only read this registry
 node scripts/registry-skills.mjs deprecate --registry-id <registry-id> --name <name> --reason "<why>"
 ```
 
+The reason is cut to 256 characters. `DEPRECATED` is final: the record
+can never be updated or set back, and the publish script then fails for
+that name. To bring the skill back, publish it under a new name (rename
+the file and its frontmatter `name`).
+
 The same script lists and deprecates the skills the curator graduated
 into a reviewer's registry; pass that reviewer's registry id, or
 `--stack <reviewer-stack-name>` to read its `SkillsRegistryId` output.
+The skill lifecycle records such a deprecation on the skill's concern
+record as `retired_reason` `operator` at its next check or retirement,
+and the curator never publishes that skill again unless an operator
+restores the record (see
+[infra/README.md](../../../infra/README.md#restoring-a-retired-skill)).
+`orphans --stack <reviewer-stack-name>` lists the live skills in a
+reviewer's registry that no concern record names, which the lifecycle
+never checks or retires.
