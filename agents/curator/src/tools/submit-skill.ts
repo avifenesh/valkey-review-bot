@@ -151,8 +151,12 @@ async function firstFreeName(registry: SkillPublisher, candidates: readonly stri
   return null;
 }
 
-/** Anything that reads as a suppression marker, wherever it is on a line. */
-const MARKER_LIKE_RE = /<!--\s*\/?\s*suppressed\b/i;
+/**
+ * Anything that reads as a suppression marker, wherever it is on a line.
+ * The slash and the space after it are one optional group, so a long run
+ * of spaces after "<!--" is matched in linear time.
+ */
+const MARKER_LIKE_RE = /<!--\s*(?:\/\s*)?suppressed\b/i;
 
 /** Each suppressed block as written: the opening marker, the suppressed lines and the closing marker. */
 function blockTexts(markdown: string, blocks: readonly { startLine: number; endLine: number }[]): string[] {

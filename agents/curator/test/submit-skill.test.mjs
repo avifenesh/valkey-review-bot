@@ -997,6 +997,18 @@ test('a skill deprecated between the read and the update is still marked retired
   assert.ok(registry.calls.includes(`upsert ${OLD}`), 'the refusal came from upsert');
 });
 
+test('suppressedBlocksProblem reads a long line of spaces after "<!--" in linear time', () => {
+  const head = '---\nname: x\ndescription: y\n---\n\n';
+  for (const opener of ['<!--', '<!-- /']) {
+    const line = opener + ' '.repeat(GRADUATED_SKILL_MAX_CHARS - head.length - opener.length - 20);
+    const started = Date.now();
+    assert.equal(suppressedBlocksProblem(null, `${head}${line}`), null, opener);
+    assert.match(suppressedBlocksProblem(null, `${head}${line}suppressed`), /Never write a marker yourself/, opener);
+    // Quadratic backtracking took seconds on a line this long.
+    assert.ok(Date.now() - started < 500, `${opener}: ${Date.now() - started} ms`);
+  }
+});
+
 test('suppressedBlocksProblem compares blocks byte for byte and ignores everything else', () => {
   assert.equal(suppressedBlocksProblem(PUBLISHED, PUBLISHED), null);
   assert.equal(suppressedBlocksProblem(null, INPUT.skill_md), null);
