@@ -11,6 +11,8 @@ import { modelAccessStatements } from './bedrock-arns';
 import type { CuratorAgentConfig, ModelsConfig, ReviewerId } from './deployment-config';
 import { createRuntimeRole, grantTableKeyUse, registryResources } from './grants';
 
+const CURATOR_RUNTIME_NAME = 'valkey_reviewer_curator_runtime';
+
 export interface CuratorAgentStackProps extends cdk.StackProps {
   /** Docker build context; the repository root. */
   readonly agentSourcePath: string;
@@ -64,6 +66,7 @@ export class CuratorAgentStack extends cdk.Stack {
     this.role = createRuntimeRole(this, 'CuratorRole', {
       description: 'Execution role for the curator runtime.',
       image,
+      runtimeName: CURATOR_RUNTIME_NAME,
     });
     props.assetsBucket.grantRead(this.role, 'curator/*');
     const m = props.models;
@@ -96,7 +99,7 @@ export class CuratorAgentStack extends cdk.Stack {
     }));
 
     this.runtime = new agentcore.CfnRuntime(this, 'CuratorRuntime', {
-      agentRuntimeName: 'valkey_reviewer_curator_runtime',
+      agentRuntimeName: CURATOR_RUNTIME_NAME,
       description: 'Curator for the valkey-reviewer agents: records maintainer feedback and graduates skills.',
       agentRuntimeArtifact: {
         containerConfiguration: { containerUri: image.imageUri },

@@ -99,6 +99,11 @@ describe('reviewer role', () => {
     expect(JSON.stringify(invoke)).not.toContain('TokenBrokerValkeyGlideReviewFn');
   });
 
+  test('the curator writes only its own runtime log groups', () => {
+    const group = `arn:aws:logs:us-west-2:${ACCOUNT}:log-group:/aws/bedrock-agentcore/runtimes/valkey_reviewer_curator_runtime-*`;
+    expect(resourceStrings(bySid(curatorStatements(), 'RuntimeLogs'))).toEqual([group, `${group}:*`]);
+  });
+
   test.each(['valkey-review', 'valkey-glide-review'] as const)('%s sessions end two hours after they start at the latest', (id) => {
     const runtime = Object.values<any>(reviewerTemplate(id).findResources('AWS::BedrockAgentCore::Runtime'))[0];
     expect(runtime.Properties.LifecycleConfiguration).toEqual({ IdleRuntimeSessionTimeout: 900, MaxLifetime: 7200 });
