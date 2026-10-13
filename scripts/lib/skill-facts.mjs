@@ -171,7 +171,8 @@ export async function skillFacts({ skillMd, upstream, record = null, base }) {
       area: globs.map((glob, i) => ({ glob, files: counts[i] })),
     };
   } catch (err) {
-    if (partialClone && err instanceof Error) {
+    // Git's own words for an object a partial clone lacks while lazy fetching is off.
+    if (partialClone && err instanceof Error && /lazy fetching disabled|from promisor remote/.test(err.message)) {
       err.message += `\n${partialClone} is a partial clone, and this reads only the objects it has. Fetch what the check needs there`
         + ' yourself (checking out --rev and --base does), or use --repo or --url.';
     }

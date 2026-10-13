@@ -169,6 +169,11 @@ test('a partial clone is read without fetching: what it lacks is an error, and n
     });
   }
   assert.deepEqual(objects(dir), before, 'no object was fetched into the clone');
+  await assert.rejects(skillFacts({ skillMd: SKILL, upstream: { checkout: dir, rev: 'no-such-rev' } }), (err) => {
+    assert.match(err.message, /names no commit/);
+    assert.ok(!err.message.includes('partial clone'), 'other errors get no partial-clone hint');
+    return true;
+  });
 });
 
 test('skill-facts.mjs refuses a partial clone with a git that cannot turn off lazy fetching', async () => {
