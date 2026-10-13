@@ -38,9 +38,10 @@ It also reads a retired skill (status DEPRECATED). Read-only: it uses neither th
         const name = typeof item.graduated_record_name === 'string' ? item.graduated_record_name : '';
         if (!name) return fail(`get_skill: record ${input.record_id} has not graduated, so it has no published skill`);
         if (!deps.registry.get) return fail('get_skill: no registry reader is configured');
-        // A generation submit_skill claimed but never published: show the
-        // skill it replaces, whose suppressed blocks the new text keeps.
-        const previous = typeof item.previous_record_name === 'string' ? item.previous_record_name : '';
+        // A generation submit_skill claimed but never published, on a
+        // record that is still a tombstone: show the skill it replaces,
+        // whose suppressed blocks the new text keeps, as submit_skill does.
+        const previous = item.retired_at !== undefined && typeof item.previous_record_name === 'string' ? item.previous_record_name : '';
         const skill = (await deps.registry.get(name)) ?? (previous ? await deps.registry.get(previous) : null);
         if (!skill) return fail(`get_skill: the registry has no skill named "${name}"`);
         return ok({

@@ -142,4 +142,13 @@ test('get_skill shows the replaced skill when a claimed generation never reached
   assert.equal(out.record_name, 'replication-handshake');
   assert.equal(out.skill_md, SKILL_MD);
   assert.deepEqual(reads, ['replication-handshake-1a2b3c4d', 'replication-handshake']);
+
+  // A live record whose skill is missing has nothing to fall back on: submit_skill compares against no text.
+  const live = setup({
+    item: { ...graduated, graduated_record_name: 'replication-handshake-1a2b3c4d', previous_record_name: 'replication-handshake' },
+    get: async (name) => (name === 'replication-handshake' ? { name, status: 'DEPRECATED', description: 'd', skillMd: SKILL_MD } : null),
+  });
+  const missing = parse(await live.tool.invoke({ area_bucket: 'src', record_id: 'r1' }));
+  assert.equal(missing.ok, false);
+  assert.match(missing.error, /the registry has no skill named "replication-handshake-1a2b3c4d"/);
 });
