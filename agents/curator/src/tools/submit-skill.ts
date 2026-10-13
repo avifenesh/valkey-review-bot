@@ -35,11 +35,12 @@ import { errorText, fail, ok, type TouchedRecord } from './run.js';
  *
  * A new generation is claimed on the record while it stays a tombstone:
  * the claim sets the new name and previous_record_name and removes
- * graduated_at, and only the write after the publish sets graduated_at
- * and removes retired_at. Until then retired_* describe the skill the
- * generation replaces. The lifecycle never retires a tombstone's skill,
- * so a claimed generation the registry shows retired was retired by an
- * operator.
+ * graduated_at. The write after the publish sets graduated_at and
+ * removes retired_at; it is retried, and if it still fails, a later
+ * reinforcement finishes the publication under the claimed name. Until
+ * then retired_* describe the skill the generation replaces. The
+ * lifecycle never retires a tombstone's skill, so a claimed generation
+ * the registry shows retired was retired by an operator.
  *
  * Release-check edits. A check run that applies an edit (the curator's
  * maintenance mode) first claims it with a write that sets revised_at
@@ -249,9 +250,9 @@ const MAINTENANCE_RETRY_MS = 7 * 24 * 3600 * 1000;
 
 /**
  * Whether a check run is applying an edit: it removed maintenance_id
- * and has not yet removed maintenance_requested_at.
- * Every other writer sets or removes the claim's attributes together.
- * After MAINTENANCE_RETRY_MS the claim has expired, as decay sees it.
+ * and has not yet removed maintenance_requested_at. Every other writer
+ * sets or removes the claim's attributes together. After
+ * MAINTENANCE_RETRY_MS the claim has expired, as decay sees it.
  */
 function reviseInFlight(item: Item, nowMs: number): boolean {
   if (item.maintenance_id !== undefined || typeof item.maintenance_requested_at !== 'string') return false;
@@ -446,8 +447,9 @@ async function chooseTarget(
   if (!deps.registry.get) return `cannot read the retired skill "${current}" (no registry reader is configured)`;
   const published = await deps.registry.get(current);
   // Not retired in the registry: an earlier re-publication claimed this
-  // name and then failed. Finish it under the same name. When it never
-  // reached the registry, the blocks to keep are the retired skill's.
+  // name and its upsert, or the write after it, failed. Finish it under
+  // the same name. When it never reached the registry, the blocks to
+  // keep are the retired skill's.
   if (published && !isRetiredStatus(published.status)) return keep(true, published.skillMd);
   if (!published) {
     const before = typeof source.previous_record_name === 'string' ? await deps.registry.get(source.previous_record_name) : null;
