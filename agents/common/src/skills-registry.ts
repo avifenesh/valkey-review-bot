@@ -33,7 +33,7 @@ export const GRADUATED_SKILLS_MAX_CHARS = 80_000;
  */
 export const GRADUATED_SKILL_MAX_CHARS = 40_000;
 
-/** Longest status reason deprecateSkill sends; a longer one is cut. */
+/** Longest status reason deprecateSkill sends, in UTF-16 code units; a longer one is cut. */
 export const STATUS_REASON_MAX_CHARS = 256;
 
 /**
@@ -267,8 +267,20 @@ export async function upsertSkill(
 }
 
 /**
+ * `text` cut to at most `max` UTF-16 code units, one fewer when the cut
+ * would split a surrogate pair, so the result never ends in half of a
+ * character. That keeps it within `max` whether the service counts code
+ * units or code points.
+ */
+function cutOnCodePoints(text: string, max: number): string {
+  if (text.length <= max) return text;
+  const high = text.charCodeAt(max - 1);
+  return text.slice(0, high >= 0xd800 && high <= 0xdbff ? max - 1 : max);
+}
+
+/**
  * Retire a skill record: set its status to DEPRECATED with a reason,
- * trimmed and cut to STATUS_REASON_MAX_CHARS. Reviewers stop loading it
+ * trimmed and cut to STATUS_REASON_MAX_CHARS without splitting a character. Reviewers stop loading it
  * at their next run. DEPRECATED is terminal, so this cannot be undone;
  * a returning skill is published under a new name. A refused transition
  * (for example a ValidationException) is thrown to the caller. Returns
@@ -280,7 +292,7 @@ export async function deprecateSkill(
   recordId: string,
   reason: string,
 ): Promise<string> {
-  const statusReason = reason.trim().slice(0, STATUS_REASON_MAX_CHARS).trimEnd();
+  const statusReason = cutOnCodePoints(reason.trim(), STATUS_REASON_MAX_CHARS).trimEnd();
   if (!statusReason) throw new Error('deprecateSkill needs a reason');
   const resp = await retryWhileBusy(() => client.send(new UpdateRegistryRecordStatusCommand({
     registryId,

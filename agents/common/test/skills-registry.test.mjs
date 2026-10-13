@@ -210,6 +210,18 @@ test('deprecateSkill sets DEPRECATED with the reason trimmed to the limit', asyn
   assert.ok(call.input.statusReason.startsWith('valkey-reviewer: retired (decayed) 2026-10-13; x'));
 });
 
+test('deprecateSkill does not cut a reason in the middle of a character', async () => {
+  const client = fakeClient([]);
+  // U+1F512 takes two code units, at 255 and 256: a plain cut at 256 would keep half of it.
+  await deprecateSkill(client, 'reg', 'rec-1', `${'x'.repeat(STATUS_REASON_MAX_CHARS - 1)}\u{1F512} locked`);
+  const sent = client.calls[0].input.statusReason;
+  assert.ok(sent.isWellFormed(), 'no lone surrogate');
+  assert.equal(sent, 'x'.repeat(STATUS_REASON_MAX_CHARS - 1));
+  // A character that ends right at the limit is kept whole.
+  await deprecateSkill(client, 'reg', 'rec-1', `${'x'.repeat(STATUS_REASON_MAX_CHARS - 2)}\u{1F512} locked`);
+  assert.equal(client.calls[1].input.statusReason, `${'x'.repeat(STATUS_REASON_MAX_CHARS - 2)}\u{1F512}`);
+});
+
 test('deprecateSkill keeps a short reason as written, without surrounding space', async () => {
   const client = fakeClient([]);
   await deprecateSkill(client, 'reg', 'rec-1', '\n valkey-reviewer: retired (obsolete) 2026-10-13 \n');
