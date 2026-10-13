@@ -35,9 +35,9 @@ export function transactionCanceled(codes = []) {
 
 /**
  * Evaluate a ConditionExpression of attribute_exists(#n),
- * attribute_not_exists(#n) and `#n = :v` clauses joined by AND against
- * an item (undefined when the item does not exist). Other syntax throws,
- * so a test cannot pass on a clause it did not evaluate.
+ * attribute_not_exists(#n), `#n = :v` and `#n >= :v` clauses joined by
+ * AND against an item (undefined when the item does not exist). Other
+ * syntax throws, so a test cannot pass on a clause it did not evaluate.
  */
 export function conditionHolds(item, input) {
   const names = input.ExpressionAttributeNames ?? {};
@@ -48,8 +48,52 @@ export function conditionHolds(item, input) {
     if ((m = clause.match(/^attribute_exists\((#\w+)\)$/))) return attr(m[1]) !== undefined;
     if ((m = clause.match(/^attribute_not_exists\((#\w+)\)$/))) return attr(m[1]) === undefined;
     if ((m = clause.match(/^(#\w+) = (:\w+)$/))) return attr(m[1]) !== undefined && attr(m[1]) === values[m[2]];
+    if ((m = clause.match(/^(#\w+) >= (:\w+)$/))) return typeof attr(m[1]) === 'number' && attr(m[1]) >= values[m[2]];
     throw new Error(`conditionHolds cannot evaluate "${clause}"`);
   });
+}
+
+/**
+ * Apply an UpdateExpression of `SET #n = :v, ...` and `REMOVE #n, ...`
+ * to a copy of `item`. Other syntax throws.
+ */
+export function applyUpdate(item, input) {
+  const names = input.ExpressionAttributeNames ?? {};
+  const values = input.ExpressionAttributeValues ?? {};
+  const next = structuredClone(item ?? input.Key);
+  const m = input.UpdateExpression.match(/^(?:SET (.+?))?(?:\s*REMOVE (.+))?$/);
+  if (!m || (!m[1] && !m[2])) throw new Error(`applyUpdate cannot apply "${input.UpdateExpression}"`);
+  for (const clause of m[1] ? m[1].split(', ') : []) {
+    const set = clause.match(/^(#\w+) = (:\w+)$/);
+    if (!set) throw new Error(`applyUpdate cannot apply "${clause}"`);
+    next[names[set[1]]] = structuredClone(values[set[2]]);
+  }
+  for (const placeholder of m[2] ? m[2].split(', ') : []) {
+    if (!/^#\w+$/.test(placeholder)) throw new Error(`applyUpdate cannot remove "${placeholder}"`);
+    delete next[names[placeholder]];
+  }
+  return next;
+}
+
+/**
+ * A concerns table in memory. GetCommand returns copies; UpdateCommand
+ * evaluates its condition like DynamoDB (conditionFailed when it does
+ * not hold) and applies the update.
+ */
+export function memoryTable(items = []) {
+  const keyOf = (key) => `${key.area_bucket}\u0000${key.record_id}`;
+  const rows = new Map(items.map((item) => [keyOf(item), structuredClone(item)]));
+  const ddb = fakeDdb({
+    GetCommand: (input) => ({ Item: rows.has(keyOf(input.Key)) ? structuredClone(rows.get(keyOf(input.Key))) : undefined }),
+    UpdateCommand: (input) => {
+      const current = rows.get(keyOf(input.Key));
+      if (input.ConditionExpression && !conditionHolds(current, input)) throw conditionFailed();
+      const next = applyUpdate(current, input);
+      rows.set(keyOf(input.Key), next);
+      return input.ReturnValues === 'ALL_NEW' ? { Attributes: structuredClone(next) } : {};
+    },
+  });
+  return { ddb, item: (areaBucket, recordId) => rows.get(keyOf({ area_bucket: areaBucket, record_id: recordId })) };
 }
 
 export const REINFORCER = 'maintainer#valkey-io/valkey#42';
