@@ -69,6 +69,8 @@ test('the prompt keeps suppressed skill pieces for older release lines only', ()
   assert.ok(prompt.indexOf(para) < prompt.indexOf('\nConfidence:\n'));
 });
 
+// Reads the GLIDE reviewer's prompt too, so it needs the whole repository
+// checked out, as CI has it; the reviewer images do not run tests.
 test('the reviewer prompts share the mention and suppressed-skill text', () => {
   const valkey = readFileSync(new URL('../config/prompt.md', import.meta.url), 'utf8');
   const glide = readFileSync(new URL('../../valkey-glide-review/config/prompt.md', import.meta.url), 'utf8');
