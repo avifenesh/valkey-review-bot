@@ -3,7 +3,7 @@ import test from 'node:test';
 import './support/ts-resolve.mjs';
 import { fakeDdb } from './support/fakes.mjs';
 
-const { budgetKey, createDeliveryStore, releaseQuietly } = await import('../src/store.ts');
+const { autoReviewKey, budgetKey, createDeliveryStore, releaseQuietly } = await import('../src/store.ts');
 
 const TABLE = 'idempotency';
 const at = (iso) => () => new Date(iso);
@@ -41,6 +41,8 @@ test('other DynamoDB errors are not mistaken for duplicates', async () => {
   const store = createDeliveryStore(throttled, TABLE);
   await assert.rejects(store.claim('k'), /slow down/);
   await assert.rejects(store.takeReviewSlot('route', 40), /slow down/);
+  await assert.rejects(store.takeAutoReview('o/r', 1, 3), /slow down/);
+  await assert.rejects(store.returnAutoReview('o/r', 1), /slow down/);
 });
 
 test('the budget key names the route and the UTC day', () => {
@@ -80,6 +82,51 @@ test('a zero budget admits nothing and does not touch the table', async () => {
   const store = createDeliveryStore(ddb, TABLE);
   assert.equal(await store.takeReviewSlot('r', 0), false);
   assert.equal(ddb.calls.length, 0);
+});
+
+test('the automatic review key names the lowercased repository and the PR', () => {
+  assert.equal(autoReviewKey('Example-Org/Valkey', 7), 'autoreviews#example-org/valkey#7');
+});
+
+test('automatic reviews are numbered per pull request up to the cap', async () => {
+  const ddb = fakeDdb();
+  const store = createDeliveryStore(ddb, TABLE, at('2026-10-13T08:00:00Z'));
+  assert.deepEqual([
+    await store.takeAutoReview('o/r', 7, 3),
+    await store.takeAutoReview('O/R', 7, 3),
+    await store.takeAutoReview('o/r', 7, 3),
+    await store.takeAutoReview('o/r', 7, 3),
+  ], [1, 2, 3, 0]);
+  assert.equal(await store.takeAutoReview('o/r', 8, 3), 1, 'pull requests count separately');
+  assert.equal(await store.takeAutoReview('o/r', 7, 4), 4, 'a raised cap allows more');
+
+  const counter = ddb.items.get('autoreviews#o/r#7');
+  assert.equal(counter.reviews, 4);
+  assert.equal(counter.ttl, Date.parse('2027-04-11T08:00:00Z') / 1000, 'kept for 180 days after the latest');
+  const update = ddb.calls.find((c) => c.op === 'UpdateCommand').input;
+  assert.equal(update.ConditionExpression, 'attribute_not_exists(#reviews) OR #reviews < :cap');
+  assert.equal(update.ReturnValues, 'UPDATED_NEW');
+});
+
+test('a zero cap admits nothing and does not touch the table', async () => {
+  const ddb = fakeDdb();
+  const store = createDeliveryStore(ddb, TABLE);
+  assert.equal(await store.takeAutoReview('o/r', 7, 0), 0);
+  assert.equal(ddb.calls.length, 0);
+});
+
+test('a returned automatic review can be taken again, and the count never goes below zero', async () => {
+  const ddb = fakeDdb();
+  const store = createDeliveryStore(ddb, TABLE);
+  assert.equal(await store.takeAutoReview('o/r', 7, 1), 1);
+  assert.equal(await store.takeAutoReview('o/r', 7, 1), 0);
+  await store.returnAutoReview('o/r', 7);
+  assert.equal(ddb.items.get('autoreviews#o/r#7').reviews, 0);
+  await store.returnAutoReview('o/r', 7);
+  await store.returnAutoReview('o/r', 9);
+  assert.equal(ddb.items.get('autoreviews#o/r#7').reviews, 0);
+  assert.equal(ddb.items.has('autoreviews#o/r#9'), false);
+  assert.equal(await store.takeAutoReview('o/r', 7, 1), 1);
 });
 
 test('releaseQuietly logs a failed release instead of throwing', async () => {

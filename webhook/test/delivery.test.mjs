@@ -106,6 +106,7 @@ test('a verified delivery logs its metadata and decision', async () => {
   const { handler, logs } = setup();
   await handler(delivery('pull_request', prEvent('opened')));
   assert.deepEqual(logs, [
+    `[auto-review] route=valkey-review repo=${REPO} pr=7 round=1/3 queued`,
     `[delivery] event=pull_request action=opened repo=${REPO} actor=author status=200 decision=enqueued:${REPO}#7#abc123`,
   ]);
 });
@@ -143,6 +144,43 @@ test('a duplicate delivery is skipped and does not use budget', async () => {
   assert.equal(body(await handler(delivery('pull_request', prEvent('opened')))).skipped, 'duplicate');
   assert.equal(sent.length, 1);
   assert.equal(store.slotsTaken, 1);
+  assert.equal(store.autoReviews.get(`${REPO}#7`), 1);
+});
+
+test('the first automatic review counts toward the pull request\'s cap', async () => {
+  const { handler, sent, store } = setup();
+  await handler(delivery('pull_request', prEvent('opened', { number: 1 })));
+  await handler(delivery('pull_request', prEvent('ready_for_review', { number: 2 }, GLIDE)));
+  await handler(delivery('pull_request', prEvent('reopened', { number: 3, head: { sha: 'fff' } })));
+  assert.equal(sent.length, 3);
+  assert.equal(store.autoReviews.get(`${REPO}#1`), 1);
+  assert.equal(store.autoReviews.get(`${GLIDE}#2`), 1);
+  assert.equal(store.autoReviews.get(`${REPO}#3`), 1);
+});
+
+test('at the cap an automatic review is skipped, logged, and gives back what it took', async () => {
+  const { handler, sent, store, logs } = setup({ env: { MAX_AUTOMATIC_REVIEWS_PER_PR: '2' } });
+  store.autoReviews.set(`${REPO}#7`, 2);
+  const resp = await handler(delivery('pull_request', prEvent('reopened')));
+  assert.equal(body(resp).skipped, 'auto-review-cap');
+  assert.equal(sent.length, 0);
+  assert.equal(store.autoReviews.get(`${REPO}#7`), 2);
+  assert.deepEqual(store.released, [`${REPO}#7#abc123`]);
+  assert.equal(store.slotsTaken, 0, 'a capped review uses no budget');
+  assert.deepEqual(logs, [
+    `[auto-review] route=valkey-review repo=${REPO} pr=7 cap=2 reached; skipped`,
+    `[delivery] event=pull_request action=reopened repo=${REPO} actor=author status=200 decision=skipped:auto-review-cap`,
+  ]);
+});
+
+test('the cap counts per pull request, whatever the repository name\'s case', async () => {
+  const { handler, sent, store } = setup({ env: { MAX_AUTOMATIC_REVIEWS_PER_PR: '1' } });
+  store.autoReviews.set(`${REPO}#7`, 1);
+  const upper = prEvent('opened', {}, 'Example-Org/Valkey');
+  assert.equal(body(await handler(delivery('pull_request', upper))).skipped, 'auto-review-cap');
+  await handler(delivery('pull_request', prEvent('opened', { number: 8 })));
+  assert.equal(sent.length, 1);
+  assert.equal(sent[0].body.pr_number, 8);
 });
 
 test('route gates: unrouted, mention-only, bot author, author allowlist, other actions', async () => {
@@ -187,6 +225,7 @@ test('over budget: the review is skipped, logged, and its key released', async (
     assert.equal(body(resp).skipped, 'budget-exhausted=valkey-review');
     assert.equal(sent.length, 1);
     assert.deepEqual(store.released, [`${REPO}#2#abc123`]);
+    assert.equal(store.autoReviews.get(`${REPO}#2`), 0, 'the pull request keeps its automatic review');
     assert.match(warnings[0], /\[budget\] route=valkey-review daily budget of 1 reviews used up; skipped example-org\/valkey#2/);
   } finally {
     console.warn = original;
@@ -216,6 +255,28 @@ test('@mention summons are not budgeted', async () => {
   assert.equal(store.slotsTaken, 0);
 });
 
+test('@mention summons run past the automatic review cap and do not count toward it', async () => {
+  const { handler, sent, store } = setup({
+    github: {
+      [`GET repos/${REPO}/collaborators/maintainer/permission`]: { status: 200, json: { permission: 'write' } },
+      [`GET repos/${REPO}/pulls/7`]: { status: 200, json: { state: 'open', head: { sha: 'abc123' } } },
+      [`POST repos/${REPO}/issues/7/comments`]: { status: 201, json: { id: 5 } },
+    },
+  });
+  store.autoReviews.set(`${REPO}#7`, 3);
+  const resp = await handler(delivery('issue_comment', {
+    action: 'created',
+    installation: { id: 42 },
+    repository: { full_name: REPO },
+    sender: { login: 'maintainer' },
+    issue: { number: 7, pull_request: {}, user: { login: 'author' } },
+    comment: { id: 11, body: '@example-reviewer review please', user: { login: 'maintainer' }, author_association: 'MEMBER' },
+  }));
+  assert.equal(body(resp).enqueued, 'mention#issue_comment-11');
+  assert.equal(sent.length, 1);
+  assert.equal(store.autoReviews.get(`${REPO}#7`), 3);
+});
+
 test('a failed enqueue releases the key and returns 500 so a redelivery works', async () => {
   let fail = true;
   const sent = [];
@@ -233,6 +294,8 @@ test('a failed enqueue releases the key and returns 500 so a redelivery works', 
     assert.equal(first.statusCode, 500);
     assert.deepEqual(body(first), { error: 'internal' });
     assert.deepEqual(store.released, [`${REPO}#7#abc123`]);
+    assert.equal(store.autoReviews.get(`${REPO}#7`), 0, 'the automatic review is given back');
+    assert.equal(store.slotsTaken, 1, 'the budget slot is not');
   } finally {
     console.error = original;
   }
@@ -240,6 +303,23 @@ test('a failed enqueue releases the key and returns 500 so a redelivery works', 
   const second = await handler(delivery('pull_request', prEvent('opened')));
   assert.equal(second.statusCode, 200);
   assert.equal(sent.length, 1);
+  assert.equal(store.autoReviews.get(`${REPO}#7`), 1);
+});
+
+test('a store failure after the claim gives back the key and the automatic review', async () => {
+  const store = fakeStore();
+  store.takeReviewSlot = async () => { throw new Error('throttled'); };
+  const { handler, sent } = setup({ store });
+  const original = console.error;
+  console.error = () => {};
+  try {
+    assert.equal((await handler(delivery('pull_request', prEvent('opened')))).statusCode, 500);
+  } finally {
+    console.error = original;
+  }
+  assert.equal(sent.length, 0);
+  assert.deepEqual(store.released, [`${REPO}#7#abc123`]);
+  assert.equal(store.autoReviews.get(`${REPO}#7`), 0);
 });
 
 function reviewReply(comment = {}, repo = REPO) {

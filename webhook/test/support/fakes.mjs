@@ -8,8 +8,9 @@ export function conditionFailed() {
 
 /**
  * An in-memory DynamoDB document client for the receiver's table. It
- * understands the three commands src/store.ts sends, including the
- * budget counter's condition, and records every call.
+ * understands the commands src/store.ts sends, including the conditions
+ * on the review counters, and records every call. Any other condition
+ * fails the test.
  */
 export function fakeDdb() {
   const items = new Map();
@@ -32,26 +33,42 @@ export function fakeDdb() {
       }
       if (op === 'UpdateCommand') {
         const item = items.get(input.Key.key) ?? { key: input.Key.key };
-        const budget = input.ExpressionAttributeValues[':budget'];
-        if (item.reviews !== undefined && !(item.reviews < budget)) throw conditionFailed();
-        item.reviews = (item.reviews ?? 0) + input.ExpressionAttributeValues[':one'];
-        item.ttl = input.ExpressionAttributeValues[':ttl'];
+        const values = input.ExpressionAttributeValues;
+        const below = /^attribute_not_exists\(#reviews\) OR #reviews < (:\w+)$/.exec(input.ConditionExpression);
+        if (below) {
+          if (item.reviews !== undefined && !(item.reviews < values[below[1]])) throw conditionFailed();
+        } else if (input.ConditionExpression === '#reviews > :zero') {
+          if (!(item.reviews > values[':zero'])) throw conditionFailed();
+        } else {
+          throw new Error(`unexpected condition ${input.ConditionExpression}`);
+        }
+        const add = /ADD #reviews (:\w+)/.exec(input.UpdateExpression);
+        item.reviews = (item.reviews ?? 0) + values[add[1]];
+        if (/SET #ttl = :ttl/.test(input.UpdateExpression)) item.ttl = values[':ttl'];
         items.set(input.Key.key, item);
-        return {};
+        return input.ReturnValues === 'UPDATED_NEW' ? { Attributes: { reviews: item.reviews, ttl: item.ttl } } : {};
       }
       throw new Error(`unexpected ${op}`);
     },
   };
 }
 
-/** An in-memory DeliveryStore with the same behavior as src/store.ts. */
+/**
+ * An in-memory DeliveryStore with the same behavior as src/store.ts.
+ * autoReviews counts automatic reviews per "owner/name#pr", lowercased.
+ */
 export function fakeStore({ budget = Infinity } = {}) {
   const keys = new Map();
   const released = [];
+  const autoReviews = new Map();
+  const returned = [];
   let slots = 0;
+  const prKey = (repo, prNumber) => `${repo.toLowerCase()}#${prNumber}`;
   return {
     keys,
     released,
+    autoReviews,
+    returned,
     get slotsTaken() { return slots; },
     async claim(key, attributes = {}) {
       if (keys.has(key)) return false;
@@ -66,6 +83,17 @@ export function fakeStore({ budget = Infinity } = {}) {
       if (slots >= Math.min(budget, dailyBudget)) return false;
       slots += 1;
       return true;
+    },
+    async takeAutoReview(repo, prNumber, cap) {
+      const taken = autoReviews.get(prKey(repo, prNumber)) ?? 0;
+      if (taken >= cap) return 0;
+      autoReviews.set(prKey(repo, prNumber), taken + 1);
+      return taken + 1;
+    },
+    async returnAutoReview(repo, prNumber) {
+      const taken = autoReviews.get(prKey(repo, prNumber)) ?? 0;
+      returned.push(prKey(repo, prNumber));
+      if (taken > 0) autoReviews.set(prKey(repo, prNumber), taken - 1);
     },
   };
 }

@@ -13,10 +13,10 @@ import { releaseQuietly, type DeliveryStore } from './store.js';
  *   1. Verify X-Hub-Signature-256 over the raw body. On a mismatch, fetch
  *      the secret again once in case it was rotated.
  *   2. pull_request opened, reopened or ready_for_review on a review route:
- *      route gates, idempotency key repo#pr#head_sha, the route's daily
- *      review budget, then the route's queue. New commits (synchronize)
- *      do not start a review; a maintainer can ask for one with an
- *      @mention.
+ *      route gates, idempotency key repo#pr#head_sha, the pull request's
+ *      cap on automatic reviews, the route's daily review budget, then the
+ *      route's queue. New commits (synchronize) do not start a review; a
+ *      maintainer can ask for one with an @mention.
  *   3. issue_comment, pull_request_review_comment, pull_request_review:
  *      an @mention of the bot is a review request (src/mention.ts).
  *      Everything else, and a thread reply even when it also starts a
@@ -88,6 +88,14 @@ export function createDeliveryHandler(
   const log = deps.log ?? ((line: string) => console.log(line));
   const release = (key: string): Promise<void> => deps.store.release(key);
 
+  async function returnAutoReviewQuietly(repo: string, prNumber: number): Promise<void> {
+    try {
+      await deps.store.returnAutoReview(repo, prNumber);
+    } catch (err) {
+      console.error(`[store] could not give back an automatic review of ${repo}#${prNumber}; the pull request has one fewer`, err);
+    }
+  }
+
   async function signatureMatches(body: Buffer, header: string | undefined): Promise<boolean> {
     if (!header) return false;
     const secret = await deps.webhookSecret(false);
@@ -151,30 +159,47 @@ export function createDeliveryHandler(
     const key = `${repo}#${prNumber}#${headSha}${ready ? '#ready' : ''}`;
     if (!(await deps.store.claim(key, { action }))) return skip('duplicate');
 
-    let admitted: boolean;
+    // What this review has taken so far, given back newest first when it
+    // is not queued, so a redelivery can try again. Each step logs its
+    // own failure instead of throwing.
+    const taken: (() => Promise<void>)[] = [() => releaseQuietly(release, key)];
+    const giveBack = async (): Promise<void> => {
+      for (let undo = taken.pop(); undo; undo = taken.pop()) await undo();
+    };
+
     try {
-      admitted = await deps.store.takeReviewSlot(route.routeId, config.dailyReviewBudget);
+      const cap = config.maxAutomaticReviewsPerPr;
+      const round = await deps.store.takeAutoReview(repo, prNumber, cap);
+      if (round === 0) {
+        await giveBack();
+        log(`[auto-review] route=${route.routeId} repo=${repo} pr=${prNumber} cap=${cap} reached; skipped`);
+        return skip('auto-review-cap');
+      }
+      taken.push(() => returnAutoReviewQuietly(repo, prNumber));
+
+      if (!(await deps.store.takeReviewSlot(route.routeId, config.dailyReviewBudget))) {
+        // Given back so a redelivery after the budget resets can still review.
+        await giveBack();
+        console.warn(`[budget] route=${route.routeId} daily budget of ${config.dailyReviewBudget} reviews used up; skipped ${repo}#${prNumber}`);
+        return skip(`budget-exhausted=${route.routeId}`);
+      }
+
+      // A failed send below still uses its budget slot. Failures are rare
+      // and the count only has to bound spend.
+      const envelope: ReviewEnvelope = {
+        repo,
+        pr_number: prNumber,
+        installation_id: target.installationId,
+        head_sha: headSha,
+        ...(ready ? { run_nonce: 'ready' } : {}),
+      };
+      await deps.sendMessage(route.queueUrl, envelope, { repo, pr_number: prNumber, action });
+      log(`[auto-review] route=${route.routeId} repo=${repo} pr=${prNumber} round=${round}/${cap} queued`);
     } catch (err) {
-      await releaseQuietly(release, key);
+      await giveBack();
       throw err;
     }
-    if (!admitted) {
-      // Released so a redelivery after the budget resets can still review.
-      await releaseQuietly(release, key);
-      console.warn(`[budget] route=${route.routeId} daily budget of ${config.dailyReviewBudget} reviews used up; skipped ${repo}#${prNumber}`);
-      return skip(`budget-exhausted=${route.routeId}`);
-    }
-
-    // A failed send below still uses its budget slot. Failures are rare
-    // and the count only has to bound spend.
-    const envelope: ReviewEnvelope = {
-      repo,
-      pr_number: prNumber,
-      installation_id: target.installationId,
-      head_sha: headSha,
-      ...(ready ? { run_nonce: 'ready' } : {}),
-    };
-    return enqueueClaimed(key, route.queueUrl, envelope, { repo, pr_number: prNumber, action });
+    return { status: 200, body: { ok: true, enqueued: key } };
   }
 
   async function mention(m: Mention, route: ReviewRoute, target: Target): Promise<Outcome> {
