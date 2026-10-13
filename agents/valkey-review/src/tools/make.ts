@@ -1,5 +1,5 @@
-import { spawn } from 'node:child_process';
 import { buildChildEnv, resolveInside } from '../../../common/src/tools/child-env.js';
+import { runBounded } from '../../../common/src/tools/spawn.js';
 import { z } from 'zod';
 import { tool } from '@strands-agents/sdk';
 import { MAKE_ALLOWED_TARGETS, MAKE_ALLOWED_VARS, makeArgs } from './make-policy.js';
@@ -27,39 +27,11 @@ Output is capped at 1 MB and 8 minutes. The tool returns stdout+stderr; exit cod
       const cwd = resolveInside(opts.workspaceRoot, input.subdir);
       if (!cwd) return `ERROR: subdir "${input.subdir}" is outside the workspace.`;
 
-      return await new Promise<string>((resolve) => {
-        const child = spawn('make', args, { cwd, env: buildChildEnv() });
-        const chunks: Buffer[] = [];
-        let total = 0;
-        const MAX = 1_000_000;
-        let truncated = false;
-        const timer = setTimeout(() => {
-          child.kill('SIGTERM');
-          setTimeout(() => child.kill('SIGKILL'), 3000);
-        }, 8 * 60_000);
-        const onData = (b: Buffer) => {
-          if (total + b.length > MAX) {
-            chunks.push(b.subarray(0, Math.max(0, MAX - total)));
-            total = MAX;
-            truncated = true;
-            child.kill('SIGTERM');
-          } else {
-            chunks.push(b);
-            total += b.length;
-          }
-        };
-        child.stdout.on('data', onData);
-        child.stderr.on('data', onData);
-        child.on('error', (err) => {
-          clearTimeout(timer);
-          resolve(`ERROR: could not run make: ${err.message}`);
-        });
-        child.on('close', (code) => {
-          clearTimeout(timer);
-          const out = Buffer.concat(chunks).toString('utf8');
-          resolve(`${out}${truncated ? '\n[output truncated]' : ''}\n[exit ${code}]`);
-        });
+      const r = await runBounded('make', args, {
+        cwd, env: buildChildEnv(), timeoutMs: 8 * 60_000, maxBytes: 1_000_000, mergeStderr: true, graceMs: 3000,
       });
+      if (r.err) return `ERROR: ${r.err}`;
+      return `${r.out}\n[exit ${r.code}]`;
     },
   });
 }
