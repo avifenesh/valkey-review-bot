@@ -61,7 +61,8 @@ const REAL_GIT = execFileSync('sh', ['-c', 'command -v git'], { encoding: 'utf8'
 /**
  * An environment whose `git` drops GIT_NO_LAZY_FETCH, as git before 2.44
  * ignores it, and fails (mode 'fail') or stalls (mode 'stall') any fetch
- * that names `base`.
+ * that names `base`. In mode 'stall-writer' the stalled fetch also starts
+ * a child that appends a line to `root`/writer.log every 100 ms for 10 s.
  */
 function oldGitEnv(root, base, mode) {
   const bin = path.join(root, 'bin');
@@ -73,6 +74,10 @@ function oldGitEnv(root, base, mode) {
     '  for a in "$@"; do',
     '    if [ "$a" = "$SKC_BASE" ]; then',
     '      [ "$SKC_MODE" = stall ] && exec sleep 30',
+    '      if [ "$SKC_MODE" = stall-writer ]; then',
+    '        ( i=0; while [ $i -lt 100 ]; do echo x >> "$SKC_WRITER_LOG"; i=$((i + 1)); sleep 0.1; done ) &',
+    '        exec sleep 30',
+    '      fi',
     '      echo "fatal: simulated network failure" >&2',
     '      exit 128',
     '    fi',
@@ -81,7 +86,10 @@ function oldGitEnv(root, base, mode) {
     'exec "$SKC_REAL_GIT" "$@"',
     '',
   ].join('\n'), { mode: 0o755 });
-  return { ...upstreamGitEnv(), PATH: `${bin}:${process.env.PATH}`, SKC_BASE: base, SKC_MODE: mode, SKC_REAL_GIT: REAL_GIT };
+  return {
+    ...upstreamGitEnv(), PATH: `${bin}:${process.env.PATH}`,
+    SKC_BASE: base, SKC_MODE: mode, SKC_REAL_GIT: REAL_GIT, SKC_WRITER_LOG: path.join(root, 'writer.log'),
+  };
 }
 
 test('the checkout finds the default branch, fetches tip and base at depth 1 and detaches at the tip', async () => {
@@ -138,6 +146,22 @@ test('a base fetch that stalls times out to baseAvailable false and the checkout
   assert.ok(Date.now() - started < 10_000);
   assert.equal(co.baseAvailable, false);
   assert.equal(gitIn(path.join(up.root, 'checkout'))('rev-parse', 'HEAD'), up.tipSha);
+  await removeCheckout(up.root);
+});
+
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+const sizeOf = (file) => (existsSync(file) ? readFileSync(file).length : 0);
+
+test('a base fetch that times out is killed with everything it started', { timeout: 20_000 }, async () => {
+  const up = makeUpstream();
+  const env = oldGitEnv(up.root, up.baseSha, 'stall-writer');
+  const co = await prepareUpstreamCheckout({ dir: path.join(up.root, 'checkout'), url: up.url, verifiedSha: up.baseSha, env, baseTimeoutMs: 500 });
+  assert.equal(co.baseAvailable, false);
+  const log = env.SKC_WRITER_LOG;
+  assert.ok(sizeOf(log) > 0, 'the writer ran');
+  const before = sizeOf(log);
+  await sleep(600);
+  assert.equal(sizeOf(log), before, 'a child of the stalled fetch kept writing');
   await removeCheckout(up.root);
 });
 
@@ -254,6 +278,25 @@ test('the runner returns exit codes, marks output past the cap and throws on a t
   assert.equal(cut.truncated, true);
   assert.ok(cut.stdout.length <= 1000);
   await assert.rejects(git(['-c', 'alias.wait=!sleep 5', 'wait'], { timeoutMs: 200 }), { message: 'git wait timed out after 0s' });
+  rmSync(dir, { recursive: true, force: true });
+});
+
+test('the runner kills what git started when the output passes the cap, or when git leaves it running', { timeout: 20_000 }, async () => {
+  const dir = tempDir('skc-runner3-');
+  gitIn(dir)('init', '-q');
+  const git = createGitRunner(dir);
+  const marker = path.join(dir, 'late');
+  // A child that would write a file later, and output past the cap.
+  const cut = await git(['-c', `alias.flood=!(sleep 0.5; touch ${marker}) & yes`, 'flood'], { maxBytes: 1000 });
+  assert.equal(cut.truncated, true);
+  assert.equal(cut.stdout.length, 1000);
+  // A child that holds git's output after git exits.
+  const started = Date.now();
+  const left = await git(['-c', `alias.leave=!(sleep 5; echo late; touch ${marker}) & echo early`, 'leave']);
+  assert.deepEqual({ code: left.code, stdout: left.stdout }, { code: 0, stdout: 'early\n' });
+  assert.ok(Date.now() - started < 4_000, 'waited for the child that held the output');
+  await sleep(800);
+  assert.equal(existsSync(marker), false, 'a child git started outlived the call');
   rmSync(dir, { recursive: true, force: true });
 });
 

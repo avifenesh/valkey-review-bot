@@ -1,4 +1,4 @@
-import { execFile } from 'node:child_process';
+import { spawn } from 'node:child_process';
 import { mkdir, readdir, rm } from 'node:fs/promises';
 import path from 'node:path';
 import type { Citation, LineResolver } from './edits.js';
@@ -38,7 +38,8 @@ export interface GitCallOptions {
 
 /**
  * Run git with an argv (no shell) in one directory. A non-zero exit is
- * returned, not thrown; a timeout or a git that cannot start throws.
+ * returned, not thrown; a timeout, a git killed by a signal or a git
+ * that cannot start throws.
  */
 export type GitRunner = (args: readonly string[], opts?: GitCallOptions) => Promise<GitResult>;
 
@@ -46,6 +47,9 @@ const GIT_TIMEOUT_MS = 10 * 60_000;
 /** Each best-effort step for the base: its fetch and its blob batch. */
 const BASE_TIMEOUT_MS = 3 * 60_000;
 const GIT_MAX_BYTES = 64 * 1024 * 1024;
+const STDERR_MAX_BYTES = 1024 * 1024;
+/** How long to wait for git's output to close after it exits or is killed. */
+const CLOSE_GRACE_MS = 2_000;
 const FILE_MAX_BYTES = 16 * 1024 * 1024;
 
 /** Same filter as tools/child-env.ts buildChildEnv. */
@@ -87,24 +91,95 @@ function subcommand(args: readonly string[]): string {
   return args[0] ?? '';
 }
 
+/**
+ * The runner of a checkout. git runs in its own process group, and a
+ * timeout, or stdout past `maxBytes`, kills the whole group: a lazy
+ * fetch or remote helper git started cannot keep writing into the
+ * repository after the call returns. So does a git that exits while
+ * something it started still holds its output, once a grace period
+ * has passed.
+ */
 export function createGitRunner(cwd: string, env: NodeJS.ProcessEnv = upstreamGitEnv()): GitRunner {
   return (args, opts = {}) => new Promise((resolve, reject) => {
     const timeoutMs = opts.timeoutMs ?? GIT_TIMEOUT_MS;
-    execFile('git', [...args], {
-      cwd,
-      env,
-      encoding: 'utf8',
-      timeout: timeoutMs,
-      killSignal: 'SIGKILL',
-      maxBuffer: opts.maxBytes ?? GIT_MAX_BYTES,
-      windowsHide: true,
-    }, (err, stdout, stderr) => {
-      if (!err) return resolve({ code: 0, stdout, stderr, truncated: false });
-      const e = err as NodeJS.ErrnoException & { code?: string | number; killed?: boolean; signal?: string | null };
-      if (e.code === 'ERR_CHILD_PROCESS_STDIO_MAXBUFFER') return resolve({ code: -1, stdout, stderr, truncated: true });
-      if (e.killed || e.signal) return reject(new Error(`git ${subcommand(args)} timed out after ${Math.round(timeoutMs / 1000)}s`));
-      if (typeof e.code === 'number') return resolve({ code: e.code, stdout, stderr, truncated: false });
+    const maxBytes = opts.maxBytes ?? GIT_MAX_BYTES;
+    const child = spawn('git', [...args], { cwd, env, detached: true, stdio: ['ignore', 'pipe', 'pipe'], windowsHide: true });
+    const out: Buffer[] = [];
+    const err: Buffer[] = [];
+    let outBytes = 0;
+    let errBytes = 0;
+    let truncated = false;
+    let timedOut = false;
+    let settled = false;
+    let status: { code: number | null; signal: NodeJS.Signals | null } = { code: null, signal: null };
+    let grace: NodeJS.Timeout | undefined;
+
+    const killGroup = () => {
+      try {
+        process.kill(-child.pid!, 'SIGKILL');
+      } catch {
+        // The group has already exited.
+      }
+    };
+    const finish = () => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      clearTimeout(grace);
+      child.stdout.destroy();
+      child.stderr.destroy();
+      const stdout = Buffer.concat(out).toString('utf8');
+      const stderr = Buffer.concat(err).toString('utf8');
+      if (timedOut) return reject(new Error(`git ${subcommand(args)} timed out after ${Math.round(timeoutMs / 1000)}s`));
+      if (truncated) return resolve({ code: -1, stdout, stderr, truncated: true });
+      if (status.code !== null) return resolve({ code: status.code, stdout, stderr, truncated: false });
+      reject(new Error(`git ${subcommand(args)} was killed by ${status.signal ?? 'a signal'}`));
+    };
+    // Kill the group, and stop waiting for its output after the grace period.
+    const stop = () => {
+      killGroup();
+      grace ??= setTimeout(finish, CLOSE_GRACE_MS);
+    };
+
+    const timer = setTimeout(() => {
+      timedOut = true;
+      stop();
+    }, timeoutMs);
+    child.stdout.on('data', (b: Buffer) => {
+      if (truncated) return;
+      if (outBytes + b.length > maxBytes) {
+        out.push(b.subarray(0, maxBytes - outBytes));
+        truncated = true;
+        stop();
+        return;
+      }
+      out.push(b);
+      outBytes += b.length;
+    });
+    child.stderr.on('data', (b: Buffer) => {
+      const kept = b.subarray(0, Math.max(0, STDERR_MAX_BYTES - errBytes));
+      err.push(kept);
+      errBytes += kept.length;
+    });
+    child.on('error', (e) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      clearTimeout(grace);
       reject(new Error(`could not run git: ${e.message}`));
+    });
+    child.on('exit', (code, signal) => {
+      status = { code, signal };
+      // 'close' waits for everything that holds git's output. Whatever
+      // git left running is stopped after the grace period.
+      grace ??= setTimeout(() => {
+        killGroup();
+        finish();
+      }, CLOSE_GRACE_MS);
+    });
+    child.on('close', (code, signal) => {
+      if (status.code === null && status.signal === null) status = { code, signal };
+      finish();
     });
   });
 }
@@ -126,7 +201,7 @@ export interface PrepareOptions {
   readonly branch?: string;
   /** Environment for git. Default upstreamGitEnv(). */
   readonly env?: NodeJS.ProcessEnv;
-  /** Timeout of each best-effort base step. Default 3 minutes. */
+  /** Timeout of each best-effort base step. Default 3 minutes. A step that times out is killed with everything it started. */
   readonly baseTimeoutMs?: number;
 }
 
