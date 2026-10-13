@@ -12,6 +12,7 @@ import {
   repoSkillPath,
   skillPublisher,
 } from '../dist/curator/src/maintenance.js';
+import { prepareUpstreamCheckout } from '../dist/common/src/skill-check/upstream.js';
 import { captureLogs, drain, fakeRegistry, makeUpstream, memoryTable, ScriptedModel, tempDir } from './maintenance-fakes.mjs';
 
 const TABLE = 'valkey_review_concerns';
@@ -428,6 +429,44 @@ test('a first check with every name present is clean', async () => {
   const item = s.table.item(KEY);
   assert.equal(item.verified_sha, TIP_SHA);
   assert.equal(item.verified_release, '');
+});
+
+// A base the checkout says it has but the repository lacks: the diff since it is never examined.
+const MISSING_BASE = 'f'.repeat(40);
+const claimingBase = async (opts) => ({ ...(await prepareUpstreamCheckout(opts)), baseAvailable: true });
+
+test('an incomplete result with nothing flagged is not confirmed and needs no model', async () => {
+  const s = setup({
+    item: record({ audit_names: new Set(['serverCron', 'src/server.c']), verified_sha: MISSING_BASE }),
+    skill: { name: NAME, skillMd: CLEAN_MD },
+    checkout: claimingBase,
+  });
+  const { result, lines } = await run(checkMessage(), s.deps);
+  assert.equal(result.decision, 'suspect');
+  assert.equal(s.modelBuilds(), 0);
+  const item = s.table.item(KEY);
+  assert.equal(item.verified_sha, MISSING_BASE);
+  assert.equal(item.verified_release, '9.1.2');
+  assert.match(item.check_note, /not examined in full/);
+  assert.ok(claimGone(item));
+  assert.ok(lines.some((l) => l.includes('is not in the repository')), lines.join('\n'));
+});
+
+test('an accurate verdict on an incomplete result keeps the verification where it was', async () => {
+  const md = '---\nname: db-flush\ndescription: Use when.\n---\n\n- `serverCron` is never `old_placeholder_name`.\n';
+  const s = setup({
+    item: record({ audit_names: new Set(['serverCron']), verified_sha: MISSING_BASE }),
+    skill: { name: NAME, skillMd: md },
+    turns: [report('accurate')],
+    checkout: claimingBase,
+  });
+  const { result } = await run(checkMessage(), s.deps);
+  assert.equal(result.decision, 'accurate');
+  const item = s.table.item(KEY);
+  assert.equal(item.verified_sha, MISSING_BASE);
+  assert.equal(item.verified_ref, undefined);
+  assert.deepEqual(set(item.audit_names), ['serverCron']);
+  assert.deepEqual(set(item.ignored_names), ['old_placeholder_name']);
 });
 
 test('valid edits with applyEdits on are claimed, written update-only, then verified', async () => {

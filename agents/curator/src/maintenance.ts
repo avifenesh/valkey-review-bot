@@ -706,16 +706,21 @@ function outcomeWrite(run: Run, v: Outcome): Write {
     .remove(...CLAIM);
 }
 
-/** The confirmation: verification moves to the checked commit unless the result was incomplete. */
+/**
+ * The confirmation: verification moves to the checked commit, with
+ * `present` as the new baseline, unless the result was incomplete
+ * (confirmableCommit). This is the one place that decides it.
+ */
 function confirm(w: Write, c: Checked, present: readonly string[], item: Item, lost: readonly string[]): void {
   const commit = confirmableCommit(c.result);
-  if (commit) {
-    w.set('verified_sha', commit).set('verified_ref', c.ref).setNames('audit_names', storedAudit(present));
-  } else {
-    // The baseline stays at the old commit; only lost names leave it, so each loss is penalised once.
-    const lostSet = new Set(lost);
-    w.setNames('audit_names', storedAudit(names(item.audit_names).filter((n) => !lostSet.has(n))));
-  }
+  if (commit) w.set('verified_sha', commit).set('verified_ref', c.ref).setNames('audit_names', storedAudit(present));
+  else keepBaseline(w, item, lost);
+}
+
+/** The baseline stays at the old commit; only lost names leave it, so each loss is penalised once. */
+function keepBaseline(w: Write, item: Item, lost: readonly string[]): void {
+  const gone = new Set(lost);
+  w.setNames('audit_names', storedAudit(names(item.audit_names).filter((n) => !gone.has(n))));
 }
 
 function storedAudit(list: Iterable<string>): string[] {
@@ -1029,8 +1034,8 @@ async function* checkBody(run: Run, req: CheckRequest, c: Checked, skill: SkillR
   const v: Outcome = { outcome: 'suspect', note: flaggedNote(`${counts}`) };
   await finishCheck(run, (it, penalty) => {
     const w = outcomeWrite(run, v).set('pending_revision', pendingRevision(run.nowIso, c, report, reason));
-    // The verification does not move: the baseline stays, less the lost names.
-    w.setNames('audit_names', storedAudit(names(it.audit_names).filter((n) => !r.lost.includes(n))));
+    // The verification does not move.
+    keepBaseline(w, it, r.lost);
     stale(w, it, unresolved, run.nowIso);
     if (penalty) penalize(w, it, r.keptFraction, r.lost.length);
     return w;
@@ -1095,9 +1100,7 @@ async function* applyRevision(
   };
   const build = (it: Item, penalty: boolean): Write => {
     const w = outcomeWrite(run, v).remove('pending_revision');
-    const commit = confirmableCommit(c.result);
-    if (commit) w.set('verified_sha', commit).set('verified_ref', c.ref).setNames('audit_names', storedAudit(after.present));
-    else w.setNames('audit_names', storedAudit(names(it.audit_names).filter((n) => !after.lost.includes(n))));
+    confirm(w, c, after.present, it, after.lost);
     stale(w, it, remaining, run.nowIso);
     if (run.liveRead) w.remove(MARKER);
     if (penalty) penalize(w, it, after.keptFraction, after.lost.length);
@@ -1196,7 +1199,7 @@ async function* repoCheck(run: Run, req: RepoCheckRequest): AsyncGenerator<Strea
       w.set('skills_repo_sha', fetched.sha).remove('pending_revision');
     };
     const notConfirmed = (w: Write, report: CheckReport | null, reason: string) => {
-      w.setNames('audit_names', storedAudit(names(item!.audit_names).filter((n) => !r.lost.includes(n))));
+      keepBaseline(w, item!, r.lost);
       stale(w, item!, unresolved, run.nowIso);
       w.set('skills_repo_sha', fetched.sha);
       if (report) w.set('pending_revision', pendingRevision(run.nowIso, c, report, reason));
