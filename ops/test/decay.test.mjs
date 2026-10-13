@@ -71,12 +71,14 @@ test('decayTable decays from the later of updated_at and decayed_at and keeps up
   assert.deepEqual(stats, { table: 'concerns', scanned: 2, decayed: 2, deleted: 0, skipped: 0, errors: 0 });
   const [fresh, stepped] = ddb.writes.map((w) => w.input);
   assert.equal(fresh.ExpressionAttributeValues[':s'], 0.5);
-  assert.equal(fresh.ConditionExpression, '#ua = :ua AND attribute_not_exists(#da)');
+  assert.equal(fresh.ConditionExpression, '#ua = :ua AND attribute_not_exists(#da) AND #ds = :ds');
   assert.equal(fresh.ExpressionAttributeValues[':ua'], daysAgo(30));
+  assert.equal(fresh.ExpressionAttributeValues[':ds'], 1);
   assert.equal(fresh.UpdateExpression, 'SET #ds = :s, #da = :now');
   assert.equal(stepped.ExpressionAttributeValues[':s'], 0.25);
-  assert.equal(stepped.ConditionExpression, '#ua = :ua AND #da = :da');
+  assert.equal(stepped.ConditionExpression, '#ua = :ua AND #da = :da AND #ds = :ds');
   assert.equal(stepped.ExpressionAttributeValues[':da'], daysAgo(30));
+  assert.equal(stepped.ExpressionAttributeValues[':ds'], 0.5);
 });
 
 test('a reinforcement after a decay pass starts from the reinforcement', async () => {
@@ -91,8 +93,8 @@ test('records below the floor are deleted only in the state the scan saw', async
   assert.equal(stats.deleted, 1);
   const { op, input } = ddb.writes[0];
   assert.equal(op, 'DeleteCommand');
-  assert.equal(input.ConditionExpression, '#ua = :ua AND attribute_not_exists(#da)');
-  assert.deepEqual(input.ExpressionAttributeNames, { '#ua': 'updated_at', '#da': 'decayed_at' });
+  assert.equal(input.ConditionExpression, '#ua = :ua AND attribute_not_exists(#da) AND #ds = :ds');
+  assert.deepEqual(input.ExpressionAttributeNames, { '#ua': 'updated_at', '#da': 'decayed_at', '#ds': 'decay_score' });
 });
 
 test('records reinforced during the pass are skipped, malformed ones counted as errors', async () => {
@@ -105,4 +107,38 @@ test('records reinforced during the pass are skipped, malformed ones counted as 
   );
   const stats = await decayTable(ddb, 'concerns', CONFIG, NOW);
   assert.deepEqual(stats, { table: 'concerns', scanned: 2, decayed: 0, deleted: 0, skipped: 1, errors: 1 });
+});
+
+test('every write is also conditioned on the decay_score as read, or its absence', async () => {
+  const ddb = fakeDdb([[
+    { area_bucket: 'src', record_id: 'scored', decay_score: 0.8, updated_at: daysAgo(30), decayed_at: daysAgo(1) },
+    { area_bucket: 'src', record_id: 'unscored', updated_at: daysAgo(30) },
+    { area_bucket: 'src', record_id: 'gone', updated_at: daysAgo(400) },
+  ]]);
+  await decayTable(ddb, 'concerns', CONFIG, NOW);
+  const [scored, unscored, gone] = ddb.writes.map((w) => w.input);
+  assert.match(scored.ConditionExpression, /(^| AND )#ds = :ds( AND |$)/);
+  assert.equal(scored.ExpressionAttributeValues[':ds'], 0.8);
+  assert.match(unscored.ConditionExpression, /(^| AND )attribute_not_exists\(#ds\)( AND |$)/);
+  assert.ok(!(':ds' in unscored.ExpressionAttributeValues));
+  assert.equal(unscored.ExpressionAttributeValues[':s'], 0.5, 'a record without a score starts from 1.0');
+  assert.equal(ddb.writes[2].op, 'DeleteCommand');
+  assert.match(gone.ConditionExpression, /(^| AND )attribute_not_exists\(#ds\)( AND |$)/);
+  for (const w of ddb.writes) assert.equal(w.input.ExpressionAttributeNames['#ds'], 'decay_score');
+});
+
+test('a record the curator re-scored after the scan is skipped', async () => {
+  const ddb = fakeDdb(
+    [[{ area_bucket: 'src', record_id: 'penalised', decay_score: 1, updated_at: daysAgo(30), decayed_at: daysAgo(1) }]],
+    (_op, input) => {
+      // The curator lowered the score to 0.4 between the scan and the write.
+      if (input.ExpressionAttributeValues[':ds'] !== 0.4) {
+        throw Object.assign(new Error('conditional'), { name: 'ConditionalCheckFailedException' });
+      }
+      return {};
+    },
+  );
+  const stats = await decayTable(ddb, 'concerns', CONFIG, NOW);
+  assert.equal(stats.skipped, 1);
+  assert.equal(stats.decayed, 0);
 });

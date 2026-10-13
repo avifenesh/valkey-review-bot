@@ -14,9 +14,9 @@ import { DynamoDBDocumentClient, DeleteCommand, ScanCommand, UpdateCommand } fro
  * With the default 30-day half-life and 0.05 floor, a record nobody
  * reinforces is deleted after about 130 days (30 * log2(20)).
  *
- * Writes are conditioned on the updated_at and decayed_at the scan
- * saw, so a record reinforced while the pass runs is skipped rather
- * than decayed or deleted.
+ * Writes are conditioned on the updated_at, decayed_at and decay_score
+ * the scan saw, so a record reinforced, or re-scored by the curator,
+ * while the pass runs is skipped rather than decayed or deleted.
  */
 
 export interface DecayConfig {
@@ -86,6 +86,29 @@ function isConditionFailure(err: unknown): boolean {
   return (err as { name?: string } | null)?.name === 'ConditionalCheckFailedException';
 }
 
+/**
+ * Condition and values that match a record only in the state the scan
+ * read: the same updated_at, decayed_at and decay_score, or each one
+ * still absent. Uses #ua, #da and #ds.
+ */
+function stateAsRead(updatedAt: string, decayedAt: string, decayScore: unknown): { unchanged: string; seen: Record<string, unknown> } {
+  const seen: Record<string, unknown> = { ':ua': updatedAt };
+  const parts = ['#ua = :ua'];
+  if (decayedAt) {
+    parts.push('#da = :da');
+    seen[':da'] = decayedAt;
+  } else {
+    parts.push('attribute_not_exists(#da)');
+  }
+  if (decayScore === undefined) {
+    parts.push('attribute_not_exists(#ds)');
+  } else {
+    parts.push('#ds = :ds');
+    seen[':ds'] = decayScore;
+  }
+  return { unchanged: parts.join(' AND '), seen };
+}
+
 export async function decayTable(ddb: SendClient, tableName: string, config: DecayConfig, nowMs: number): Promise<Stats> {
   let scanned = 0;
   let decayed = 0;
@@ -125,8 +148,7 @@ export async function decayTable(ddb: SendClient, tableName: string, config: Dec
       const score = typeof item.decay_score === 'number' ? item.decay_score : 1.0;
       const nextScore = decayedScore(score, (nowMs - since) / 1000, config.halfLifeSeconds);
 
-      const unchanged = decayedAt ? '#ua = :ua AND #da = :da' : '#ua = :ua AND attribute_not_exists(#da)';
-      const seen: Record<string, unknown> = decayedAt ? { ':ua': updatedAt, ':da': decayedAt } : { ':ua': updatedAt };
+      const { unchanged, seen } = stateAsRead(updatedAt, decayedAt, item.decay_score);
       const key = { area_bucket: areaBucket, record_id: recordId };
 
       try {
@@ -135,7 +157,7 @@ export async function decayTable(ddb: SendClient, tableName: string, config: Dec
             TableName: tableName,
             Key: key,
             ConditionExpression: unchanged,
-            ExpressionAttributeNames: { '#ua': 'updated_at', '#da': 'decayed_at' },
+            ExpressionAttributeNames: { '#ua': 'updated_at', '#da': 'decayed_at', '#ds': 'decay_score' },
             ExpressionAttributeValues: seen,
           }));
           deleted += 1;
