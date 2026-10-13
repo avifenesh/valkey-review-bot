@@ -39,9 +39,14 @@ export interface InvocationPayload {
   readonly repo: string; // "owner/name"
   readonly pr_number: number;
   readonly installation_id: number;
-  /** "push" when the receiver started the review for new commits (pull_request synchronize). */
+  /**
+   * Set on every automatic review, the ones the receiver starts for a
+   * pull_request event: "opened", "reopened", "ready_for_review" or
+   * "push" (new commits). @mention runs, thread replies included, have
+   * none.
+   */
   readonly trigger?: string;
-  /** The route's skipDrafts setting, sent with push reviews. */
+  /** The route's skipDrafts setting, sent with automatic reviews. */
   readonly skip_drafts?: boolean;
 }
 
@@ -112,23 +117,26 @@ export interface PrContext {
   readonly diffRefSpec: string; // "<mergeBaseSha>..<headSha>"
 }
 
-/** A push review that is not run: the reason, and the head the pull request was at. */
-export interface SkippedPushReview {
+/** An automatic review that is not run: the reason, and the head the pull request was at. */
+export interface SkippedReview {
   readonly skipped: string;
   readonly headSha: string;
 }
 
 /**
- * Why a push review should not run, or null when it should. A push
- * review waits in the queue for a while, so the pull request may have
- * been closed, merged or turned back into a draft since the push. Other
- * runs, such as a maintainer's @mention, go ahead in any state.
+ * Why an automatic review should not run, or null when it should. An
+ * automatic review can wait a long time before it runs: a review of new
+ * commits waits in the queue first, and any automatic review waits while
+ * another review of the pull request runs. By then the pull request may
+ * have been closed, merged or turned back into a draft. Runs without a
+ * trigger, a maintainer's @mention or thread reply, go ahead in any
+ * state.
  */
-export function pushReviewSkipReason(
+export function automaticReviewSkipReason(
   payload: Pick<InvocationPayload, 'trigger' | 'skip_drafts'>,
   pr: { readonly state: string; readonly draft?: boolean; readonly merged?: boolean },
 ): string | null {
-  if (payload.trigger !== 'push') return null;
+  if (!payload.trigger) return null;
   if (pr.state !== 'open') return `the pull request is ${pr.merged ? 'merged' : pr.state}`;
   if (pr.draft === true && payload.skip_drafts === true) return 'the pull request is a draft and this route skips drafts';
   return null;
@@ -291,16 +299,16 @@ async function listPrFiles(octokit: Octokit, owner: string, repo: string, prNumb
 }
 
 /**
- * Check out the pull request and gather what the review needs. A push
- * review whose pull request no longer wants one stops after reading the
- * pull request, before any git work, and returns why instead.
+ * Check out the pull request and gather what the review needs. An
+ * automatic review whose pull request no longer wants one stops after
+ * reading the pull request, before any git work, and returns why instead.
  */
 export async function prepareWorkspace(
   payload: InvocationPayload,
   octokit: Octokit,
   tokens: TokenSource,
   opts: WorkspaceOptions,
-): Promise<PrContext | SkippedPushReview> {
+): Promise<PrContext | SkippedReview> {
   const [owner, repoName] = payload.repo.split('/');
   if (!owner || !repoName) throw new Error(`bad repo: ${payload.repo}`);
   const cwd = opts.workspaceRoot;
@@ -308,7 +316,7 @@ export async function prepareWorkspace(
   const upstreamRepo = opts.upstreamRepo || prRepo;
 
   const { data: pr } = await octokit.pulls.get({ owner, repo: repoName, pull_number: payload.pr_number });
-  const skipped = pushReviewSkipReason(payload, pr);
+  const skipped = automaticReviewSkipReason(payload, pr);
   if (skipped !== null) return { skipped, headSha: pr.head.sha };
   const baseSha = pr.base.sha;
   const auth = async (): Promise<NodeJS.ProcessEnv> => gitAuthEnv(await tokens.get());

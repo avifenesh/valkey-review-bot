@@ -318,15 +318,17 @@ test('suppressed pieces of the baked-in skill reach the reviewer labelled', () =
   assert.ok(baseSystemPrompt('P', '# Skill\n\n## Use when\nbody').endsWith('\n\n# Skill\n\n## Use when\nbody'));
 });
 
-test('the payload schema keeps the push-review fields', () => {
-  const parsed = requestSchema.parse({ ...payload, trigger: 'push', skip_drafts: true, pending_marker: 'm-1' });
-  assert.equal(parsed.trigger, 'push');
-  assert.equal(parsed.skip_drafts, true);
-  assert.equal('pending_marker' in parsed, false);
+test('the payload schema keeps the automatic-review fields', () => {
+  for (const trigger of ['opened', 'reopened', 'ready_for_review', 'push']) {
+    const parsed = requestSchema.parse({ ...payload, trigger, skip_drafts: true, pending_marker: 'm-1' });
+    assert.equal(parsed.trigger, trigger);
+    assert.equal(parsed.skip_drafts, true);
+    assert.equal('pending_marker' in parsed, false);
+  }
   assert.throws(() => requestSchema.parse({ ...payload, skip_drafts: 'yes' }));
 });
 
-test('a push review of a pull request that closed while it waited ends as completed and posts nothing', async (t) => {
+test('an automatic review of a pull request that closed while it waited ends as completed and posts nothing', async (t) => {
   const written = recordHeartbeats(t);
   const logs = [];
   t.mock.method(console, 'log', (...args) => { logs.push(args.join(' ')); });
@@ -346,7 +348,7 @@ test('a push review of a pull request that closed while it waited ends as comple
       createStatusComment: () => { throw new Error('only mention runs have a status comment'); },
     },
   });
-  const frames = await consume(handler(requestSchema.parse({ ...payload, trigger: 'push', skip_drafts: true })));
+  const frames = await consume(handler(requestSchema.parse({ ...payload, trigger: 'reopened', skip_drafts: true })));
   assert.deepEqual(frames.at(-1), {
     event: 'done',
     data: {
@@ -357,10 +359,10 @@ test('a push review of a pull request that closed while it waited ends as comple
   assert.equal(model.calls, 0);
   assert.equal(assembled, false);
   assert.deepEqual(written, ['running', 'completed']);
-  assert.ok(logs.some((l) => l === '[invoke] push review of valkey-io/valkey#7 not run: the pull request is closed; nothing posted'), logs.join('\n'));
+  assert.ok(logs.some((l) => l === '[invoke] automatic review (trigger=reopened) of valkey-io/valkey#7 not run: the pull request is closed; nothing posted'), logs.join('\n'));
 });
 
-test('a push review that is closed at the done frame stays completed', async (t) => {
+test('an automatic review that is closed at the done frame stays completed', async (t) => {
   const written = recordHeartbeats(t);
   const pr = { state: 'open', draft: true, head: { sha: 'n'.repeat(40) }, base: { sha: 'b'.repeat(40), ref: 'unstable' } };
   const handler = createReviewHandler({
@@ -373,7 +375,7 @@ test('a push review that is closed at the done frame stays completed', async (t)
       createOctokit: () => ({ pulls: { get: async () => ({ data: pr }) } }),
     },
   });
-  const frames = await consume(handler({ ...payload, trigger: 'push', skip_drafts: true }), (f) => f.event === 'done');
+  const frames = await consume(handler({ ...payload, trigger: 'ready_for_review', skip_drafts: true }), (f) => f.event === 'done');
   assert.equal(frames.at(-1).data.skip_reason, 'the pull request is a draft and this route skips drafts');
   assert.deepEqual(written, ['running', 'completed']);
 });

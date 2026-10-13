@@ -7,7 +7,7 @@ import test from 'node:test';
 import './support/ts-resolve.mjs';
 
 const {
-  findStateComment, gitProcessEnv, maintainedReleaseLines, parseReleaseBranches, prepareWorkspace, pushReviewSkipReason, renderPrOverview, MAINTAINED_WINDOW_DAYS,
+  findStateComment, gitProcessEnv, maintainedReleaseLines, automaticReviewSkipReason, parseReleaseBranches, prepareWorkspace, renderPrOverview, MAINTAINED_WINDOW_DAYS,
 } = await import('../src/workspace.ts');
 const { reviewStateSchema, STATE_MARKER, validateReviewState } = await import('../src/review-state.ts');
 
@@ -88,21 +88,24 @@ test('the state comment is only taken from this app', () => {
   assert.equal(findStateComment(comments.slice(1, 3), appId), undefined);
 });
 
-test('a push review runs only while its pull request is open, and not a draft on a route that skips drafts', () => {
-  const push = { trigger: 'push', skip_drafts: true };
+test('an automatic review runs only while its pull request is open, and not a draft on a route that skips drafts', () => {
   const open = { state: 'open', draft: false, merged: false };
-  assert.equal(pushReviewSkipReason(push, open), null);
-  assert.equal(pushReviewSkipReason(push, { ...open, state: 'closed' }), 'the pull request is closed');
-  assert.equal(pushReviewSkipReason(push, { ...open, state: 'closed', merged: true }), 'the pull request is merged');
-  assert.equal(pushReviewSkipReason(push, { ...open, draft: true }), 'the pull request is a draft and this route skips drafts');
-  assert.equal(pushReviewSkipReason({ trigger: 'push', skip_drafts: false }, { ...open, draft: true }), null);
-  assert.equal(pushReviewSkipReason({ trigger: 'push' }, { ...open, draft: true }), null);
-  // Reviews started any other way go ahead whatever the state.
-  assert.equal(pushReviewSkipReason({}, { ...open, state: 'closed', merged: true }), null);
-  assert.equal(pushReviewSkipReason({ skip_drafts: true }, { ...open, draft: true }), null);
+  for (const trigger of ['opened', 'reopened', 'ready_for_review', 'push']) {
+    const auto = { trigger, skip_drafts: true };
+    assert.equal(automaticReviewSkipReason(auto, open), null, trigger);
+    assert.equal(automaticReviewSkipReason(auto, { ...open, state: 'closed' }), 'the pull request is closed', trigger);
+    assert.equal(automaticReviewSkipReason(auto, { ...open, state: 'closed', merged: true }), 'the pull request is merged', trigger);
+    assert.equal(automaticReviewSkipReason(auto, { ...open, draft: true }), 'the pull request is a draft and this route skips drafts', trigger);
+    assert.equal(automaticReviewSkipReason({ trigger, skip_drafts: false }, { ...open, draft: true }), null, trigger);
+    assert.equal(automaticReviewSkipReason({ trigger }, { ...open, draft: true }), null, trigger);
+  }
+  // @mention runs and thread replies carry no trigger and go ahead whatever the state.
+  assert.equal(automaticReviewSkipReason({}, { ...open, state: 'closed', merged: true }), null);
+  assert.equal(automaticReviewSkipReason({ trigger: '' }, { ...open, state: 'closed' }), null);
+  assert.equal(automaticReviewSkipReason({ skip_drafts: true }, { ...open, draft: true }), null);
 });
 
-test('workspace preparation stops a push review of a closed pull request before any git or listing call', async () => {
+test('workspace preparation stops an automatic review of a closed pull request before any git or listing call', async () => {
   const calls = [];
   const pr = { state: 'closed', merged: true, draft: false, head: { sha: 'c'.repeat(40), ref: 'fix' }, base: { sha: 'b'.repeat(40), ref: 'unstable' } };
   const paginate = async () => { calls.push('paginate'); return []; };
@@ -117,8 +120,11 @@ test('workspace preparation stops a push review of a closed pull request before 
   const tokens = { get: async () => { calls.push('token'); throw new Error('no token is needed'); } };
   const opts = { workspaceRoot: join(tmpdir(), 'no-such-workspace'), appId: 1, upstreamRepo: '' };
   const payload = { repo: 'valkey-io/valkey', pr_number: 12, installation_id: 1, trigger: 'push', skip_drafts: false };
-  assert.deepEqual(await prepareWorkspace(payload, octokit, tokens, opts), { skipped: 'the pull request is merged', headSha: 'c'.repeat(40) });
-  assert.deepEqual(calls, [{ owner: 'valkey-io', repo: 'valkey', pull_number: 12 }]);
+  for (const trigger of ['push', 'reopened']) {
+    calls.length = 0;
+    assert.deepEqual(await prepareWorkspace({ ...payload, trigger }, octokit, tokens, opts), { skipped: 'the pull request is merged', headSha: 'c'.repeat(40) });
+    assert.deepEqual(calls, [{ owner: 'valkey-io', repo: 'valkey', pull_number: 12 }]);
+  }
   // The same pull request summoned by a maintainer is prepared as usual.
   calls.length = 0;
   await assert.rejects(prepareWorkspace({ ...payload, trigger: undefined }, octokit, tokens, opts), /no token is needed/);

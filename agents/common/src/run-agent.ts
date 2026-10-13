@@ -63,10 +63,13 @@ export const requestSchema = z.object({
   run_nonce: z.string().optional(),
   trigger_path: z.string().optional(),
   trigger_line: z.number().int().positive().optional(),
-  // Push-trigger fields (receiver's synchronize path). trigger is "push"
-  // for a review of new commits; skip_drafts is the route's skipDrafts.
-  // Such a review waits in the queue first, so the run checks again that
-  // the PR still wants it (see pushReviewSkipReason in workspace.ts).
+  // Automatic-review fields (receiver's pull_request path). trigger is
+  // "opened", "reopened", "ready_for_review" or "push" (new commits), and
+  // is absent on @mention runs; skip_drafts is the route's skipDrafts. An
+  // automatic review can wait a long time before it runs, so the run
+  // checks again that the PR still wants it (see automaticReviewSkipReason
+  // in workspace.ts). Any string is accepted, so a receiver that sends a
+  // new trigger does not fail the run.
   trigger: z.string().optional(),
   skip_drafts: z.boolean().optional(),
 });
@@ -257,7 +260,7 @@ export function createReviewHandler(opts: ReviewHandlerOpts): (payload: Payload)
       if ('skipped' in prepared) {
         // Nothing to review: post nothing and leave the state comment
         // alone. Completed, so the invoker does not run it again.
-        console.log(`[invoke] push review of ${payload.repo}#${payload.pr_number} not run: ${prepared.skipped}; nothing posted`);
+        console.log(`[invoke] automatic review (trigger=${payload.trigger}) of ${payload.repo}#${payload.pr_number} not run: ${prepared.skipped}; nothing posted`);
         await heartbeat.finish('completed');
         yield {
           event: 'done',
