@@ -13,9 +13,10 @@ security model in [SECURITY.md](../SECURITY.md).
 | Receiver | `webhook/src/receiver.ts`, logic in `webhook/src/delivery.ts` | Lambda behind an API Gateway HTTP API (`POST /webhook`) |
 | Invoker | `webhook/src/invoker.ts`, `webhook/src/watchdog.ts` | One Lambda per review route and one for the curator, each fed by its own SQS queue |
 | Token broker | `webhook/src/token-broker.ts`, checks in `webhook/src/broker.ts` | One Lambda per reviewer, invoked by that reviewer's runtime |
+| Skills-repo token broker | `webhook/src/skills-repo-broker.ts` | One Lambda, created when `skillsRepo` is set, invoked by the curator only |
 | Reviewers | `agents/common`, plus `agents/valkey-review` or `agents/valkey-glide-review` | One Bedrock AgentCore runtime and container image per reviewer |
-| Curator | `agents/curator` | Its own AgentCore runtime |
-| Decay job | `ops/src/decay.ts` | Lambda on a daily EventBridge schedule |
+| Curator | `agents/curator`: feedback in `src/agent.ts`, skill maintenance in `src/maintenance.ts` | Its own AgentCore runtime |
+| Decay job and skill-maintenance scheduler | `ops/src/decay.ts`, `ops/src/releases.ts` | Lambda on a daily EventBridge schedule |
 | Infrastructure | `infra/lib/*.ts` | CDK app; the stacks are listed in [infra/README.md](../infra/README.md#stacks) |
 
 ```text
@@ -29,7 +30,10 @@ HTTP API -> receiver -+-> route queue -> route worker -> reviewer runtime -> Git
                       |                          table
                       |
                       +-> curator queue -> curator worker -> curator runtime -> concerns table
-                                                                             -> reviewer's skills registry
+                                ^                                    |       -> reviewer's skills registry
+                                |                                    +-> upstream default branch (anonymous git fetch)
+  decay job (daily) ------------+                                    +-> skills-repo broker -> pull request on the bot repository
+  (concerns tables, GitHub releases API)
 ```
 
 ### Automatic pull request review
@@ -105,7 +109,32 @@ HTTP API -> receiver -+-> route queue -> route worker -> reviewer runtime -> Git
    the model.
 5. The model makes at most one change to the concerns store. When the record
    it reinforced has enough reinforcements, it publishes the record as a skill
-   to the reviewer's registry, and every later review loads it.
+   to the reviewer's registry, and every later review loads it. A correction
+   to a graduated record (`update_concern`) can publish a new text of its
+   live skill, starting from the published one (`get_skill`).
+
+### Skill maintenance
+
+1. Once a day the decay job (`ops/src/decay.ts`) reads the highest GA
+   release of each reviewer's upstream from the GitHub releases API,
+   without credentials (`latestReleaseTag` in `ops/src/releases.ts`).
+2. It scans each concerns table, decays every score, deletes records that
+   never graduated once they fall below the floor, and picks the graduated
+   skills that are due for a check or a retirement.
+3. Within per-reviewer caps it claims each one on its record and sends a
+   maintenance message to the curator queue: `check` for a registry skill,
+   `retire`, or once per release `repo_check` for the reviewer's skill file
+   in this repository.
+4. The curator worker invokes the curator runtime, which runs the message
+   (`handleMaintenance` in `agents/curator/src/maintenance.ts`). A check
+   fetches the upstream default branch into a fresh directory and looks up
+   the names the skill cites. Only when names are flagged does a bounded,
+   read-only model audit run.
+5. Depending on the outcome and the settings, the curator records the
+   result, edits the registry skill in suppress-and-add form, deprecates a
+   retired skill, or opens a pull request against the bot's repository for
+   a repo skill file. Every run logs `[maintenance]` report lines
+   (section 6).
 
 ## 2. The receiver
 
@@ -612,7 +641,9 @@ progress edits without a final edit.
 ### Token broker
 
 The GitHub App secret (`app_id`, `private_key`, `webhook_secret`) lives in
-Secrets Manager. Only the receiver and the token brokers can read it. The
+Secrets Manager. Only the receiver and the token brokers can read it (the
+skills-repo broker only when `skillsRepo.appSecretName` names this secret,
+which is the default). The
 receiver uses the webhook secret to verify deliveries and acts as the
 installation for @mention handling and thread lookups. The reviewer runtimes
 never see the secret. Each reviewer has its own broker (one instance of
@@ -633,6 +664,23 @@ without this check another installation of the App could give a token for
 a same-named repository of another owner. The broker then returns an installation token for that one
 repository with `pull_requests: write` and `metadata: read`, and its
 expiry. The installation check adds one GitHub call per token.
+
+### Skills-repo token broker
+
+The curator proposes edits to the reviewers' skill files in this repository
+by pull request (see [Repo skill pull requests](#repo-skill-pull-requests)).
+For that it invokes the skills-repo broker (`webhook/src/skills-repo-broker.ts`,
+created in `infra/lib/substrate-stack.ts` only when `skillsRepo` is set).
+Only the curator role may invoke it. The request carries an optional
+`purpose`, which is only logged. The repository comes from the broker's
+`SKILLS_REPO` variable, and the App from the secret `SKILLS_REPO_APP_SECRET_NAME`
+names, so a caller cannot pick either. The broker looks up the App's
+installation on that repository as the App, refuses when there is none or
+when its account is not the repository's owner, and returns a token for
+that one repository with `contents: write`, `pull_requests: write` and
+`metadata: read`. Besides writing its logs, its role can only read that one
+secret (`secretsmanager:GetSecretValue`). The curator caches the token until five minutes before it
+expires, and neither logs it nor shows it to a model.
 
 ### Token scope and refresh
 
@@ -673,11 +721,20 @@ repository, which holds the images of every CDK app in the account and
 region that uses the same bootstrap qualifier. It has no Secrets Manager
 access, no concerns table access and no registry writes. The curator can
 call its models, read its own prefix in the assets bucket (and list the
-bucket), read and write the concerns tables, write the reviewer registries,
-read its own registry, write its own runtime log groups and pull from the
-same repository. It holds no GitHub credentials and makes no GitHub calls.
-[infra/README.md](../infra/README.md#stacks) lists the grants in more
-detail.
+bucket), read and write the concerns tables, create, update and read
+records in the reviewer registries and set their status (a retirement
+sets `DEPRECATED`), read its own registry, invoke the skills-repo broker
+when there is one, write its own runtime log groups and pull from the
+same repository. It holds no GitHub credentials. Its maintenance runs make
+anonymous HTTPS calls to GitHub: git fetches of the public upstream
+repositories, and reads of the skill files in the bot's repository
+(`api.github.com` and `raw.githubusercontent.com`). With a token from the
+skills-repo broker they write a branch and a pull request in the bot's
+repository, and nothing else. The decay Lambda, which is not a runtime,
+can scan, update and delete items in the concerns tables and send messages
+to the curator queue, and calls the GitHub releases API without
+credentials. [infra/README.md](../infra/README.md#stacks) lists the grants
+in more detail.
 
 ## 6. The curator
 
@@ -698,6 +755,19 @@ ends the run without calling the model. `reviewer_id` selects the concerns
 table (`CONCERNS_TABLES_JSON`) and skills registry (`SKILLS_REGISTRIES_JSON`);
 an unknown id is an error.
 
+The decay job sends maintenance messages to the same queue
+(`MaintenanceMessage` in `ops/src/decay.ts`). The runtime accepts either
+kind (`curatorRequestSchema` in `agents/curator/src/maintenance.ts`) and
+tells them apart by `maintenance_id`. A maintenance message carries only
+identifiers and a GA tag: `maintenance_id` (at most 200 characters),
+`reason` (`check`, `retire` or `repo_check`), `reviewer_id`, `area_bucket`,
+`record_id` and `dry_run`; `record_name` (a registry record name) and
+`seen_updated_at` for a check or a retirement; `release_tag` (a GA tag, or
+empty for a check when the release is unknown) for a check or a repo check;
+`retire_reason` (`decayed` or `obsolete`) for a retirement. No skill text,
+repository or URL: the curator maps `reviewer_id` to its upstream from
+`UPSTREAM_REPOS_JSON`. A message that fails the schema is refused.
+
 ### The run
 
 - System prompt: `agents/curator/config/prompt.md` with
@@ -715,17 +785,74 @@ an unknown id is an error.
   The loop ends after the tool round that calls `curator_done`, or after
   `MAX_ITERATIONS` rounds (default 40).
 - Stream: the curator runtime has none of the reviewers' closed-stream
-  handling, does not report `HealthyBusy` and keeps AgentCore's default
-  session lifecycle. If its stream closes before the `done` frame, the
-  worker reports the message as failed and SQS delivers it again, up to
-  three receives.
+  handling and keeps AgentCore's default session lifecycle. A maintenance
+  run is registered as an async task, so `/ping` reports `HealthyBusy`
+  while it runs; a feedback run is not. If its stream closes before the
+  `done` frame, the worker reports the message as failed and SQS delivers
+  it again, up to three receives.
 - Limits (`CuratorRun` in `agents/curator/src/tools/run.ts`): one change to
   the concerns store per run, one skill submission per run, nothing after
   `curator_done`. A call that fails or changes nothing frees its slot.
   `resolution` feedback can only bump an existing record, without edits.
 - Tools: `list_concerns`, `get_concern`, `create_concern`, `bump_concern`,
   `update_concern`, `merge_concerns`, `delete_concern`,
-  `list_skill_authoring`, `submit_skill` and `curator_done`.
+  `list_skill_authoring`, `get_skill`, `submit_skill` and `curator_done`.
+  Every tool refuses an `area_bucket` that starts with `#`: such buckets
+  hold the skill lifecycle's own items, never concern records.
+
+### Maintenance runs
+
+`handleMaintenance` runs one maintenance message. It acts only while the
+record's `maintenance_id` (read with a consistent read) is the message's;
+any other value means a stale or duplicate message, and nothing is
+written. Every write that changes the skill's state is also conditioned on
+`graduated_record_name` being the message's `record_name`. A finished run
+removes the claim (`maintenance_id`, `maintenance_requested_at`,
+`maintenance_reason`) in its last write. An outcome to retry later keeps
+it, and the decay job asks again once it is 7 days old
+(`MAINTENANCE_RETRY_DAYS`): an inconclusive check, a registry record that
+is still `CREATING` or `UPDATING`, an ambiguous deprecation, or a run that
+throws.
+
+- `retire` runs without a model ([Retirement](#retirement)).
+- `check` runs the deterministic check and, when names are flagged, an
+  audit ([Skill checks](#skill-checks)).
+- `repo_check` checks the reviewer's skill file in this repository
+  ([Repo skill pull requests](#repo-skill-pull-requests)).
+
+The audit is a second use of the `curate` loop with its own tools and
+prompt: `read`, `grep` and `glob` from the reviewers' harness, confined to
+the checkout, without write tools or `lsp`; the read-only `git` tool in the
+checkout; and `report_skill_check`, which ends it (`assembleCheckTools` in
+`agents/curator/src/check-run.ts`). It has no shell, network, concerns or
+registry tool. The system prompt is `agents/curator/config/skill-check.md`,
+loaded from `curator/skill-check.md` (`CHECK_PROMPT_S3_KEY`) with its
+limits filled in from the code. The first message gives the upstream, the
+default branch, the checked commit, the base (the last check's commit),
+the release, and each flagged name with its status, then the skill between
+`<<<SKILL <marker>` and `>>>END <marker>` and the diff excerpts between
+`<<<DIFF <marker>` and `>>>END <marker>`, with a random marker per run. The
+audit ends at an accepted report, after `CHECK_MAX_ROUNDS` tool rounds
+(default 25), or 12 minutes after the run started, below the worker's 15.
+The models are the curator's, with the same per-call fallback.
+
+Report mode. A message with `dry_run`, or a setting that is off
+(`CHECK_APPLY_EDITS`, `RETIRE_SKILLS`, `CHECK_OPEN_PULL_REQUESTS`), never
+writes the registry or opens a pull request. A dry run also leaves the
+outcome, verification, names and standing alone: it writes only an
+audit's result to `pending_revision` (reason `dry run`, never in place of
+a real check's result) and releases the claim. Its decision says what a
+real run would do: `would-accurate`, `would-revise`, `would-suspect`,
+`would-obsolete`, `would-retire` or `would-record-retirement`.
+
+Each run logs one report line per outcome, `[maintenance] <check|retire|repo_check>
+reviewer=... outcome=... dry_run=... maintenance=...`, one
+`[maintenance] edit` line per proposed edit with its evidence, original and
+replacement, and `[maintenance] audit <status> rounds=... refusals=...`
+after an audit. Strings in these lines are JSON-quoted and stripped of
+invisible format and separator characters, so text from a table or a model
+cannot break a line. The entrypoint ends with
+`[curator] maintenance <status> reason=... decision=...`.
 
 ### Concern records
 
@@ -737,8 +864,37 @@ edits), `reinforcement_count`, `reinforcers`, `decay_score`, `created_at`,
 `updated_at` (last reinforcement), `edited_at`, and after graduation
 `graduated_record_name` and `graduated_at`. The decay job adds `decayed_at`.
 Every write is conditioned on the state it was computed from. `list_concerns`
-returns the 20 most reinforced records in a bucket. The model sees how many
-people reinforced a record, never their logins (`recordView`).
+returns the 20 most reinforced records in a bucket, live records before
+tombstones. The model sees how many people reinforced a record, never their
+logins (`recordView`).
+
+A graduated record also carries its skill's lifecycle:
+
+| Attributes | Meaning | Written by |
+| --- | --- | --- |
+| `skill_generation`, `previous_record_name` | The generation of the published skill (1 when absent) and the retired name a later generation replaced | `submit_skill` |
+| `retired_at`, `retired_reason`, `retired_from_status` | The skill is retired (`decayed`, `obsolete` or `operator`); the record stays as a tombstone | Retire and check runs, `submit_skill` |
+| `verified_release`, `verified_at`, `verified_sha`, `verified_ref` | The release and time of the last completed check, and the default-branch commit it confirmed (`<branch>@<sha12>` in `verified_ref`) | Check runs |
+| `audit_names`, `lost_names`, `ignored_names` | The baseline: cited names present at `verified_sha` (at most 300); baseline names found missing since; absent names an audit judged accurate (at most 100) | Check runs |
+| `stale_names`, `stale_since` | Names still lost or new and absent, unresolved (at most 50), and since when | Check runs |
+| `check_outcome`, `check_note` | `clean`, `accurate`, `revised`, `suspect`, `obsolete`, `inconclusive` or `error`, and a note of at most 500 characters built by code from counts and the skill's own names | Check runs |
+| `obsolete_release` | The release at which the subject was found gone; `decay_score` is set to 0 with it | Check runs |
+| `pending_revision` | An audit's result that was not applied: `at`, `verdict`, `reason`, `summary` (at most 400 characters), `edits` (`original`, `replacement`, `evidence` citations) and `problems` | Check runs |
+| `previous_skill_md`, `revised_at` | The text before the last applied edit, for rollback | Check runs |
+| `partial_checks`, `partial_check_id` | Checks in a row whose diff was read only in part | Check runs |
+| `maintenance_id`, `maintenance_requested_at`, `maintenance_reason` | The claim of a queued maintenance message | Decay job; the curator removes it |
+| `maintenance_deprecating`, `retire_refused_at` | A deprecation this lifecycle started, and when the registry last refused one | Retire runs |
+
+`recordView` shows the model only `skill_state` (`live` or `retired`),
+`retired_reason`, `verified_release`, `verified_at`, `check_outcome`,
+`check_note` and `stale_names`. It never shows `audit_names`,
+`ignored_names`, `verified_sha`, `pending_revision`, `previous_skill_md` or
+the maintenance attributes.
+
+Each concerns table also holds one item that is not a concern record, at
+`area_bucket` `#maintenance` and `record_id` `repo-skill`: the claim and the
+last check of the reviewer's repo skill file, with the same check
+attributes plus `skills_repo_sha`, the commit of the file it read.
 
 ### Reinforcers and graduation threshold
 
@@ -762,8 +918,9 @@ graduate. The curator accepts values from 2 to 100.
 ### Publishing skills to AWS Agent Registry
 
 `submit_skill` (`agents/curator/src/tools/submit-skill.ts`) accepts only the
-record this run bumped or merged into, and only when its stored count meets
-the threshold. It accepts at most 40,000 characters of `skill_md`
+record this run bumped or merged into, or a graduated record whose live skill
+this run corrected with `update_concern` (an update, never a first
+graduation), and only when its stored count meets the threshold. It accepts at most 40,000 characters of `skill_md`
 (`GRADUATED_SKILL_MAX_CHARS`), half the reviewers' load budget, so every
 published skill can be loaded. The record name is the record's existing
 `graduated_record_name`. A first graduation uses a slug of the subject (at
@@ -777,7 +934,30 @@ with that name or creates one. The markdown goes in
 `descriptors.agentSkillsDefinition.additionalData.skillMd.data` and gets
 minimal frontmatter if it has none; `upsertSkill` refuses markdown over the
 registry's limit of 102,400 characters. The description notes the source
-`record_id`. Finally `graduated_at` is set.
+`record_id`. Finally `graduated_at` is set, and the lifecycle attributes of a
+retirement or a pending check (`retired_*`, `stale_*`, `obsolete_release`,
+`pending_revision`, `retire_refused_at`) are removed.
+
+For a record that published before, the model first reads the published
+text with `get_skill`, which returns the registry record in any status. The
+release check may have corrected that text, so the new text starts from it.
+It must keep every suppressed block of the published text byte for byte and
+may add none: only the release check writes suppression markers. Claiming
+the update also removes any maintenance claim on the record, which voids a
+check or retirement queued for the old text, and an update is refused while
+a check run is applying an edit to the same skill.
+
+Retired skills. `upsertSkill` refuses a record that is `DEPRECATED` or
+`REJECTED` (`SkillRetiredError`) and changes nothing, because `DEPRECATED`
+is final: such a record can never be updated or set back. It prefers a
+live record when several share a name, and has an `updateOnly` mode, used
+by check runs, that never creates one. A reinforcement of a tombstone whose
+`retired_reason` is `decayed` or `obsolete` therefore publishes a new
+generation under a new name, `suffixedName(slug, "<record_id>#g<n>")`, and
+sets `skill_generation`. A skill an operator retired (`retired_reason`
+`operator`, or a `REJECTED` record) is never published again. An operator
+can restore such a record by removing `retired_reason`; the next eligible
+reinforcement then publishes a new generation.
 
 `list_skill_authoring` returns up to 10 skills from the curator's own registry
 (sources in `agents/curator/skills/`, published with
@@ -792,22 +972,306 @@ combined markdown at 80,000 characters (`GRADUATED_SKILLS_MAX_CHARS`). Newest
 skills come first; a skill that does not fit is skipped and later ones are
 still tried, and the number of skills left out is logged. All registry calls
 share one 10 second deadline. Any failure means no graduated skills
-for that run. `renderGraduatedSkills` appends them to the system prompt.
-Concerns below the threshold never reach a reviewer. `scripts/registry-skills.mjs`
-lists skills and deprecates one to retire it.
+for that run. `renderGraduatedSkills` appends them to the system prompt
+under a fixed introduction: several maintainers confirmed each rule, each is
+re-checked against the upstream default branch after releases, a rule is a
+reason to look and the code at the PR head wins. For each skill it strips
+the frontmatter, puts the description on one `Scope:` line without its
+record-id sentence, demotes the skill's own headings one level outside
+fenced blocks, and drops the record-id citation. A suppressed piece is kept,
+with its markers replaced by the labels `**Superseded in <release>.**` (and a
+sentence saying it describes code before that release and matters only for
+backports to older release lines) and `**End of superseded text.**`. Only
+well-formed blocks, as `parseSuppressed` in
+`agents/common/src/skill-check/edits.ts` reads them, are labelled. The
+baked-in `skill.md` gets the same labels. Concerns below the threshold never
+reach a reviewer. `scripts/registry-skills.mjs` lists skills, deprecates one
+to retire it, and lists orphans: live skills that no concern record names,
+which the lifecycle never reaches.
 
 ### Decay
 
 `infra/lib/decay-cron-stack.ts` runs `ops/src/decay.ts` every 24 hours.
 `decayTable` scans each concerns table and multiplies each score by
 `0.5 ^ (elapsed / half-life)`, where elapsed time counts from the later of
-`updated_at` and `decayed_at`. A record below the floor is deleted; any other
-record gets its new `decay_score` and `decayed_at`. Writes are conditioned on
-the timestamps the scan saw, so a record reinforced during the pass is
-skipped. With the defaults (30 day half-life, 0.05 floor) an unreinforced
-record is deleted after about 130 days. Graduated records decay the same
-way, but decay never touches a registry: a published skill stays until it is
-deprecated.
+`updated_at` and `decayed_at`. Every write is conditioned on the
+`updated_at`, `decayed_at` and `decay_score` the scan saw, so a record
+reinforced, or scored by the curator, during the pass is skipped.
+
+- A record that never graduated decays on `DECAY_HALF_LIFE_SECONDS` (30
+  days) and is deleted below the floor (0.05), after about 130 days without
+  reinforcement. The delete is also conditioned on the record still not
+  having graduated.
+- A live graduated record decays on `DECAY_GRADUATED_HALF_LIFE_SECONDS` (180
+  days) and is never deleted: it is its skill's provenance. Below the floor
+  it is a retirement candidate, after about 778 days (180 x log2(20))
+  without reinforcement. Otherwise it is a check candidate when a check is
+  due: it was never checked; it was published again since its last check
+  (`graduated_at` after `verified_at`); the release tag is known and differs
+  from `verified_release`; the last check is older than
+  `SKILL_RECHECK_SECONDS` (90 days); or the pass was started with
+  `recheck_all`.
+- A record with a maintenance request younger than 7 days is in flight and
+  gets only its score.
+- A tombstone (`retired_at` set) is left as it is.
+- An item in a bucket that starts with `#` is not a concern record. The
+  pass keeps the `#maintenance` / `repo-skill` item for the repo skill check,
+  leaves any other one alone and logs it as `reserved-bucket`.
+
+After the scan:
+
+1. Retirement candidates, lowest score first. With `RETIRE_SKILLS` off (the
+   default), without a queue or in a dry run, each is logged as
+   `would-retire` and gets its score. Otherwise the first
+   `MAX_RETIREMENTS_PER_DAY` (3) per reviewer are claimed and sent with
+   `retire_reason` `obsolete` when `obsolete_release` is set, else
+   `decayed`, and the rest are logged as `deferred`. A record whose
+   retirement the curator refused is not asked again for
+   `RETIRE_REFUSED_BACKOFF_SECONDS` (30 days), logged as `retire-backoff`,
+   and can still be checked meanwhile.
+2. The repo skill check, once per release: when the release tag is known and
+   differs from the `verified_release` of the `#maintenance` item, or the
+   pass has `recheck_all`, and no request for it is younger than 7 days, a
+   `repo_check` is claimed and sent first.
+3. Check candidates: never checked first, then published again, then the
+   oldest check. With the repo check, at most `SKILL_CHECKS_PER_DAY` (10)
+   per reviewer; the rest are `deferred` to the next pass. Each message is
+   delayed 60 seconds more than the one before, up to the SQS limit of 900,
+   so checks do not crowd out feedback on the shared queue.
+
+A claim is one conditional `UpdateItem` that also stores the decayed score
+and sets `maintenance_id` (`<reason>#<reviewer>#<record_id>#<time of the
+pass>`), `maintenance_requested_at` and `maintenance_reason`, conditioned on
+the state as read, the record's name and no `retired_at`. When the send
+fails, the claim is removed again and the record is asked for at the next
+pass.
+
+Checks are queued only with a curator queue, `SKILL_CHECKS_PER_DAY` above 0
+and an upstream for the reviewer; the release lookup is skipped otherwise.
+The lookup is one anonymous `GET /repos/<upstream>/releases?per_page=50`
+per distinct upstream per pass, with a 10 second timeout
+(`latestReleaseTag`). Drafts, prereleases and tags that are not `X.Y.Z` or
+`vX.Y.Z` are dropped and the highest version wins, whatever its date, so
+`9.2.0-rc1` and `rust/v0.9.0` never count and `8.1.10` after `9.1.2` does not
+move it. Nothing is stored per repository: a day on which the API fails
+(rate limits on shared Lambda addresses, 5xx, a timeout) only skips the
+release trigger, and the next pass catches up, because each record compares
+its own `verified_release`.
+
+The scheduled event sets nothing. A manual invoke can pass
+`{"recheck_all": true}`, which makes every live graduated skill due (still
+within the caps), and `{"dry_run": true}`, which logs every retirement
+candidate as `would-retire` and sends checks with `dry_run: true`. A dry run
+still writes the routine scores and still deletes ungraduated records below
+the floor, as the next scheduled pass would. Each table's pass ends with
+
+```text
+[decay] <table> scanned= decayed= deleted= skipped= errors= kept_retired= checks_requested= retire_requested= would_retire= deferred= retire_backoff= reserved=
+```
+
+and each request logs its own line: `check-requested`,
+`repo-check-requested`, `retire-requested`, and for retirements that are
+not requested `would-retire`, `deferred` (over the cap) or `retire-backoff`.
+Checks over the cap are only counted. `[release] <repo> tag=<tag>`, or a
+warning, shows the lookup.
+
+### Skill checks
+
+A `check` message makes the curator check one registry skill against the
+upstream default branch (`check` in `agents/curator/src/maintenance.ts`).
+
+1. Read the record with a consistent read and the registry record by name
+   (`getSkillByName`). Skip a stale message, a renamed or retired record.
+   A registry record that is gone or `DEPRECATED` is recorded as retired
+   (`decayed` or `obsolete` when this lifecycle's deprecation marker is on
+   the record, else `operator`), `REJECTED` always as `operator`. One that is
+   `CREATING` or `UPDATING` gives `inconclusive`, and the check is retried.
+   A reviewer with no upstream is skipped.
+2. Make the checkout (`prepareUpstreamCheckout` in
+   `agents/common/src/skill-check/upstream.ts`) in a fresh directory under
+   `/tmp/skill-check`, removed afterwards: `git init`, `ls-remote --symref`
+   for the default branch, a depth-1 blob-less fetch of its tip and a
+   checkout, which fetches the tip's blobs in one batch; then, best effort,
+   the commit of the last check (`verified_sha`) and the blobs of the files
+   that changed since. The URL is `https://github.com/<upstream>.git`, with
+   no credentials. The repository is new, so it has no hooks. git runs with
+   no system or global config, no prompts, a low-speed abort, and an
+   environment without `AWS_`, `AMAZON_`, `GH_`, `GITHUB_` or `GIT_`
+   variables or any name holding `TOKEN`, `SECRET`, `PASSWORD`,
+   `CREDENTIAL` or `PRIVATE_KEY`. Each git call has a 10 minute limit (3
+   minutes for the base) and runs in its own process group, killed whole at
+   the limit. No upstream code runs.
+3. Extract the cited names (`extractNames` in `skill-check/names.ts`):
+   inline code spans of 2 to 120 characters outside the frontmatter, fenced
+   blocks and suppressed pieces, plus path-like and `A::b` words of the
+   description. A span becomes a path, directory, glob, prefix (`REPL_STATE_*`),
+   qualified name (`a::b`, `a.b`, `a->b`), symbol (at least 4 characters with
+   an underscore or an inner capital, or all capitals of at least 5) or
+   config name (`kebab-case`). Anything else is dropped. At most 300 names
+   per skill.
+4. Run the deterministic check (`checkSkill` in `skill-check/check.ts`),
+   with git plumbing only:
+   - presence at the tip: `git ls-tree` for paths, directories and globs (a
+     path whose first component is at the top of the tree must match
+     exactly; any other matches as a tail, so `server.c` finds `src/server.c`),
+     and `git grep -w -F` for symbols, configs and the components of
+     qualified names, 10 patterns per call and 4 calls at a time;
+   - `lost`: names of the baseline (`audit_names`) now absent, and names lost
+     at an earlier check that the skill still cites. A loss lowers standing
+     once: the name leaves `audit_names` for `lost_names`;
+   - `new_absent`: other cited names, absent and not in `ignored_names`;
+   - `touched`, only with a base: rare names (1 to 40 occurrences at the
+     tip) on a changed line or in a hunk header of `git diff <base> <tip>`,
+     and cited full paths that changed. At most 200 files per diff call, 4
+     MiB per call and 64 MiB per check; up to 3 hunks per name and 24,000
+     characters of excerpts go to the audit.
+5. Nothing flagged and the whole diff read: `clean`. The record is
+   confirmed without a model: `verified_*` move to the checked commit and
+   `audit_names` to the names present.
+6. Otherwise the audit runs ([Maintenance runs](#maintenance-runs)) and ends
+   with `report_skill_check`: a `verdict` (`accurate`, `revise`, `obsolete`
+   or `unsure`), a `summary` of at most 400 characters for the operator, and
+   for `revise` at most 6 `edits`, each `{original, replacement, evidence}`.
+   A report is refused with reasons, and the model tries again, when it says
+   `accurate` while a lost name is missing, `revise` without edits, edits
+   with another verdict, or edits that break the edit contract below. After
+   2 refusals the next report is accepted as it is, but edits that break the
+   contract are never applied.
+
+The edit contract (`validateEdits` in `skill-check/edits.ts`). An edit never
+overwrites a fact. It wraps the stale piece in markers and adds the
+replacement after them:
+
+```text
+<!-- suppressed: superseded in <release>, <YYYY-MM-DD>; <reason>; evidence: <repo>@<sha>:<path>:<line> -->
+<the original piece, unchanged>
+<!-- /suppressed -->
+<the replacement piece>
+```
+
+- `original` is 1 to 5 whole lines of the skill body, at most 800
+  characters, found exactly once. It cannot be in the frontmatter, a fenced
+  block or a suppressed block, and edits do not overlap or nest.
+- `original` holds a flagged name.
+- Split on runs of `[A-Za-z0-9_./:*>-]`, the text between tokens is the
+  same in both and the token count is equal: no word, sentence or
+  punctuation is added or removed, and the line count is the same.
+- A changed token is a code name in a backtick span replaced by a code name
+  of the same sort (a path for a path, an identifier for an identifier, a
+  config name for a config name), and must be a flagged name; or a number
+  on a line that holds a flagged name. Words outside code spans never
+  change, so "NEVER flag" cannot become "ALWAYS flag".
+- Each edit cites 1 to 5 lines of the checked commit, and every new name or
+  number appears as a word on a cited line. A number's cited line must also
+  hold a code name from the edited line.
+- The marker's reason is generated from the changed names
+  (`` `a` is now `b` ``, joined by `; `), never from the model.
+- The edits grow the skill by at most 4,000 characters, markers included,
+  and the result stays within 40,000 characters (`GRADUATED_SKILL_MAX_CHARS`;
+  102,400 for a repo skill file).
+
+`<release>` is the message's GA tag, or `<branch>@<12-char sha>` of the
+checked commit when the release was unknown.
+
+Outcomes:
+
+| Outcome | When | What is written |
+| --- | --- | --- |
+| `clean` | Nothing flagged, diff read in full | Verification moves; `stale_names`, `lost_names` and `pending_revision` cleared |
+| `accurate` | The audit judged every flagged name fine, and no name is lost | Verification moves; the new absent names join `ignored_names` |
+| `revised` | Valid `revise` edits and `CHECK_APPLY_EDITS` on | First a claim write saves `previous_skill_md` and `revised_at` and removes `maintenance_id`, so only one copy of the message reaches the registry; then `UpdateRegistryRecord` (update only) with the edited text; then the new text's names are checked in the same checkout and the verification moves |
+| `suspect` | Valid edits with `CHECK_APPLY_EDITS` off, `unsure`, `obsolete` without evidence, or a report accepted after refusals | `pending_revision`, `stale_names`, `lost_names`; `verified_release` and `verified_at` move, `verified_sha` does not, and the baseline only loses the lost names |
+| `obsolete` | `obsolete`, and deterministic evidence: at least 3 baseline names with fewer than half kept, or no file left in the record's `area` globs | `obsolete_release` and `decay_score` 0; the next decay pass asks for the retirement. A reinforcement since the read makes it `suspect` instead |
+| `inconclusive` | No report by the round cap or the deadline, a model or git failure, a registry record being written, or nothing flagged but part of the diff unread | `check_outcome` and `check_note`; the claim stays, so the check runs again after 7 days |
+| `error` | A failure retrying cannot fix, such as a registry record that was never published | Recorded with the release, so the check is due only at the next trigger |
+
+A check with names still lost lowers the record's standing: `decay_score`
+is multiplied by the share of baseline names kept, conditioned on the score
+and `updated_at` as read. When a reinforcement won the race, the write is
+retried once without the penalty.
+
+The base. Only git's answer that the remote no longer has the base commit
+(after a force-push, say) gives a presence-only check that may confirm. Any
+other failure to fetch the base (a timeout, a network error) leaves the
+check incomplete, and an incomplete check never moves `verified_sha`. A
+check whose diff ran past the budget counts in `partial_checks`; after 2 such
+checks in a row, the third confirms and its `check_note` says so. The
+operator's way out of a check that stays incomplete is to remove
+`verified_sha` from the record, which makes the next check a first check.
+
+### Retirement
+
+A `retire` message runs without a model (`retire` in `maintenance.ts`).
+
+1. Skip a stale message, a renamed or retired record, a `decayed` retirement
+   whose record was reinforced since (`updated_at` differs from
+   `seen_updated_at`), and an `obsolete` one whose `obsolete_release` is gone
+   (published again since).
+2. Read the registry record. Gone: record the tombstone with the message's
+   reason. `DEPRECATED`: the same when this lifecycle's marker shows it was
+   its own deprecation, else `operator`. `REJECTED`: `operator`. `CREATING`
+   or `UPDATING`: keep the claim and retry later.
+3. With `RETIRE_SKILLS` off or in a dry run, log `would-retire` and stop.
+4. Set `maintenance_deprecating` on the record, then call `deprecateSkill`:
+   `UpdateRegistryRecordStatus` to `DEPRECATED` with the reason
+   `valkey-reviewer: retired (<reason>) <date>; last reinforced <date>`.
+5. Write the tombstone: `retired_at`, `retired_reason` and
+   `retired_from_status`, with the claim and the marker removed.
+
+Reviewers stop loading the skill at their next run, because `loadSkills`
+skips `DEPRECATED` records, and that frees room in the 30-skill,
+80,000-character window. When the registry refuses the transition
+(`ValidationException`) and a fresh read shows the record neither retired
+nor being written, the run logs `[maintenance] retire-refused <name>
+status=<s>`, sets `retire_refused_at` and releases the claim; the decay job
+then waits 30 days before it asks again. A deprecation that fails in any other way leaves
+the claim and the marker, and the redelivered message finds out what
+happened.
+
+### Repo skill pull requests
+
+The reviewers' built-in skill files (`agents/<reviewer>/config/skill.md`)
+ship with this repository, so they are never edited in place. A
+`repo_check` message, sent once per GA release, checks one of them the same
+way as a registry skill, with two differences: `obsolete` is not a verdict
+for it, and its edits are proposed by pull request
+(`agents/curator/src/repo-skill-pr.ts`).
+
+- Without `skillsRepo` the check is recorded as `skipped`. With it, the
+  curator reads the file anonymously from `skillsRepo.repo` at
+  `skillsRepo.baseBranch` (`GET /repos/<repo>/commits/<branch>`, then
+  `raw.githubusercontent.com`), so the bot's repository must be public.
+- Valid `revise` edits with `CHECK_OPEN_PULL_REQUESTS` on and a token broker
+  configured are proposed; otherwise the result is `suspect` and the edits
+  wait in the item's `pending_revision`.
+- The proposal is deterministic code. It refuses any path but
+  `agents/<reviewer>/config/skill.md` of a configured reviewer (never the
+  curator's), and any new content that is not the read content plus
+  suppress-and-add edits that keep the edit contract, re-derived from the two
+  texts. The model never sees the token and never calls GitHub.
+- Branch `skill-check/<reviewer>/<release>` (a `<branch>@<sha>` label becomes
+  `<branch>-<sha>`) points at one commit on the base branch tip that holds the
+  new file. Title: `Supersede stale facts in the <reviewer> skill for
+  <release>`. The commit message lists the changes and the evidence, and the
+  pull request body shows the evidence as links. Both are built from the
+  validated blocks only, never from model text. The commit is made with the
+  broker's token, so GitHub authors it as the App's bot user, and it is
+  signed off as `skillsRepo.signOff`, or as that bot identity when it is not
+  set.
+- A re-run for the same reviewer and release updates the same branch and
+  pull request. A branch that holds commits the check did not make, such as
+  a maintainer's fixups, is never rebuilt: the proposal is `refused` and the
+  run records `error`. When the file changed
+  on the base branch since the check read it, nothing is pushed
+  (`base-moved`), and the next pass checks the new text.
+- When maintainers closed a pull request from the branch without merging,
+  nothing more is proposed for that release (`declined`); the next release
+  proposes on a new branch. The only ref ever written is the
+  `skill-check/` branch.
+
+Outcomes of a repo check add `proposed`, `declined` and `skipped` to those of
+a registry check. The item records the checked file's commit in
+`skills_repo_sha`.
 
 ## 7. Where state lives
 
@@ -815,13 +1279,15 @@ deprecated.
 | --- | --- | --- | --- |
 | Idempotency table (DynamoDB, webhook stack) | Delivery keys (24 hour TTL), daily budget counters `budget#<route>#<date>` (3 day TTL), round counters `autoreviews#owner/name#<pr>` (180 days from the latest automatic review) and pending markers `pending#owner/name#<pr>` (an hour after the queue delay) | Receiver; review workers extend and delete pending markers | Receiver, review workers (pending markers) |
 | `valkey_reviewer_run_heartbeat` (DynamoDB, substrate stack) | One item per run key: `last_activity`, `status`, `model`, `message_id`, 24 hour TTL | Reviewer runtimes; review workers write each run's start record | Review workers |
-| `valkey_review_concerns`, `valkey_glide_review_concerns` (DynamoDB, reviewer stacks) | Concern records. Customer-managed KMS key, point-in-time recovery, retained on stack deletion | Curator, decay job | Curator, decay job, `scripts/concerns-dump.sh` |
-| Assets bucket (S3, substrate stack) | `<agent>/prompt.md` and `<agent>/skill.md` for each reviewer and `curator/`. KMS encrypted and versioned | CDK deploy | Each runtime reads its own prefix at container start |
-| Reviewer skills registries (AWS Agent Registry, one per reviewer) | Graduated `SKILL` records | Curator (`submit_skill`) | That reviewer |
+| `valkey_review_concerns`, `valkey_glide_review_concerns` (DynamoDB, reviewer stacks) | Concern records with their skill lifecycle attributes (tombstones included), and the `#maintenance` / `repo-skill` item. Customer-managed KMS key, point-in-time recovery, retained on stack deletion | Curator, decay job, `scripts/skill-check.mjs` (claims) | Curator, decay job, `scripts/concerns-dump.sh`, `scripts/skill-check.mjs`, `scripts/registry-skills.mjs orphans` |
+| Assets bucket (S3, substrate stack) | `<agent>/prompt.md` and `<agent>/skill.md` for each reviewer, and `curator/prompt.md`, `curator/skill.md` and `curator/skill-check.md`. KMS encrypted and versioned | CDK deploy | Each runtime reads its own prefix at container start |
+| Reviewer skills registries (AWS Agent Registry, one per reviewer) | Graduated `SKILL` records, retired ones `DEPRECATED` | Curator (`submit_skill`, check edits, retirement) | That reviewer, the curator |
 | Curator registry (AWS Agent Registry) | Skill-writing guidance | `scripts/publish-curator-skills.mjs` | Curator (`list_skill_authoring`) |
-| GitHub App secret (Secrets Manager) | `app_id`, `private_key`, `webhook_secret`. Created by the operator and referenced by name, so a deploy never replaces it | Operator | Receiver, token broker |
+| GitHub App secret (Secrets Manager) | `app_id`, `private_key`, `webhook_secret`. Created by the operator and referenced by name, so a deploy never replaces it | Operator | Receiver, token brokers, and the skills-repo broker when `skillsRepo.appSecretName` names it |
+| Skills-repo App secret (Secrets Manager, optional) | `app_id` and `private_key` of the App that opens skill pull requests, when it is not the main App | Operator | Skills-repo broker |
 | SQS queues | Envelopes in flight (14 days), and dead-lettered messages | Receiver, SQS redrive | Workers, operators |
 | GitHub | Reviews, the review state comment (the carry-over between runs) and status comments | Reviewer runtimes, receiver (acknowledgements) | Reviewer runtimes, people |
+| Bot repository on GitHub (`skillsRepo.repo`) | The reviewers' repo skill files, and `skill-check/<reviewer>/<release>` branches and pull requests | Maintainers; the curator writes only `skill-check/` branches and their pull requests | Curator (anonymous reads), maintainers |
 | Container image | The repository clone each run fetches into. Warm containers keep gitignored build output between runs | Image build | Reviewer runtime |
 
 The registries and the secret are created outside the CDK app; see
