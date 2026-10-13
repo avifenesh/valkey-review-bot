@@ -511,29 +511,6 @@ function containsWordStart(text: string, stem: string): boolean {
   return false;
 }
 
-function globToRegExp(glob: string): RegExp {
-  let re = '';
-  for (let i = 0; i < glob.length; i++) {
-    const c = glob[i]!;
-    if (c === '*' && glob[i + 1] === '*') {
-      i++;
-      if (glob[i + 1] === '/') {
-        i++;
-        re += '(?:.*/)?';
-      } else {
-        re += '.*';
-      }
-    } else if (c === '*') {
-      re += '[^/]*';
-    } else if (c === '?') {
-      re += '[^/]';
-    } else {
-      re += c.replace(/[.+^${}()|[\]\\]/g, '\\$&');
-    }
-  }
-  return new RegExp(`^${re}$`);
-}
-
 /** The components of a qualified name that differ from the one it replaces, or null when the shapes differ. */
 function changedComponents(from: string, to: string): string[] | null {
   const a = from.split(/(::|\.|->)/);
@@ -548,21 +525,18 @@ function changedComponents(from: string, to: string): string[] | null {
 }
 
 /**
- * Whether a cited line supports a changed name: the line has the new
- * name as a word. A new path is also supported by any line of that file
- * (or of a file whose path ends with it, as the check matches tails),
- * a new directory or glob by a line of a file in or matching it, and a
- * new qualified name by a line that has each component that changed.
+ * Whether a cited line supports a changed name: the line contains the
+ * new name (a path, directory or glob too, as text: the file a line
+ * comes from is not evidence) or the new number. A new prefix is
+ * supported by a word starting with its stem, and a new qualified name
+ * by a line that has each component that changed.
  */
-function supports(change: Change, c: Citation, line: string): boolean {
+function supports(change: Change, line: string): boolean {
   const to = change.to;
   if (change.number) return containsNumber(line, to);
   if (containsWord(line, to)) return true;
   switch (nameKind(to)) {
     case 'prefix': return containsWordStart(line, to.slice(0, -1));
-    case 'path': return c.path === to || c.path.endsWith(`/${to}`);
-    case 'dir': return c.path.startsWith(to) || c.path.includes(`/${to}`);
-    case 'glob': return globToRegExp(to).test(to.includes('/') ? c.path : c.path.slice(c.path.lastIndexOf('/') + 1));
     case 'qualified': {
       const parts = changedComponents(change.from, to);
       return parts !== null && parts.length > 0 && parts.every((p) => containsWord(line, p));
@@ -800,11 +774,11 @@ async function evidenceProblems(
       const line = lines[j];
       if (line === null || line === undefined) {
         problems.push({ edit, message: `evidence ${formatCitation(c)}: no such line at that commit` });
-      } else if (!changes.some((ch) => supports(ch, c, line))) {
+      } else if (!changes.some((ch) => supports(ch, line))) {
         problems.push({ edit, message: `evidence ${formatCitation(c)}: the line supports none of the changed names` });
       }
     });
-    const unsupported = changes.filter((ch) => !evidence.some((c, j) => typeof lines[j] === 'string' && supports(ch, c, lines[j]!)));
+    const unsupported = changes.filter((ch) => !lines.some((line) => typeof line === 'string' && supports(ch, line)));
     for (const to of new Set(unsupported.map((ch) => ch.to))) problems.push({ edit, message: `no cited line contains \`${to}\`` });
   }
   return problems;

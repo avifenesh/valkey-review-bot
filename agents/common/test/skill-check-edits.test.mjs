@@ -20,6 +20,7 @@ const UPSTREAM = {
   'src/db.c:121': '    /* emptyData replaced the old name */',
   'src/config.c:3301': '    createIntConfig("hash-max-listpack-entries", "hash-max-ziplist-entries", MODIFIABLE_CONFIG, 0, LONG_MAX, server.hash_max_listpack_entries, 1024, INTEGER_CONFIG, NULL, NULL),',
   'src/hashtable.c:1': '/* Hash table implementation */',
+  'cmake/Modules/SourceFiles.cmake:12': '    ${CMAKE_SOURCE_DIR}/src/hashtable.c',
   'src/replication.c:40': 'case REPL_STATE_V2_CONNECT:',
   'src/server.h:10': 'int unrelated_line;',
 };
@@ -95,11 +96,16 @@ test('a multi-line piece, a removed file and a prefix are accepted together', as
     {
       original: '- `dict` lives in `src/dict.c`; callers keep `dictEntry`.\n- Transitions use `REPL_STATE_*` values.',
       replacement: '- `dict` lives in `src/hashtable.c`; callers keep `dictEntry`.\n- Transitions use `REPL_STATE_V2_*` values.',
-      evidence: [cite('src/hashtable.c', 1), cite('src/replication.c', 40)],
+      evidence: [cite('cmake/Modules/SourceFiles.cmake', 12), cite('src/replication.c', 40)],
     },
   ];
   const out = await validateEdits(SKILL, edits, ctx(), resolver());
   assert.deepEqual(out.problems, []);
+  // A line of the new file that does not name it is no evidence for the path.
+  assert.deepEqual((await validateEdits(SKILL, [{ ...edits[0], evidence: [cite('src/hashtable.c', 1), cite('src/replication.c', 40)] }], ctx(), resolver())).problems, [
+    `edit 1: evidence ${REPO}@${SHA}:src/hashtable.c:1: the line supports none of the changed names`,
+    'edit 1: no cited line contains `src/hashtable.c`',
+  ]);
   const [block] = listSuppressedBlocks(out.skillMd);
   assert.equal(block.original, edits[0].original);
   assert.equal(block.replacement, edits[0].replacement);
@@ -366,7 +372,7 @@ test('a replacement identical to the original, or holding markers, is refused', 
   assert.ok(problems.includes('edit 1: the replacement must not contain suppression markers'), JSON.stringify(problems));
 });
 
-test('a qualified name, a directory or a glob is supported by its changed part or by the cited file', async () => {
+test('a qualified name is supported by its changed part; a path, directory or glob only by a line that contains it', async () => {
   const skillMd = [
     '---', 'name: q', 'description: "x"', '---',
     '- `ConnectionManager::reconnect` retries; see `glide-core/src/client/**` and `glide-core/src/old/`.',
@@ -377,16 +383,23 @@ test('a qualified name, a directory or a glob is supported by its changed part o
   const table = {
     'glide-core/src/conn/mod.rs:10': '    pub fn reconnect_now(&self) {',
     'glide-core/src/new/lib.rs:1': '//! new module',
+    '.github/CODEOWNERS:3': 'glide-core/src/conn/** @valkey-io/glide-maintainers',
+    'glide-core/Cargo.toml:5': 'include = ["glide-core/src/new/"]',
   };
-  const ok = await validateEdits(skillMd, [{ original, replacement, evidence: [cite('glide-core/src/conn/mod.rs', 10), cite('glide-core/src/new/lib.rs', 1)] }],
-    ctx({ flagged: ['ConnectionManager::reconnect'] }), resolver(table));
+  const flagged = ['ConnectionManager::reconnect'];
+  const evidence = [cite('glide-core/src/conn/mod.rs', 10), cite('.github/CODEOWNERS', 3), cite('glide-core/Cargo.toml', 5)];
+  const ok = await validateEdits(skillMd, [{ original, replacement, evidence }], ctx({ flagged }), resolver(table));
   assert.deepEqual(ok.problems, []);
-  const bad = await validateEdits(skillMd, [{ original, replacement, evidence: [cite('glide-core/src/new/lib.rs', 1)] }],
-    ctx({ flagged: ['ConnectionManager::reconnect'] }), resolver(table));
+  // Lines of files inside the new directory or glob do not name them.
+  const bad = await validateEdits(skillMd, [{ original, replacement, evidence: [cite('glide-core/src/conn/mod.rs', 10), cite('glide-core/src/new/lib.rs', 1)] }],
+    ctx({ flagged }), resolver(table));
   assert.deepEqual(bad.problems, [
-    'edit 1: no cited line contains `ConnectionManager::reconnect_now`',
+    `edit 1: evidence ${REPO}@${SHA}:glide-core/src/new/lib.rs:1: the line supports none of the changed names`,
     'edit 1: no cited line contains `glide-core/src/conn/**`',
+    'edit 1: no cited line contains `glide-core/src/new/`',
   ]);
+  const unsupported = await validateEdits(skillMd, [{ original, replacement, evidence: evidence.slice(1) }], ctx({ flagged }), resolver(table));
+  assert.deepEqual(unsupported.problems, ['edit 1: no cited line contains `ConnectionManager::reconnect_now`']);
 });
 
 test('an edit that gives its own reason is refused; the reason is always generated', async () => {
