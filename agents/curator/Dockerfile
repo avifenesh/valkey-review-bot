@@ -1,7 +1,9 @@
-# Curator agent container: the concerns-store tools and skill graduation
-# into AWS Agent Registry. Unlike the reviewers it needs no repository
-# checkout, language toolchains or language servers. The base image is
-# pinned by digest.
+# Curator agent container: the concerns-store tools, skill graduation
+# into AWS Agent Registry, and the skill maintenance runs. Unlike the
+# reviewers it bakes no repository checkout and needs no language
+# toolchains or language servers; a release check fetches the public
+# upstream into a fresh directory under /tmp/skill-check and deletes it
+# afterwards. The base image is pinned by digest.
 
 FROM --platform=$BUILDPLATFORM public.ecr.aws/docker/library/node:26-bookworm-slim@sha256:86f07bc9c5dce4578cf37e5a418b7bfc7f817cda25cde66e2b66e95ed86c4567 AS build
 
@@ -32,6 +34,14 @@ FROM public.ecr.aws/docker/library/node:26-bookworm-slim@sha256:86f07bc9c5dce457
 ENV NODE_ENV=production
 
 WORKDIR /app/agents/curator
+
+# git for the release check's upstream checkout, with the CA bundle for
+# its https fetches. The checkouts go in a directory only the runtime
+# user can write.
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends git ca-certificates \
+ && rm -rf /var/lib/apt/lists/* \
+ && install -d -o node -g node -m 0700 /tmp/skill-check
 
 COPY --from=build --chown=node:node /app/agents/curator/package.json /app/agents/curator/package.json
 COPY --from=build --chown=node:node /app/agents/curator/node_modules /app/agents/curator/node_modules
