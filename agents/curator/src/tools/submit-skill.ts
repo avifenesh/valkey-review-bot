@@ -456,11 +456,15 @@ async function chooseTarget(
   if (await deps.registry.exists(name)) {
     return `another skill already uses the registry name "${name}"; submit again with a different subject`;
   }
+  const conditions = [...gate, '#grn = :old', 'attribute_exists(#ret)'];
+  const values: Record<string, unknown> = { ':name': name, ':gen': generation, ':old': current, ':t': threshold };
+  // An operator who set retired_reason since the read made the retirement final.
+  asRead(conditions, values, '#rr', ':readReason', reason);
   return {
     name,
     update: `SET #grn = :name, #sg = :gen, #prn = :old ${CANCEL_MAINTENANCE}, #ga`,
-    conditions: [...gate, '#grn = :old', 'attribute_exists(#ret)'],
-    values: { ':name': name, ':gen': generation, ':old': current, ':t': threshold },
+    conditions,
+    values,
     replaces: current,
     previous: published.skillMd,
     tombstone: true,

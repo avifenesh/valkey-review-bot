@@ -763,6 +763,22 @@ test('an update claim and a revise claim of the same skill cannot both succeed',
   assert.equal(conditionHolds(w.record(), reviseClaim()), false);
 });
 
+test('a tombstone that changes between the read and the generation claim publishes nothing', async () => {
+  const isClaim = (command) => command.constructor.name === 'UpdateCommand' && command.input.UpdateExpression.startsWith('SET #grn = :name, #sg');
+  const changes = {
+    'no longer retired': (row) => { delete row.retired_at; },
+    'retired by an operator': (row) => { row.retired_reason = 'operator'; },
+  };
+  for (const [name, change] of Object.entries(changes)) {
+    const w = world({ item: tombstone(), skills: DEPRECATED, intercept: (command, row) => { if (isClaim(command)) change(row); } });
+    const out = parse(await w.submit.invoke(INPUT));
+    assert.equal(out.ok, false, name);
+    assert.match(out.error, /changed or graduated under another name/, name);
+    assert.ok(!w.registry.calls.some((c) => c.startsWith('upsert')), `${name}: nothing is published`);
+    assert.equal(w.record().graduated_record_name, OLD, name);
+  }
+});
+
 test('two runs restoring one tombstone agree on one generation', async () => {
   // The other run claimed generation 2 after this one read the record.
   const now = tombstone({ graduated_record_name: generationName(2), skill_generation: 2, previous_record_name: OLD });
