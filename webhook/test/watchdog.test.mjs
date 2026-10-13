@@ -4,12 +4,16 @@ import test from 'node:test';
 import './support/ts-resolve.mjs';
 
 const { heartbeatRunKey } = await import('../src/review-envelope.ts');
-const { CURATOR_MAX_RECEIVES, decide } = await import('../src/watchdog.ts');
+const { CURATOR_MAX_RECEIVES, decide, isCuratorMessage, messageTag } = await import('../src/watchdog.ts');
 
 const MIN = 60_000;
 const NOW = Date.parse('2026-10-13T12:00:00Z');
 const review = { repo: 'example-org/valkey', pr_number: 7, installation_id: 42, head_sha: 'abc123' };
 const curator = { reviewer_id: 'valkey-review', feedback_id: 'rc-1', kind: 'review_comment_reply', repo: 'example-org/valkey', pr_number: 7 };
+const maintenance = {
+  maintenance_id: 'check#valkey-review#r1#2026-10-13', reason: 'check', reviewer_id: 'valkey-review',
+  area_bucket: 'src', record_id: 'r1', record_name: 'rdb-load', release_tag: '9.1.2', seen_updated_at: '2026-10-01T00:00:00Z',
+};
 
 function input(overrides = {}) {
   const reads = [];
@@ -116,6 +120,33 @@ test('curator messages run on every receive up to the queue limit, then are dele
   const decision = await decide(value);
   assert.equal(decision.action, 'delete');
   assert.equal(decision.error, true);
+});
+
+test('maintenance messages run like curator messages, without a heartbeat read', async () => {
+  for (let receive = 1; receive <= CURATOR_MAX_RECEIVES; receive++) {
+    const { value, reads } = input({ envelope: maintenance, receiveCount: receive });
+    assert.deepEqual(await decide(value), { action: 'invoke', useFallbackModel: false, reason: `attempt ${receive}` });
+    assert.equal(reads.length, 0);
+  }
+  const { value, reads } = input({ envelope: maintenance, receiveCount: CURATOR_MAX_RECEIVES + 1 });
+  const decision = await decide(value);
+  assert.equal(decision.action, 'delete');
+  assert.equal(decision.error, true);
+  assert.equal(reads.length, 0);
+});
+
+test('only a string feedback_id or maintenance_id marks a curator message', () => {
+  assert.equal(isCuratorMessage(curator), true);
+  assert.equal(isCuratorMessage(maintenance), true);
+  assert.equal(isCuratorMessage(review), false);
+  assert.equal(isCuratorMessage({ ...review, feedback_id: 7 }), false);
+  assert.equal(isCuratorMessage({ ...review, maintenance_id: null }), false);
+});
+
+test('the log tag names the message', () => {
+  assert.equal(messageTag(review), 'review repo=example-org/valkey pr=7 head=abc123');
+  assert.equal(messageTag(curator), 'curator repo=example-org/valkey feedback=rc-1');
+  assert.equal(messageTag(maintenance), 'curator maintenance=check#valkey-review#r1#2026-10-13 reviewer=valkey-review');
 });
 
 test('heartbeatRunKey matches the runtime formula', () => {

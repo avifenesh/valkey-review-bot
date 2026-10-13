@@ -2,7 +2,7 @@ import { BedrockAgentCoreClient, InvokeAgentRuntimeCommand } from '@aws-sdk/clie
 import { DynamoDBClient } from '@aws-sdk/client-dynamodb';
 import { DynamoDBDocumentClient, GetCommand } from '@aws-sdk/lib-dynamodb';
 import { loadInvokerConfig } from './config.js';
-import { decide, isCuratorMessage, type HeartbeatRecord } from './watchdog.js';
+import { decide, isCuratorMessage, messageTag, type HeartbeatRecord } from './watchdog.js';
 
 /**
  * Queue worker: one message per invocation, forwarded unchanged to the
@@ -37,9 +37,7 @@ async function handleOne(record: SqsRecord): Promise<void> {
   const envelope = JSON.parse(record.body) as Record<string, unknown>;
   const curator = isCuratorMessage(envelope);
   const receiveCount = parseInt(record.attributes?.ApproximateReceiveCount ?? '1', 10);
-  const tag = curator
-    ? `curator repo=${envelope.repo} feedback=${envelope.feedback_id}`
-    : `review repo=${envelope.repo} pr=${envelope.pr_number} head=${envelope.head_sha}`;
+  const tag = messageTag(envelope);
 
   // Without the heartbeat table every redelivery would look like a dead
   // run and start a second review on the fallback model.

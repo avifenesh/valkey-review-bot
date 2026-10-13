@@ -22,10 +22,10 @@ import { heartbeatRunKey } from './review-envelope.js';
  * infra/lib/webhook-stack.ts sizes maxReceiveCount from the 90-minute
  * default and the 16-minute visibility timeout.
  *
- * Curator messages have no heartbeat. Each receive runs the curator; the
- * curator queue dead-letters after three receives, and a message seen
- * more often than that (a queue without its redrive policy) is deleted
- * rather than run again.
+ * Curator messages, feedback or maintenance, have no heartbeat. Each
+ * receive runs the curator; the curator queue dead-letters after three
+ * receives, and a message seen more often than that (a queue without its
+ * redrive policy) is deleted rather than run again.
  */
 
 export const CURATOR_MAX_RECEIVES = 3;
@@ -51,8 +51,22 @@ export interface WatchdogInput {
   readonly readHeartbeat: (runKey: string) => Promise<HeartbeatRecord | undefined>;
 }
 
+/**
+ * The receiver sends feedback envelopes (feedback_id) and the decay job
+ * sends maintenance envelopes (maintenance_id) to the curator queue.
+ * Anything else is a review.
+ */
 export function isCuratorMessage(envelope: Readonly<Record<string, unknown>>): boolean {
-  return typeof envelope.feedback_id === 'string';
+  return typeof envelope.feedback_id === 'string' || typeof envelope.maintenance_id === 'string';
+}
+
+/** How the invoker's log lines name a message. */
+export function messageTag(envelope: Readonly<Record<string, unknown>>): string {
+  if (typeof envelope.maintenance_id === 'string') {
+    return `curator maintenance=${envelope.maintenance_id} reviewer=${envelope.reviewer_id}`;
+  }
+  if (isCuratorMessage(envelope)) return `curator repo=${envelope.repo} feedback=${envelope.feedback_id}`;
+  return `review repo=${envelope.repo} pr=${envelope.pr_number} head=${envelope.head_sha}`;
 }
 
 export async function decide(input: WatchdogInput): Promise<Decision> {
