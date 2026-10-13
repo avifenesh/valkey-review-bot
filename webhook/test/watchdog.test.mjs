@@ -12,7 +12,7 @@ const review = { repo: 'example-org/valkey', pr_number: 7, installation_id: 42, 
 const curator = { reviewer_id: 'valkey-review', feedback_id: 'rc-1', kind: 'review_comment_reply', repo: 'example-org/valkey', pr_number: 7 };
 const maintenance = {
   maintenance_id: 'check#valkey-review#r1#2026-10-13', reason: 'check', reviewer_id: 'valkey-review',
-  area_bucket: 'src', record_id: 'r1', record_name: 'rdb-load', release_tag: '9.1.2', seen_updated_at: '2026-10-01T00:00:00Z',
+  area_bucket: 'src', record_id: 'r1', record_name: 'rdb-load', release_tag: '9.1.2', seen_updated_at: '2026-10-01T00:00:00Z', dry_run: false,
 };
 
 function input(overrides = {}) {
@@ -146,7 +146,15 @@ test('only a string feedback_id or maintenance_id marks a curator message', () =
 test('the log tag names the message', () => {
   assert.equal(messageTag(review), 'review repo=example-org/valkey pr=7 head=abc123');
   assert.equal(messageTag(curator), 'curator repo=example-org/valkey feedback=rc-1');
-  assert.equal(messageTag(maintenance), 'curator maintenance=check#valkey-review#r1#2026-10-13 reviewer=valkey-review');
+  assert.equal(
+    messageTag(maintenance),
+    'curator maintenance=check#valkey-review#r1#2026-10-13 reviewer=valkey-review reason=check dry_run=false',
+  );
+  assert.equal(
+    messageTag({ ...maintenance, reason: 'repo_check', dry_run: true }),
+    'curator maintenance=check#valkey-review#r1#2026-10-13 reviewer=valkey-review reason=repo_check dry_run=true',
+  );
+  assert.match(messageTag({ ...maintenance, dry_run: 'true' }), / dry_run=false$/, 'only the boolean true is a dry run');
 });
 
 test('a review of new commits names the pending marker the worker clears', () => {

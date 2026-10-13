@@ -60,10 +60,14 @@ export function isCuratorMessage(envelope: Readonly<Record<string, unknown>>): b
   return typeof envelope.feedback_id === 'string' || typeof envelope.maintenance_id === 'string';
 }
 
-/** How the invoker's log lines name a message. */
+/**
+ * How the invoker's log lines name a message. A maintenance message also
+ * shows its reason (check, retire or repo_check) and whether it is a dry
+ * run, so a report-only pass can be told apart in the logs.
+ */
 export function messageTag(envelope: Readonly<Record<string, unknown>>): string {
   if (typeof envelope.maintenance_id === 'string') {
-    return `curator maintenance=${envelope.maintenance_id} reviewer=${envelope.reviewer_id}`;
+    return `curator maintenance=${envelope.maintenance_id} reviewer=${envelope.reviewer_id} reason=${envelope.reason} dry_run=${envelope.dry_run === true}`;
   }
   if (isCuratorMessage(envelope)) return `curator repo=${envelope.repo} feedback=${envelope.feedback_id}`;
   return `review repo=${envelope.repo} pr=${envelope.pr_number} head=${envelope.head_sha}`;
