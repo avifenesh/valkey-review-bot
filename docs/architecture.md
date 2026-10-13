@@ -286,7 +286,7 @@ A delivery reaches the curator queue only when all of these hold:
   and deletions never count.
 - The author has a login, is not a bot, and has `author_association` `OWNER`,
   `MEMBER` or `COLLABORATOR`.
-- It is not a summons. A thread reply that started a re-review still counts.
+- It is not a summons. A thread reply that started a run still counts.
 - The repository has a curator route: every review route plus the
   `curatorOnlyRoutes`.
 - `classifyCommentBody` does not call it noise. It drops empty text,
@@ -918,11 +918,11 @@ graduate. The curator accepts values from 2 to 100.
 ### Publishing skills to AWS Agent Registry
 
 `submit_skill` (`agents/curator/src/tools/submit-skill.ts`) accepts only the
-record this run bumped or merged into, or a graduated record whose live skill
-this run corrected with `update_concern` (an update, never a first
-graduation), and only when its stored count meets the threshold. It accepts at most 40,000 characters of `skill_md`
-(`GRADUATED_SKILL_MAX_CHARS`), half the reviewers' load budget, so every
-published skill can be loaded. The record name is the record's existing
+record this run bumped or merged into, or a graduated record whose live
+skill this run corrected with `update_concern` (an update, never a first
+graduation), and only when its stored count meets the threshold. It accepts
+at most 40,000 characters of `skill_md` (`GRADUATED_SKILL_MAX_CHARS`), half
+the reviewers' load budget, so every published skill can be loaded. The record name is the record's existing
 `graduated_record_name`. A first graduation uses a slug of the subject (at
 most 60 characters), or, when another skill already holds that name, the
 slug with a suffix derived from the record id; if both are taken the call
@@ -1084,9 +1084,10 @@ upstream default branch (`check` in `agents/curator/src/maintenance.ts`).
    (`getSkillByName`). Skip a stale message, a renamed or retired record.
    A registry record that is gone or `DEPRECATED` is recorded as retired
    (`decayed` or `obsolete` when this lifecycle's deprecation marker is on
-   the record, else `operator`), `REJECTED` always as `operator`. One that is
-   `CREATING` or `UPDATING` gives `inconclusive`, and the check is retried.
-   A reviewer with no upstream is skipped.
+   the record, else `operator`), `REJECTED` always as `operator`; one that
+   is gone and whose publication was never recorded gives `error`. One that
+   is `CREATING` or `UPDATING` gives `inconclusive`, and the check is
+   retried. A reviewer with no upstream is skipped.
 2. Make the checkout (`prepareUpstreamCheckout` in
    `agents/common/src/skill-check/upstream.ts`) in a fresh directory under
    `/tmp/skill-check`, removed afterwards: `git init`, `ls-remote --symref`
@@ -1156,11 +1157,11 @@ replacement after them:
 - Split on runs of `[A-Za-z0-9_./:*>-]`, the text between tokens is the
   same in both and the token count is equal: no word, sentence or
   punctuation is added or removed, and the line count is the same.
-- A changed token is a code name in a backtick span replaced by a code name
-  of the same sort (a path for a path, an identifier for an identifier, a
-  config name for a config name), and must be a flagged name; or a number
-  on a line that holds a flagged name. Words outside code spans never
-  change, so "NEVER flag" cannot become "ALWAYS flag".
+- A changed token is a flagged code name in a backtick span, replaced by a
+  code name of the same sort (a path for a path, an identifier for an
+  identifier, a config name for a config name); or a number on a line that
+  holds a flagged name. Words outside code spans never change, so "NEVER
+  flag" cannot become "ALWAYS flag".
 - Each edit cites 1 to 5 lines of the checked commit, and every new name or
   number appears as a word on a cited line. A number's cited line must also
   hold a code name from the edited line.
@@ -1224,9 +1225,9 @@ skips `DEPRECATED` records, and that frees room in the 30-skill,
 (`ValidationException`) and a fresh read shows the record neither retired
 nor being written, the run logs `[maintenance] retire-refused <name>
 status=<s>`, sets `retire_refused_at` and releases the claim; the decay job
-then waits 30 days before it asks again. A deprecation that fails in any other way leaves
-the claim and the marker, and the redelivered message finds out what
-happened.
+then waits 30 days before it asks again. A deprecation that fails in any
+other way leaves the claim and the marker, and the redelivered message
+finds out what happened.
 
 ### Repo skill pull requests
 
@@ -1261,9 +1262,9 @@ for it, and its edits are proposed by pull request
 - A re-run for the same reviewer and release updates the same branch and
   pull request. A branch that holds commits the check did not make, such as
   a maintainer's fixups, is never rebuilt: the proposal is `refused` and the
-  run records `error`. When the file changed
-  on the base branch since the check read it, nothing is pushed
-  (`base-moved`), and the next pass checks the new text.
+  run records `error`. When the file changed on the base branch since the
+  check read it, nothing is pushed (`base-moved`), and the next pass checks
+  the new text.
 - When maintainers closed a pull request from the branch without merging,
   nothing more is proposed for that release (`declined`); the next release
   proposes on a new branch. The only ref ever written is the
