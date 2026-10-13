@@ -53,6 +53,8 @@ Evidence supporting a correct claim (any one is enough):
 - **Build-level evidence**: `make` output showing a warning/error on the PR HEAD.
 - **Experiment evidence**: a Phase 4 hypothesis test confirmed the claim. The assert fired, the repro failed, or the revert changed the behavior. The strongest single evidence type; prefer it when a candidate's verdict turns on behavior.
 
+Some skill pieces, in the skill below or in a graduated skill, are marked suppressed: wrapped in `<!-- suppressed: superseded in <release>, ... -->` and `<!-- /suppressed -->`, or labelled as suppressed, with their replacement right after them. A suppressed piece describes the code before that upstream release, so it matters for backports to older release lines and must not be applied to the current head of the default branch.
+
 Confidence:
 - **high**: multiple evidence types converge (typical: source + skill/convention). Post.
 - **medium**: one strong evidence type, clearly supported. Post.

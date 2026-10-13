@@ -50,3 +50,14 @@ test('the prompt covers each kind of reply in a review thread', () => {
   assert.match(prompt, /Drop an earlier finding only if it turns out to be wrong, and say so in `summary`\./);
   assert.ok(!prompt.includes('Fix-verification re-review'));
 });
+
+test('the prompt keeps suppressed skill pieces for older release lines only', () => {
+  const prompt = readFileSync(new URL('../config/prompt.md', import.meta.url), 'utf8');
+  const para = prompt.split('\n').find((l) => l.startsWith('Some skill pieces, '));
+  assert.ok(para, 'the paragraph is in "The correctness bar"');
+  // The markers as the skill check writes them.
+  assert.ok(para.includes('`<!-- suppressed: superseded in <release>, ... -->` and `<!-- /suppressed -->`'));
+  assert.match(para, /describes the code before that upstream release/);
+  assert.match(para, /matters for backports to older release lines and must not be applied to the current head/);
+  assert.ok(prompt.indexOf(para) < prompt.indexOf('\nConfidence:\n'));
+});
