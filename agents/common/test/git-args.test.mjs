@@ -59,6 +59,19 @@ test('options that write files or run helpers are refused, including abbreviatio
   rejected(['grep', '-c', 'x'], /--count/);
 });
 
+test('git diff refuses paths outside the repository, which turn on --no-index by themselves', () => {
+  rejected(['diff', '/etc/passwd', '/dev/null'], /outside the repository/);
+  rejected(['diff', '--stat', '../../etc/passwd', 'README.md'], /"\.\.\/\.\.\/etc\/passwd"/);
+  rejected(['diff', 'src/../../x', 'README.md'], /outside the repository/);
+  rejected(['diff', '..', 'README.md'], /outside the repository/);
+  rejected(['diff', '--', '/etc/passwd'], /outside the repository/);
+  ok(['diff', 'abc..def', '--', 'src/server.c']);
+  ok(['diff', '..HEAD']);
+  ok(['diff', 'a...b', '--', 'src/../README.md']);
+  ok(['diff', 'HEAD~1', 'HEAD', '--', 'src']);
+  ok(['log', '-p', '--', 'src']);
+});
+
 test('-O inside a short-option bundle is refused for commands that take diff options', () => {
   rejected(['diff', '-RO/etc/passwd'], /git diff -O/);
   rejected(['diff', '-pO', '/etc/passwd'], /git diff -O/);

@@ -1,3 +1,4 @@
+import path from 'node:path';
 import { z } from 'zod';
 import { tool } from '@strands-agents/sdk';
 import { buildChildEnv } from './child-env.js';
@@ -133,6 +134,14 @@ function forbiddenShortOption(sub: string, arg: string): string | undefined {
   return undefined;
 }
 
+/**
+ * True for a path outside the repository: absolute, or climbing out with
+ * "..". The tool runs from the repository root.
+ */
+function outsideRepository(arg: string): boolean {
+  return path.isAbsolute(arg) || path.normalize(arg).split('/')[0] === '..';
+}
+
 function checkListingForm(sub: 'branch' | 'tag', rest: readonly string[]): string | null {
   const allowed = LISTING_OPTIONS[sub];
   let hasList = false;
@@ -188,6 +197,12 @@ export function checkGitArgs(args: readonly string[]): string | null {
     }
   }
   if (sub === 'branch' || sub === 'tag') return checkListingForm(sub, rest);
+  if (sub === 'diff') {
+    // Given two paths and one of them outside the work tree, git diff
+    // switches to --no-index by itself and compares any two files.
+    const outside = rest.find((a) => !a.startsWith('-') && outsideRepository(a));
+    if (outside) return `argument "${outside}" is not allowed: git diff reads files outside the repository given such a path. Use paths relative to the repository root.`;
+  }
   if (sub === 'reflog') {
     const write = rest.find((a) => REFLOG_WRITE_SUBCOMMANDS.has(a));
     if (write) return `git reflog ${write} changes the reflog; only reading it is allowed.`;

@@ -43,3 +43,15 @@ test('the git tool ignores a gitconfig in HOME', async () => {
     }
   }
 });
+
+test('git diff does not read a file outside the repository', async () => {
+  const dir = repo();
+  const secret = path.join(tempDir('git-tool-outside-'), 'secret.txt');
+  writeFileSync(secret, 'outside-content\n');
+  const tool = buildGitTool({ workspaceRoot: dir });
+  for (const args of [['diff', secret, '/dev/null'], ['diff', '--stat', path.relative(dir, secret), 'README.md']]) {
+    const out = await tool.invoke({ args });
+    assert.match(out, /^ERROR:/, args.join(' '));
+    assert.doesNotMatch(out, /outside-content|secret\.txt \|/);
+  }
+});
