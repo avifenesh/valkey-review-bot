@@ -15,6 +15,18 @@ import type { PrContext } from './workspace.js';
 
 export const STATE_MARKER = '<!-- valkey-reviewer:state -->';
 
+/**
+ * `text` with every STATE_MARKER removed, for model-written text the app
+ * posts as a comment, so that comment cannot pass for the state comment.
+ * Repeats until none is left: removing one copy can join the text around
+ * it into a new one.
+ */
+export function stripStateMarker(text: string): string {
+  let out = text;
+  while (out.includes(STATE_MARKER)) out = out.replaceAll(STATE_MARKER, '');
+  return out;
+}
+
 export const reviewStateSchema = z.object({
   status: z.enum(['needs_work', 'ready_for_human_review']).describe(
     '"ready_for_human_review" only when you would approve this PR as it stands: no open blocking finding and no open direction concern. Otherwise "needs_work".',

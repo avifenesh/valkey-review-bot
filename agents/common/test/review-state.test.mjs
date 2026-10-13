@@ -2,7 +2,7 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 import './support/ts-resolve.mjs';
 
-const { createStateCommentWriter, renderReviewState, reviewStateSchema, STATE_MARKER, validateReviewState } = await import('../src/review-state.ts');
+const { createStateCommentWriter, renderReviewState, reviewStateSchema, STATE_MARKER, stripStateMarker, validateReviewState } = await import('../src/review-state.ts');
 
 const state = (overrides = {}) => reviewStateSchema.parse({
   status: 'needs_work',
@@ -55,6 +55,14 @@ test('the rendered comment starts with the marker and lists open and resolved fi
   assert.match(ready, /\*\*Ready for human review\.\*\*/);
   assert.match(ready, /\*\*Open findings:\*\* none\./);
   assert.match(ready, /\*\*Backport:\*\* Not needed\. New feature\./);
+});
+
+test('the marker is stripped from model-written text, even when nested', () => {
+  assert.equal(stripStateMarker(`${STATE_MARKER}\nFixed.`), '\nFixed.');
+  assert.equal(stripStateMarker(`a ${STATE_MARKER} b ${STATE_MARKER}`), 'a  b ');
+  const [head, tail] = [STATE_MARKER.slice(0, 10), STATE_MARKER.slice(10)];
+  assert.equal(stripStateMarker(`${head}${STATE_MARKER}${tail} reply`), ' reply');
+  assert.equal(stripStateMarker('No marker here.'), 'No marker here.');
 });
 
 const ctx = { owner: 'valkey-io', repo: 'valkey', prNumber: 3 };

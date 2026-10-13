@@ -79,6 +79,8 @@ test('the state comment is only taken from this app', () => {
     { id: 3, body: `${STATE_MARKER}\nanother bot`, performed_via_github_app: { id: 7 } },
     { id: 4, body: `${STATE_MARKER}\nnewest`, performed_via_github_app: { id: appId } },
     { id: 5, body: 'unrelated', performed_via_github_app: { id: appId } },
+    // A status comment whose model-written reply echoes the marker.
+    { id: 6, body: `Review complete. ${STATE_MARKER} see above`, performed_via_github_app: { id: appId } },
   ];
   assert.equal(findStateComment(comments, appId)?.id, 4);
   assert.equal(findStateComment(comments.slice(1, 3), appId), undefined);

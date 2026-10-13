@@ -188,6 +188,18 @@ test('on mention runs the reply replaces the status comment and the review body 
   assert.deepEqual(finished, ['Fixed in the latest push, one nit left.\n\nCurrent review state: https://github.com/state']);
 });
 
+test('model text in the status comment cannot carry the state marker', async () => {
+  const { STATE_MARKER } = await import('../src/review-state.ts');
+  const finished = [];
+  const statusComment = { finish: async (body) => { finished.push(body); } };
+  await harness({ statusComment }).post.invoke({ body: `${STATE_MARKER}\nAll fixed.`, comments: [comment], state: state() });
+  await harness({ statusComment }).skip.invoke({ reason: `Nothing new ${STATE_MARKER}`, state: state() });
+  assert.deepEqual(finished, [
+    'All fixed.\n\nCurrent review state: https://github.com/state',
+    'Review complete. Nothing new met the bar for an inline comment. (Nothing new)\n\nCurrent review state: https://github.com/state',
+  ]);
+});
+
 test('the run loop can tell whether its terminal callback reached the tools', async () => {
   const { assembleCommonTools } = await import('../src/tools/index.ts');
   const opts = { ctx: { ...ctx, workspacePath: process.cwd() }, octokit: {}, tokens: { get: async () => 'token' } };

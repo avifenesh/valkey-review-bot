@@ -247,10 +247,12 @@ interface AppComment {
 
 /**
  * The newest state comment written by this app. Anyone can paste the
- * marker into a comment, so the marker alone is not enough.
+ * marker into a comment, so the marker alone is not enough. The app's
+ * status comments carry model-written text, so the marker must also open
+ * the body, as it does in every rendered state comment.
  */
 export function findStateComment<C extends AppComment>(comments: readonly C[], appId: number): C | undefined {
-  return comments.filter((c) => c.performed_via_github_app?.id === appId && (c.body ?? '').includes(STATE_MARKER)).pop();
+  return comments.filter((c) => c.performed_via_github_app?.id === appId && (c.body ?? '').startsWith(STATE_MARKER)).pop();
 }
 
 async function listPrFiles(octokit: Octokit, owner: string, repo: string, prNumber: number): Promise<string[]> {

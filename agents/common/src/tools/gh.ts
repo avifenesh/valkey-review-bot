@@ -4,7 +4,7 @@ import type { Octokit } from '@octokit/rest';
 import type { PrContext } from '../workspace.js';
 import type { StatusComment } from '../status-comment.js';
 import type { TokenSource } from '../github-auth.js';
-import { reviewStateSchema, renderReviewState, validateReviewState, type ReviewState, type StateCommentWriter } from '../review-state.js';
+import { reviewStateSchema, renderReviewState, stripStateMarker, validateReviewState, type ReviewState, type StateCommentWriter } from '../review-state.js';
 import { runBounded } from './spawn.js';
 
 /**
@@ -280,7 +280,7 @@ The review is anchored at the PR head SHA already loaded in the workspace contex
       // A failed state write is only reported; see writeState.
       const state = await writeState(deps, input.state);
       if (deps.statusComment) {
-        const reply = input.body.trim() || `Review complete. See the ${input.comments.length} inline comment(s).`;
+        const reply = stripStateMarker(input.body).trim() || `Review complete. See the ${input.comments.length} inline comment(s).`;
         await deps.statusComment.finish(withStateLink(reply, state.url));
       }
       const result = JSON.stringify({
@@ -322,7 +322,7 @@ Posts no review, but still writes \`state\` to the PR's review-state comment, so
       // Mention-triggered runs: someone asked and is watching the status
       // comment, and a silent exit would leave it on "still working".
       if (deps.statusComment) {
-        await deps.statusComment.finish(withStateLink(`Review complete. Nothing new met the bar for an inline comment. (${input.reason})`, state.url));
+        await deps.statusComment.finish(withStateLink(`Review complete. Nothing new met the bar for an inline comment. (${stripStateMarker(input.reason).trim()})`, state.url));
       }
       const result = JSON.stringify({
         ok: true,
