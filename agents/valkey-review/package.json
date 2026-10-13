@@ -1,0 +1,42 @@
+{
+  "name": "valkey-review-agent",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Reviewer agent for valkey-io/valkey pull requests.",
+  "license": "BSD-3-Clause",
+  "type": "module",
+  "main": "dist/valkey-review/src/agent.js",
+  "engines": {
+    "node": ">=24"
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "typecheck": "tsc --noEmit -p tsconfig.json",
+    "test": "node --test --experimental-strip-types test/*.test.mjs",
+    "start": "node --enable-source-maps dist/valkey-review/src/agent.js"
+  },
+  "dependencies": {
+    "@agent-sh/harness-core": "^0.2.0",
+    "@agent-sh/harness-tools": "^0.6.0",
+    "@aws-sdk/client-agent-registry-control": "^3.1150.0",
+    "@aws-sdk/client-bedrock-runtime": "^3.1067.0",
+    "@aws-sdk/client-dynamodb": "^3.1045.0",
+    "@aws-sdk/client-lambda": "^3.1150.0",
+    "@aws-sdk/client-s3": "^3.1045.0",
+    "@aws-sdk/lib-dynamodb": "^3.1045.0",
+    "@aws/bedrock-token-generator": "^1.1.0",
+    "@octokit/rest": "^22.0.1",
+    "@strands-agents/sdk": "^1.19.0",
+    "bedrock-agentcore": "^0.2.4",
+    "openai": "^6.7.0",
+    "zod": "^4.1.12"
+  },
+  "devDependencies": {
+    "@types/node": "^24.0.0",
+    "typescript": "^5.5.0"
+  },
+  "overrides": {
+    "valibot": "^1.2.0",
+    "@mozilla/readability": "^0.6.0"
+  }
+}
