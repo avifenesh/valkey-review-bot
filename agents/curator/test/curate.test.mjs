@@ -79,3 +79,38 @@ test('a text-only answer ends the run as incomplete', async () => {
   assert.equal(result.finalText, 'I think this is noise.');
   assert.ok(frames.some((f) => f.event === 'message'));
 });
+
+test('the loop stops at the deadline after the tool round that passes it', async () => {
+  const run = newRun();
+  const model = new ScriptedModel([{ tool: 'list_skill_authoring' }]);
+  const tools = [buildListSkillAuthoringTool({}), buildCuratorDoneTool(run)];
+  const gen = curate({ model, systemPrompt: 'test', tools, run, maxIterations: 10, deadlineMs: Date.now() - 1, message: 'feedback', printer: false });
+  let next;
+  do next = await gen.next(); while (!next.done);
+  assert.equal(next.value.status, 'deadline');
+  assert.ok(model.calls <= 1, `model called ${model.calls} times`);
+  assert.equal(run.done, null);
+});
+
+test('a model call still running at the deadline is cancelled', async () => {
+  const run = newRun();
+  class SlowModel extends ScriptedModel {
+    async *stream(messages, options) {
+      this.calls += 1;
+      yield { type: 'modelMessageStartEvent', role: 'assistant' };
+      await new Promise((resolve) => {
+        const timer = setTimeout(resolve, 5_000);
+        options?.cancelSignal?.addEventListener('abort', () => { clearTimeout(timer); resolve(); });
+      });
+      if (options?.cancelSignal?.aborted) throw new Error('aborted');
+      yield { type: 'modelMessageStopEvent', stopReason: 'endTurn' };
+    }
+  }
+  const model = new SlowModel([]);
+  const started = Date.now();
+  const gen = curate({ model, systemPrompt: 'test', tools: [buildCuratorDoneTool(run)], run, maxIterations: 10, deadlineMs: Date.now() + 200, message: 'feedback', printer: false });
+  let next;
+  do next = await gen.next(); while (!next.done);
+  assert.equal(next.value.status, 'deadline');
+  assert.ok(Date.now() - started < 4_000, 'the model call was not waited out');
+});
