@@ -1025,6 +1025,7 @@ test('a claim left on a record expires by age alone, and a new claim leaves the 
   };
   const cases = [
     ['every maintenance attribute left, 8 days old', old, true],
+    ['claim released, marker kept', { maintenance_deprecating: 'skill-r', retire_refused_at: daysAgo(40) }, true],
     ['id and reason left, request time removed', { maintenance_id: old.maintenance_id, maintenance_reason: 'check' }, true],
     ['request time left, id removed', { maintenance_requested_at: daysAgo(3) }, false],
     ['every maintenance attribute left, 3 days old', { ...old, maintenance_requested_at: daysAgo(3) }, false],
@@ -1038,8 +1039,9 @@ test('a claim left on a record expires by age alone, and a new claim leaves the 
       if (!due) continue;
       const [claim] = claims(ddb).map((w) => w.input);
       assert.ok(claim.ExpressionAttributeValues[':mid'].endsWith(`#r#${NOW_ISO}`), `${label}: a new id`);
-      // The claim only SETs; any other maintenance_* attribute stays for the curator.
+      // The claim only SETs; the curator's own attributes stay.
       assert.ok(!/\bREMOVE\b/.test(claim.UpdateExpression), label);
+      assert.ok(!Object.values(claim.ExpressionAttributeNames).includes('retire_refused_at'), label);
       assert.deepEqual(
         Object.values(claim.ExpressionAttributeNames).filter((n) => n.startsWith('maintenance_')).sort(),
         ['maintenance_id', 'maintenance_reason', 'maintenance_requested_at'],
@@ -1052,5 +1054,30 @@ test('a claim left on a record expires by age alone, and a new claim leaves the 
     const { ctx } = maintenance();
     await decayTable(fakeDdb([[repoItem({ verified_release: '9.1.1', ...fields })]]), 'concerns', FULL, NOW, ctx);
     assert.equal(ctx.sqs.sent.length, due ? 1 : 0, JSON.stringify(fields));
+  }
+});
+
+test('a record renamed under an unreleased claim is claimed under its new name once that claim ages out', async (t) => {
+  quietLogs(t);
+  // A claim and a marker from the record's earlier generation, which the
+  // curator could not release.
+  const renamed = (requestedDaysAgo) => live('r', {
+    graduated_record_name: 'skill-r-g2',
+    verified_at: undefined,
+    maintenance_id: `retire#valkey-review#r#${daysAgo(requestedDaysAgo)}`,
+    maintenance_reason: 'retire',
+    maintenance_requested_at: daysAgo(requestedDaysAgo),
+    maintenance_deprecating: 'skill-r',
+  });
+  for (const [requestedDaysAgo, due] of [[3, false], [8, true]]) {
+    const { ctx } = maintenance();
+    const ddb = table([renamed(requestedDaysAgo)]);
+    await decayTable(ddb, 'concerns', FULL, NOW, ctx);
+    assert.deepEqual(bodies(ctx.sqs).map((b) => [b.reason, b.record_name]), due ? [['check', 'skill-r-g2']] : [], String(requestedDaysAgo));
+    if (!due) continue;
+    const [claim] = claims(ddb).map((w) => w.input);
+    assert.equal(claim.ExpressionAttributeValues[':grn'], 'skill-r-g2');
+    assert.equal(claim.ExpressionAttributeValues[':mid'], `check#valkey-review#r#${NOW_ISO}`);
+    assert.ok(!/\bREMOVE\b/.test(claim.UpdateExpression));
   }
 });

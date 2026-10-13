@@ -188,18 +188,31 @@ export function decayedScore(score: number, elapsedSeconds: number, halfLifeSeco
  * The claim. Before the send, the pass SETs maintenance_id (unique per
  * claim), maintenance_requested_at (the time of the pass) and
  * maintenance_reason on the record. It never removes or changes any other
- * maintenance_* attribute, so the curator can keep its own markers there
- * across claims. While maintenance_requested_at is younger than
- * MAINTENANCE_RETRY_DAYS the record gets no new request, whatever else is
- * set or missing; once it is older, or absent, the pass may claim again.
+ * attribute, so the curator's own markers (maintenance_deprecating,
+ * retire_refused_at) stay across claims. While maintenance_requested_at
+ * is younger than MAINTENANCE_RETRY_DAYS the record gets no new request,
+ * whatever else is set or missing; once it is older, or absent, the pass
+ * may claim again, under the record's current graduated_record_name. It
+ * reads nothing else of a claim, so a claim the curator released is
+ * followed at the next pass and one it left behind once it has aged out.
  *
- * The curator acts only while the record's maintenance_id equals the
- * message's, and conditions each of its writes on that. On every terminal
- * outcome (checked, edited, obsolete, retired, dry run, refused, failed
- * for good) it REMOVEs maintenance_id, maintenance_requested_at and every
- * other maintenance_* attribute, so the next pass can act at once. An
- * outcome it wants retried later keeps the claim, and the request is
- * repeated once the claim has aged out.
+ * What the curator does with a claim:
+ * - It acts only while the record's maintenance_id equals the message's.
+ *   A write that changes the skill's state is also conditioned on
+ *   graduated_record_name = record_name.
+ * - On every terminal outcome (checked, edited, obsolete, retired, dry
+ *   run, refused, skipped, failed for good) it releases the claim: it
+ *   REMOVEs maintenance_id, maintenance_requested_at and
+ *   maintenance_reason, conditioned on maintenance_id alone, so a record
+ *   renamed since the send is released too. That is part of its last
+ *   state write, or a write of its own when there is none or that write
+ *   lost its condition.
+ * - It REMOVEs maintenance_deprecating only in the tombstone write, or
+ *   after it read the registry record in the same run as DRAFT,
+ *   PENDING_APPROVAL or APPROVED. A skip before any registry read keeps
+ *   the marker, so a deprecation an earlier run started is still seen as
+ *   the lifecycle's own.
+ * - An outcome it wants retried later keeps the claim, which ages out.
  *
  * SQS can deliver a message more than once, and two copies can run at
  * the same time. The curator's writes conditioned on maintenance_id make
