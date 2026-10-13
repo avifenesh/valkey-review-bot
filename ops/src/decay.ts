@@ -246,6 +246,18 @@ export interface RepoCheckMessage {
 
 export type MaintenanceMessage = CheckMessage | RetireMessage | RepoCheckMessage;
 
+/**
+ * A value read from a concerns table, for a log line. The curator model
+ * chooses area_bucket and can put any text in it, so every such value is
+ * JSON-quoted: it cannot break the line or pose as another field of the
+ * operator's report.
+ */
+const quoted = (value: string): string => JSON.stringify(value);
+
+/** A record's table and key, for a log line. */
+const recordRef = (tableName: string, key: { readonly area_bucket: string; readonly record_id: string }): string =>
+  `${tableName} bucket=${quoted(key.area_bucket)} id=${quoted(key.record_id)}`;
+
 /** The curator's limits on message fields; a record outside them is never queued. */
 const RECORD_NAME_RE = /^[a-z0-9][a-z0-9-]{0,99}$/;
 const MAX_MAINTENANCE_ID = 200;
@@ -261,7 +273,7 @@ function messageProblem(reviewerId: string, areaBucket: string, recordId: string
   if (!reviewerId || reviewerId.length > MAX_REVIEWER_ID) return 'reviewer id is empty or too long';
   if (!areaBucket || areaBucket.length > MAX_AREA_BUCKET) return 'area_bucket is empty or too long';
   if (!recordId || recordId.length > MAX_RECORD_ID) return 'record_id is empty or too long';
-  if (!RECORD_NAME_RE.test(name)) return `graduated_record_name "${name.slice(0, 120)}" is not a registry record name`;
+  if (!RECORD_NAME_RE.test(name)) return `graduated_record_name ${quoted(name.slice(0, 120))} is not a registry record name`;
   if (maintenanceId('retire', reviewerId, recordId, nowIso).length > MAX_MAINTENANCE_ID) return 'maintenance id would be too long';
   return null;
 }
@@ -451,7 +463,7 @@ export async function decayTable(
     const problem = messageProblem(ctx.reviewerId, r.key.area_bucket, r.key.record_id, name, nowIso);
     if (!problem) return true;
     errors += 1;
-    console.warn(`[decay] cannot queue maintenance for ${tableName} ${r.key.area_bucket} ${r.key.record_id}: ${problem}`);
+    console.warn(`[decay] cannot queue maintenance for ${recordRef(tableName, r.key)}: ${problem}`);
     return false;
   }
 
@@ -466,7 +478,7 @@ export async function decayTable(
         return false;
       }
       errors += 1;
-      console.warn(`[decay] ${what} failed for ${tableName} ${key.area_bucket} ${key.record_id}: ${errorText(err)}`);
+      console.warn(`[decay] ${what} failed for ${recordRef(tableName, key)}: ${errorText(err)}`);
       return false;
     }
   }
@@ -547,7 +559,7 @@ export async function decayTable(
       return true;
     } catch (err) {
       errors += 1;
-      console.warn(`[decay] send failed for ${tableName} ${key.area_bucket} ${key.record_id} maintenance=${message.maintenance_id}: ${errorText(err)}`);
+      console.warn(`[decay] send failed for ${recordRef(tableName, key)} maintenance=${quoted(message.maintenance_id)}: ${errorText(err)}`);
     }
     // Best effort: a claim left behind only delays the retry by MAINTENANCE_RETRY_DAYS.
     try {
@@ -561,7 +573,7 @@ export async function decayTable(
       }));
     } catch (err) {
       if (!isConditionFailure(err)) {
-        console.warn(`[decay] could not release maintenance=${message.maintenance_id}; it is retried after ${MAINTENANCE_RETRY_DAYS} days: ${errorText(err)}`);
+        console.warn(`[decay] could not release maintenance=${quoted(message.maintenance_id)}; it is retried after ${MAINTENANCE_RETRY_DAYS} days: ${errorText(err)}`);
       }
     }
     return false;
@@ -652,7 +664,7 @@ export async function decayTable(
   retirements.sort((a, b) => a.nextScore - b.nextScore || byKey(a, b));
   let retireClaims = 0;
   for (const r of retirements) {
-    const line = `${tableName} ${r.key.area_bucket}/${r.key.record_id} name=${r.name} score=${r.nextScore.toFixed(4)} reason=${r.retireReason}`;
+    const line = `${recordRef(tableName, r.key)} name=${quoted(r.name)} score=${r.nextScore.toFixed(4)} reason=${r.retireReason}`;
     if (!retireOn) {
       console.log(`[decay] would-retire ${line}`);
       wouldRetire += 1;
@@ -681,7 +693,7 @@ export async function decayTable(
     }, 0);
     if (sent) {
       retireRequested += 1;
-      console.log(`[decay] retire-requested ${line} maintenance=${id}`);
+      console.log(`[decay] retire-requested ${line} maintenance=${quoted(id)}`);
     }
   }
 
@@ -703,7 +715,7 @@ export async function decayTable(
       }, 0);
       if (sent) {
         checksRequested += 1;
-        console.log(`[decay] repo-check-requested ${tableName} release=${releaseTag} dry_run=${ctx.dryRun} maintenance=${id}`);
+        console.log(`[decay] repo-check-requested ${tableName} release=${releaseTag} dry_run=${ctx.dryRun} maintenance=${quoted(id)}`);
       }
     }
   }
@@ -733,7 +745,7 @@ export async function decayTable(
     }, delaySeconds);
     if (sent) {
       checksRequested += 1;
-      console.log(`[decay] check-requested ${tableName} ${c.key.area_bucket}/${c.key.record_id} name=${c.name} release=${releaseTag ?? 'unknown'} delay=${delaySeconds}s dry_run=${ctx.dryRun} maintenance=${id}`);
+      console.log(`[decay] check-requested ${recordRef(tableName, c.key)} name=${quoted(c.name)} release=${releaseTag ?? 'unknown'} delay=${delaySeconds}s dry_run=${ctx.dryRun} maintenance=${quoted(id)}`);
     }
   }
 

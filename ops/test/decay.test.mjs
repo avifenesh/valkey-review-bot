@@ -337,8 +337,8 @@ test('retirement off: candidates are logged as would-retire, given the score wri
   const lines = log.mock.calls.map((c) => c.arguments[0]).filter((l) => l.includes('would-retire'));
   assert.equal(lines.length, 4);
   // Lowest score first: the obsolete record has score 0.
-  assert.equal(lines[0], '[decay] would-retire concerns src/r2 name=skill-r2 score=0.0000 reason=obsolete');
-  assert.match(lines[1], /^\[decay\] would-retire concerns src\/r1 name=skill-r1 score=0\.\d{4} reason=decayed$/);
+  assert.equal(lines[0], '[decay] would-retire concerns bucket="src" id="r2" name="skill-r2" score=0.0000 reason=obsolete');
+  assert.match(lines[1], /^\[decay\] would-retire concerns bucket="src" id="r1" name="skill-r1" score=0\.\d{4} reason=decayed$/);
 });
 
 test('a retirement is claimed on the record, then sent', async (t) => {
@@ -404,7 +404,7 @@ test('retirements go lowest score first, within maxRetirementsPerDay, with reaso
   assert.equal(stats.deferred, 2);
   assert.equal(stats.decayed, 5, 'deferred candidates still get their score');
   const deferredLines = log.mock.calls.map((c) => c.arguments[0]).filter((l) => l.startsWith('[decay] deferred'));
-  assert.deepEqual(deferredLines.map((l) => l.split(' ')[3]), ['src/d900', 'src/d800']);
+  assert.deepEqual(deferredLines.map((l) => /\bid="([^"]*)"/.exec(l)?.[1]), ['d900', 'd800']);
 });
 
 test('each check-due rule queues a check, and a record checked at the current release is left alone', async (t) => {
@@ -579,6 +579,50 @@ test('a record the curator could not accept is never queued', async (t) => {
   assert.equal(stats.decayed, 3, 'each still gets its score write');
   assert.equal(warn.mock.calls.length, 3);
   for (const call of warn.mock.calls) assert.match(call.arguments[0], /^\[decay\] cannot queue maintenance for concerns /);
+});
+
+test('values read from the table are JSON-quoted in every report line', async (t) => {
+  const log = quietLogs(t);
+  const warn = t.mock.method(console, 'warn', () => {});
+  // area_bucket is chosen by the curator model; this one tries to end the
+  // line and forge a second report line.
+  const bucket = 'src"\n[decay] would-retire concerns bucket="x" id="y" name="z" score=0.0000 reason=obsolete';
+  const name = 'Not A Slug\n[decay] forged';
+  const boom = () => Object.assign(new Error('internal error'), { name: 'InternalServerError' });
+
+  // would-retire
+  await decayTable(table([faded('a', { area_bucket: bucket })]), 'concerns', { ...FULL, retireSkills: false }, NOW, maintenance().ctx);
+  // retire-requested, deferred, check-requested, and a record that cannot be queued
+  await decayTable(table([
+    faded('b', { area_bucket: bucket, updated_at: daysAgo(2000) }),
+    faded('c', { area_bucket: bucket }),
+    live('d', { area_bucket: bucket, verified_at: undefined }),
+    live('e', { area_bucket: bucket, verified_at: undefined, graduated_record_name: name }),
+  ]), 'concerns', { ...FULL, maxRetirementsPerDay: 1 }, NOW, maintenance().ctx);
+  // a failed write, and a failed send whose claim cannot be released
+  const ctx = { ...maintenance().ctx, sqs: fakeSqs([], () => { throw boom(); }) };
+  await decayTable(table([live('f', { area_bucket: bucket, verified_at: undefined, graduated_at: daysAgo(300) }), live('g', { area_bucket: bucket })], (_op, input) => {
+    if (input.Key.record_id === 'g' || input.UpdateExpression?.startsWith('REMOVE')) throw boom();
+    return {};
+  }), 'concerns', FULL, NOW, ctx);
+
+  const lines = [...log.mock.calls, ...warn.mock.calls].map((c) => c.arguments[0]);
+  for (const kind of ['would-retire', 'retire-requested', 'deferred', 'check-requested', 'cannot queue maintenance', 'write failed', 'send failed', 'could not release']) {
+    assert.ok(lines.some((l) => l.startsWith(`[decay] ${kind} `)), `a ${kind} line was logged`);
+  }
+  for (const line of lines) {
+    assert.ok(!line.includes('\n'), `one line: ${JSON.stringify(line)}`);
+    if (line.includes(' id=')) assert.ok(line.includes(` bucket=${JSON.stringify(bucket)} id="`), `bucket quoted: ${JSON.stringify(line)}`);
+  }
+  assert.ok(lines.some((l) => l.includes(`graduated_record_name ${JSON.stringify(name)} is not`)), 'the rejected name is quoted');
+  const report = lines.filter((l) => /^\[decay\] (would-retire|retire-requested|deferred|check-requested) /.test(l));
+  assert.equal(report.length, 4);
+  const head = ` bucket=${JSON.stringify(bucket)} id="`;
+  for (const l of report) {
+    assert.ok(l.includes(head), l);
+    assert.match(l.slice(l.indexOf(head) + head.length), /^[a-g]" name="skill-[a-g]" /, l);
+  }
+  for (const l of lines.filter((l) => l.includes('maintenance='))) assert.match(l, / maintenance="[^"\s]+"/);
 });
 
 test('the summary line names every counter', () => {
