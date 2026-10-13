@@ -14,6 +14,7 @@ import {
   curatorRequestSchema,
   handleMaintenance,
   isMaintenanceRequest,
+  maintenanceDoneLine,
   maintenanceRegistry,
   skillPublisher,
   type CuratorMessage,
@@ -128,7 +129,7 @@ async function* maintain(req: MaintenanceRequest) {
       },
       repoSkills,
     });
-    console.log(`[curator] maintenance ${result.status} reason=${req.reason} reviewer=${req.reviewer_id} decision=${result.decision} dry_run=${req.dry_run} maintenance=${JSON.stringify(req.maintenance_id)}`);
+    console.log(maintenanceDoneLine(req, result));
     yield {
       event: 'done',
       data: { status: result.status, maintenance_id: req.maintenance_id, reviewer_id: req.reviewer_id, reason: req.reason, decision: result.decision },

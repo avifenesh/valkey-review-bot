@@ -7,6 +7,7 @@ import {
   curatorRequestSchema,
   handleMaintenance,
   isMaintenanceRequest,
+  maintenanceDoneLine,
   maintenanceRegistry,
   REPO_SKILL_KEY,
   repoSkillPath,
@@ -171,6 +172,18 @@ test('maintenance messages outside the decay contract are rejected', () => {
     { ...checkMessage(), reason: 'delete' },
   ];
   for (const message of bad) assert.equal(curatorRequestSchema.safeParse(message).success, false, JSON.stringify(message));
+});
+
+test('the entrypoint\'s maintenance line quotes a decision that is a sentence', async () => {
+  const s = setup({ settings: { upstreamRepos: {} } });
+  const message = checkMessage({ maintenance_id: 'check#valkey-review#rec-1#x y\u200b' });
+  s.table.put({ ...s.table.item(KEY), maintenance_id: message.maintenance_id });
+  const { result } = await run(message, s.deps);
+  const line = maintenanceDoneLine(message, result);
+  assert.equal(line, '[curator] maintenance skipped reason=check reviewer=valkey-review decision="no upstream repository is configured for valkey-review" dry_run=false maintenance="check#valkey-review#rec-1#x y"');
+  // Every value parses as one key=value pair.
+  const pairs = [...line.slice('[curator] maintenance skipped '.length).matchAll(/(\w+)=("(?:[^"\\]|\\.)*"|\S+)/g)].map((m) => m[1]);
+  assert.deepEqual(pairs, ['reason', 'reviewer', 'decision', 'dry_run', 'maintenance']);
 });
 
 // --- Retire ---------------------------------------------------------------

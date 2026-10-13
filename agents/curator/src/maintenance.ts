@@ -297,6 +297,11 @@ function reportLine(kind: string, fields: Readonly<Record<string, string | numbe
   return `[maintenance] ${kind} ${parts.join(' ')}`;
 }
 
+/** The entrypoint's line at the end of a maintenance run. A decision can be a sentence, so it is quoted like the report lines' strings. */
+export function maintenanceDoneLine(req: MaintenanceRequest, result: MaintenanceResult): string {
+  return `[curator] maintenance ${result.status} reason=${req.reason} reviewer=${req.reviewer_id} decision=${quoted(result.decision)} dry_run=${req.dry_run} maintenance=${quoted(req.maintenance_id)}`;
+}
+
 function errorText(err: unknown): string {
   const name = (err as { name?: string } | null)?.name;
   const message = err instanceof Error ? err.message : String(err);
