@@ -235,8 +235,11 @@ export async function handleMention(
  */
 const THREAD_REPLY_DIRECTIVE = [
   'Answer the reply against the code at this location in the current PR head.',
-  'If it says the concern is fixed, verify the fix: confirm it, or say exactly what remains.',
-  'If it disputes the concern or explains why the code is correct, re-check your claim against the code: if the reply is right, say so and withdraw the finding; if not, show the evidence.',
+  'If it says the concern is fixed, verify the fix: confirm it and mark the finding resolved in `state`, or say exactly what remains.',
+  'If it disputes the concern or explains why the code is correct, re-check your claim against the code.',
+  'If the reply is right, say so and withdraw the finding: drop it from `state` and give the reason in `summary`.',
+  'Do not mark it resolved, which means fixed at the current head.',
+  'If the reply is not right, show the evidence that the problem is still there.',
   'If it asks a question, answer it from the code.',
   'Stay on this finding and what it directly affects. You are still the reviewer: never act as the author or apply changes.',
 ].join(' ');

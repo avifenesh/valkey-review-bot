@@ -479,7 +479,7 @@ export function renderPrOverview(ctx: PrContext): string {
   lines.push('');
   lines.push('## Your previous review state');
   if (ctx.previousState) {
-    lines.push('Your state comment from an earlier run, in full. Carry every finding forward into this run\'s `state`, marked resolved or still open at the current head.');
+    lines.push('Your state comment from an earlier run, in full. Carry every finding forward into this run\'s `state`, marked resolved if it is fixed at the current head or else still open. Drop one only if it is shown to be wrong, and give the reason in `summary`.');
     lines.push('');
     lines.push(ctx.previousState.body.replace(STATE_MARKER, '').trim());
   } else {

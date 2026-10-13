@@ -212,3 +212,9 @@ test('the previous state is shown without its marker', () => {
   assert.match(overview, /## Your previous review state\n.*\n\n### Review state\nOpen: one/);
   assert.ok(!overview.includes(STATE_MARKER));
 });
+
+test('the previous state is carried over by the same rule the reviewer prompts give', () => {
+  const overview = renderPrOverview({ ...baseCtx, previousState: { id: 5, body: 'Open: one' } });
+  // resolved means fixed at the head; a wrong finding is dropped instead.
+  assert.ok(overview.includes('Carry every finding forward into this run\'s `state`, marked resolved if it is fixed at the current head or else still open. Drop one only if it is shown to be wrong, and give the reason in `summary`.'));
+});

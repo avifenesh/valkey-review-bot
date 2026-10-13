@@ -45,10 +45,17 @@ test('the prompt covers each kind of reply in a review thread', () => {
   assert.match(bullet, /never act as the author, apply changes/);
   assert.match(bullet, /Do not rubber-stamp a fix/);
   assert.match(bullet, /When the fix holds, mark that finding resolved in `state`\./);
-  // A withdrawn finding follows the carry-over rule of the review state.
-  assert.match(bullet, /withdraw the finding: drop it from `state` and say why in `summary`\./);
-  assert.match(prompt, /Drop an earlier finding only if it turns out to be wrong, and say so in `summary`\./);
   assert.ok(!prompt.includes('Fix-verification re-review'));
+});
+
+test('a wrong finding is dropped, not resolved, by one rule in the prompt and the overview', () => {
+  const prompt = readFileSync(new URL('../config/prompt.md', import.meta.url), 'utf8');
+  const disputed = prompt.split('\n').find((l) => l.startsWith('  - **Finding disputed.**'));
+  assert.ok(disputed?.includes('withdraw the finding: drop it from `state` and give the reason in `summary`. Do not mark it resolved, which means fixed at the current head.'));
+  const carryOver = prompt.split('\n').find((l) => l.startsWith('- **Carry over.**'));
+  assert.ok(carryOver?.includes('Mark one resolved only when it is fixed at the current head, after checking it there. Drop an earlier finding only if it is shown to be wrong, and give the reason in `summary`.'));
+  // The overview restates the carry-over rule next to the previous state.
+  assert.ok(renderPrOverview(ctx).includes('marked resolved if it is fixed at the current head or else still open. Drop one only if it is shown to be wrong, and give the reason in `summary`.'));
 });
 
 test('the prompt keeps suppressed skill pieces for older release lines only', () => {

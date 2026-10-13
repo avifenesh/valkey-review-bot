@@ -356,8 +356,12 @@ test('the thread-reply instruction covers fix claims, disputes and questions', a
     await handleMention(m, target, deps);
     const { instruction } = enqueued[0];
     assert.ok(instruction.includes(`\n@maintainer replied: ${reply}\n`), reply);
-    assert.match(instruction, /If it says the concern is fixed, verify the fix: confirm it, or say exactly what remains\./);
-    assert.match(instruction, /If it disputes the concern or explains why the code is correct, re-check your claim against the code: if the reply is right, say so and withdraw the finding; if not, show the evidence\./);
+    assert.ok(instruction.includes('If it says the concern is fixed, verify the fix: confirm it and mark the finding resolved in `state`, or say exactly what remains.'));
+    assert.ok(instruction.includes('If it disputes the concern or explains why the code is correct, re-check your claim against the code.'));
+    // A wrong finding is dropped, the way the review state's carry-over
+    // rule drops one; resolved means fixed at the head.
+    assert.ok(instruction.includes('If the reply is right, say so and withdraw the finding: drop it from `state` and give the reason in `summary`. Do not mark it resolved, which means fixed at the current head.'));
+    assert.ok(instruction.includes('If the reply is not right, show the evidence that the problem is still there.'));
     assert.match(instruction, /If it asks a question, answer it from the code\./);
     assert.match(instruction, /never act as the author or apply changes\.$/);
   }
