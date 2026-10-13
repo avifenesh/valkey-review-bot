@@ -127,3 +127,19 @@ test('the curator gets get_skill, and the prompt\'s tool tables name exactly the
   const listed = [...tables.matchAll(/^\| `([a-z_]+)\(/gm)].map((m) => m[1]);
   assert.deepEqual([...listed].sort(), [...names].sort());
 });
+
+test('get_skill shows the replaced skill when a claimed generation never reached the registry', async () => {
+  const reads = [];
+  const { tool } = setup({
+    item: { ...graduated, graduated_record_name: 'replication-handshake-1a2b3c4d', previous_record_name: 'replication-handshake', retired_at: 'x' },
+    get: async (name) => {
+      reads.push(name);
+      return name === 'replication-handshake' ? { name, status: 'DEPRECATED', description: 'd', skillMd: SKILL_MD } : null;
+    },
+  });
+  const out = parse(await tool.invoke({ area_bucket: 'src', record_id: 'r1' }));
+  assert.equal(out.ok, true);
+  assert.equal(out.record_name, 'replication-handshake');
+  assert.equal(out.skill_md, SKILL_MD);
+  assert.deepEqual(reads, ['replication-handshake-1a2b3c4d', 'replication-handshake']);
+});
