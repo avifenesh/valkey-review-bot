@@ -27,7 +27,8 @@ import { isRepoName, latestReleaseTag, RELEASE_TAG_RE } from './releases.js';
  * - "retire" when its score falls below the floor. With RETIRE_SKILLS
  *   off, without a queue, or in a dry run, it only logs would-retire.
  *   Once the curator has refused a retirement (retire_refused_at), the
- *   record is left out for RETIRE_REFUSED_BACKOFF_SECONDS.
+ *   record is left out of retirement for RETIRE_REFUSED_BACKOFF_SECONDS,
+ *   and can get checks meanwhile.
  * - "check" when a fact check is due: the record was never checked, it
  *   was re-published since its last check, the highest GA release of
  *   the reviewer's upstream differs from the one it was checked at, or
@@ -293,9 +294,10 @@ export interface CheckMessage {
  * For RETIRE_REFUSED_BACKOFF_SECONDS (30 days by default) after
  * retire_refused_at the pass requests no retirement of the record, so a
  * skill the registry will not deprecate does not take a slot of
- * MAX_RETIREMENTS_PER_DAY every day. The pass only reads the age of the
- * attribute: the curator may leave it, or REMOVE it in a tombstone write
- * or when submit_skill publishes the skill again.
+ * MAX_RETIREMENTS_PER_DAY every day. Reviewers still load the skill, so
+ * it gets checks as a record above the floor does. The pass only reads
+ * the age of the attribute: the curator may leave it, or REMOVE it in a
+ * tombstone write or when submit_skill publishes the skill again.
  */
 export interface RetireMessage {
   /** "retire#<reviewer_id>#<record_id>#<ISO time of the pass>", at most 200 characters. */
@@ -784,20 +786,26 @@ export async function decayTable(
       // are written after the scan, once they are ranked against the caps.
       const requestedMs = Date.parse(stringOrEmpty(item.maintenance_requested_at));
       const inFlight = Number.isFinite(requestedMs) && nowMs - requestedMs < MAINTENANCE_RETRY_DAYS * DAY_SECONDS * 1000;
+      let checkable = !inFlight;
       if (!inFlight && nextScore < config.floor) {
         // A refused retirement is not requested again for a while, so it
-        // does not take a slot from the other candidates every day.
+        // does not take a slot from the other candidates every day. The
+        // skill stays live meanwhile, so it can still be checked.
         const refusedAt = stringOrEmpty(item.retire_refused_at);
         const leftMs = Date.parse(refusedAt) + config.retireRefusedBackoffSeconds * 1000 - nowMs;
         if (leftMs > 0) {
           retireBackoff += 1;
           console.log(`[decay] retire-backoff ${recordRef(tableName, key)} name=${quoted(name)} score=${nextScore.toFixed(4)}`
             + ` refused_at=${quoted(refusedAt)} retry_in=${Math.ceil(leftMs / (DAY_SECONDS * 1000))}d`);
-        } else if (!retireOn || queueable(record, name)) {
-          retirements.push({ ...record, name, retireReason: stringOrEmpty(item.obsolete_release) ? 'obsolete' : 'decayed' });
-          continue;
+        } else {
+          checkable = false;
+          if (!retireOn || queueable(record, name)) {
+            retirements.push({ ...record, name, retireReason: stringOrEmpty(item.obsolete_release) ? 'obsolete' : 'decayed' });
+            continue;
+          }
         }
-      } else if (!inFlight && checksOn) {
+      }
+      if (checkable && checksOn) {
         const due = checkDue(item, releaseTag, config, ctx.recheckAll, nowMs);
         if (due && queueable(record, name)) {
           checks.push({ ...record, name, ...due });

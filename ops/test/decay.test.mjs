@@ -459,6 +459,27 @@ test('a retirement the curator refused is not requested again for the back-off p
   assert.equal(reportStats.retireBackoff, 1);
 });
 
+test('a record in retire back-off is still checked when a check is due', async (t) => {
+  const log = quietLogs(t);
+  const { ctx } = maintenance();
+  // The curator kept the marker, as it does after CREATE_FAILED or UPDATE_FAILED.
+  const refused = { retire_refused_at: daysAgo(1), maintenance_deprecating: 'skill-due' };
+  const ddb = table([
+    faded('due', { ...refused, verified_at: undefined }),
+    faded('checked', { ...refused, graduated_record_name: 'skill-checked' }),
+  ]);
+  const stats = await decayTable(ddb, 'concerns', FULL, NOW, ctx);
+  assert.deepEqual(bodies(ctx.sqs).map((b) => [b.record_id, b.reason]), [['due', 'check']]);
+  assert.equal(stats.retireBackoff, 2);
+  assert.equal(stats.checksRequested, 1);
+  assert.equal(stats.retireRequested, 0);
+  assert.equal(stats.decayed, 2, 'the check claim stores the score; the other gets the plain write');
+  assert.equal(log.mock.calls.filter((c) => c.arguments[0].startsWith('[decay] retire-backoff ')).length, 2);
+  const [claim] = claims(ddb).map((w) => w.input);
+  assert.equal(claim.ExpressionAttributeValues[':mr'], 'check');
+  assert.ok(!/\bREMOVE\b/.test(claim.UpdateExpression), 'the curator\'s marker and retire_refused_at stay');
+});
+
 test('a refusal does not stop the checks of a record above the floor', async (t) => {
   quietLogs(t);
   const { ctx } = maintenance();
