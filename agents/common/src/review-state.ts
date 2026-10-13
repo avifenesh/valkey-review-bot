@@ -31,15 +31,15 @@ export const reviewStateSchema = z.object({
   status: z.enum(['needs_work', 'ready_for_human_review']).describe(
     '"ready_for_human_review" only when you would approve this PR as it stands: no open blocking finding and no open direction concern. Otherwise "needs_work".',
   ),
-  summary: z.string().min(1).describe('One or two short, plain sentences on where the PR stands now.'),
+  summary: z.string().min(1).describe('One or two short, plain sentences on where the PR stands now. If you dropped an earlier finding as wrong, say why here.'),
   risk: z.enum(['low', 'medium', 'high']).describe('Risk of merging the PR as it stands at this head.'),
   risk_reason: z.string().min(1).describe('One short sentence: what breaks, and for whom, if this change is wrong.'),
   findings: z.array(z.object({
     location: z.string().describe('`path:line`, or "" for a PR-wide finding.'),
     summary: z.string().min(1).describe('The finding in one short sentence.'),
     blocking: z.boolean().describe('true if this must be fixed before merge.'),
-    resolved: z.boolean().describe('true if fixed at the current head (carry-over findings from the previous state).'),
-  })).default([]).describe('Every finding from this run plus every finding carried over from the previous state comment, each marked open or resolved.'),
+    resolved: z.boolean().describe('true only if the finding is fixed at the current head, checked there. A finding shown to be wrong is not resolved: drop it from the list.'),
+  })).default([]).describe('Every finding from this run plus every finding from the previous state comment, each marked open or resolved. Drop an earlier finding only if it is shown to be wrong: leave it out rather than mark it resolved, and give the reason in the top-level `summary`.'),
   backport: z.object({
     verdict: z.enum(['needed', 'not_needed', 'unclear']),
     branches: z.array(z.string()).default([]).describe('Release branches that need the backport, named as in the PR overview\'s release-line list, e.g. ["8.1", "9.0"]. Empty unless verdict is "needed".'),

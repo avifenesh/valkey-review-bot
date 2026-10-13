@@ -1,5 +1,6 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
+import { z } from 'zod';
 import './support/ts-resolve.mjs';
 
 const { createStateCommentWriter, renderReviewState, reviewStateSchema, STATE_MARKER, stripStateMarker, validateReviewState } = await import('../src/review-state.ts');
@@ -38,6 +39,17 @@ test('a needed backport names maintained release lines', () => {
   assert.match(validateReviewState(needed(['8.1']), []), /none was found/);
   // Unknown release lines (the fetch failed): any branch name is taken as given.
   assert.equal(validateReviewState(needed(['7.2']), null), null);
+});
+
+test('the schema the model sees drops a wrong finding instead of carrying it over', () => {
+  const { properties } = z.toJSONSchema(reviewStateSchema);
+  const findings = properties.findings.description;
+  assert.doesNotMatch(findings, /carried over/);
+  assert.ok(findings.includes('Drop an earlier finding only if it is shown to be wrong: leave it out rather than mark it resolved, and give the reason in the top-level `summary`.'));
+  const resolved = properties.findings.items.properties.resolved.description;
+  assert.ok(resolved.startsWith('true only if the finding is fixed at the current head'));
+  assert.ok(resolved.includes('A finding shown to be wrong is not resolved: drop it from the list.'));
+  assert.ok(properties.summary.description.endsWith('If you dropped an earlier finding as wrong, say why here.'));
 });
 
 test('the rendered comment starts with the marker and lists open and resolved findings', () => {
