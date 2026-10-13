@@ -1,0 +1,402 @@
+import { z } from 'zod';
+import { BedrockAgentCoreApp } from 'bedrock-agentcore/runtime';
+import { Agent, AfterToolCallEvent, BeforeModelCallEvent, type AgentStreamEvent, type Model, type Tool } from '@strands-agents/sdk';
+import type { Octokit } from '@octokit/rest';
+
+import { loadEnv, loadAssets, type AgentEnv } from './config.js';
+import { createOctokit, createTokenSource, type TokenSource } from './github-auth.js';
+import { createHeartbeat } from './heartbeat.js';
+import { prepareWorkspace, renderPrOverview, type PrContext } from './workspace.js';
+import { loadGraduatedSkills, renderGraduatedSkills } from './graduated-skills.js';
+import { createStatusComment, type StatusComment } from './status-comment.js';
+import { ModelCallLimit, ReviewConversationManager, StreamStallRetryStrategy, textDelta } from './agent-loop.js';
+import { createConverseModel, createMantleModel, isMantleModel } from './models.js';
+import { isTerminalCallbackWired, type TerminalToolName } from './tools/gh.js';
+
+/**
+ * Shared bedrock-agentcore entrypoint + Strands loop.
+ *
+ * Per-agent code only needs to:
+ *   - implement `assembleTools(baseOpts)`, which returns the Strands tool
+ *     array (common harness/git/gh tools + agent-specific build tools)
+ *   - call `bootstrap({ assembleTools })` from its agent.ts
+ *
+ * Prompt and skill loading, workspace preparation, the model loop,
+ * terminal-tool tracking, SSE frames, and failure cleanup all live here.
+ * createReviewHandler is the per-invocation part on its own, with the
+ * AWS and GitHub clients injectable for tests.
+ */
+
+export interface AssembleBaseOpts {
+  readonly ctx: PrContext;
+  readonly octokit: Octokit;
+  readonly tokens: TokenSource;
+  readonly allowWrite: boolean;
+  readonly env: AgentEnv;
+  /** Present on mention-triggered runs; terminal tools edit it instead of posting a separate summary. */
+  readonly statusComment?: StatusComment;
+  /**
+   * Pass this to assembleCommonTools. post_review and skip_review call it
+   * when they succeed, and that is how the run knows the review is done.
+   */
+  readonly onTerminal?: (tool: TerminalToolName, result: string) => void;
+}
+
+export type AssembleTools = (opts: AssembleBaseOpts) => Promise<readonly unknown[]>;
+
+export interface RunAgentConfig {
+  readonly assembleTools: AssembleTools;
+}
+
+const requestSchema = z.object({
+  repo: z.string(),
+  pr_number: z.number().int().positive(),
+  installation_id: z.number().int().positive(),
+  head_sha: z.string().optional(),
+  use_fallback_model: z.boolean().optional(),
+  // Mention-trigger fields (receiver's mention path). instruction is
+  // already safety-approved; status_comment_id is the ack comment the
+  // runtime edits through the run.
+  instruction: z.string().optional(),
+  instruction_actor: z.string().optional(),
+  status_comment_id: z.number().int().positive().optional(),
+  run_nonce: z.string().optional(),
+  trigger_path: z.string().optional(),
+  trigger_line: z.number().int().positive().optional(),
+});
+
+export type Payload = z.infer<typeof requestSchema>;
+
+/** One SSE frame the handler yields to bedrock-agentcore. */
+export interface RunEvent {
+  readonly event: string;
+  readonly data: unknown;
+}
+
+/** The parts of a run that reach AWS or GitHub. Tests replace them. */
+export interface RunDeps {
+  readonly createModel: (env: AgentEnv, modelId: string) => Model;
+  readonly createHeartbeat: typeof createHeartbeat;
+  readonly createTokenSource: typeof createTokenSource;
+  readonly createOctokit: typeof createOctokit;
+  readonly prepareWorkspace: typeof prepareWorkspace;
+  readonly loadGraduatedSkills: typeof loadGraduatedSkills;
+  readonly createStatusComment: typeof createStatusComment;
+}
+
+function createModel(env: AgentEnv, modelId: string): Model {
+  return isMantleModel(modelId)
+    ? createMantleModel({ modelId, maxTokens: env.maxTokens, mantleRegion: env.mantleRegion, effort: env.reasoningEffort })
+    : createConverseModel({ modelId, maxTokens: env.maxTokens, region: env.region, effort: env.reasoningEffort });
+}
+
+const DEFAULT_DEPS: RunDeps = {
+  createModel,
+  createHeartbeat,
+  createTokenSource,
+  createOctokit,
+  prepareWorkspace,
+  loadGraduatedSkills,
+  createStatusComment,
+};
+
+export interface ReviewHandlerOpts {
+  readonly env: AgentEnv;
+  /** Reviewer prompt plus the baked-in skill; graduated skills are appended per run. */
+  readonly systemPrompt: string;
+  readonly assembleTools: AssembleTools;
+  readonly deps?: Partial<RunDeps>;
+}
+
+/**
+ * Model calls the follow-up prompt always gets, even past MAX_ITERATIONS:
+ * one to call the terminal tool, one after its result, one spare for a
+ * call the tool rejected.
+ */
+const TERMINAL_RETRY_CALLS = 3;
+
+const TERMINAL_RETRY_MESSAGE = [
+  'Your previous response ended without calling a terminal review tool, so the review is incomplete.',
+  'Do not continue in free text. If you found one or more evidence-backed findings, call `post_review` now.',
+  'If no finding meets the evidence bar, call `skip_review` now with a one-sentence reason.',
+  'You must call exactly one of `post_review` or `skip_review`.',
+].join('\n');
+
+function isTool(value: unknown): value is Tool {
+  const t = value as Partial<Tool> | null;
+  return typeof t === 'object' && t !== null
+    && typeof t.name === 'string' && typeof t.toolSpec === 'object' && typeof t.stream === 'function';
+}
+
+function toToolList(tools: readonly unknown[]): Tool[] {
+  return tools.map((t, i) => {
+    if (!isTool(t)) throw new Error(`assembleTools returned a value that is not a Strands tool at index ${i}`);
+    return t;
+  });
+}
+
+function mentionBlock(payload: Payload): string[] {
+  const lines = [
+    '',
+    '---',
+    '',
+    `## Review request from @${payload.instruction_actor ?? 'a maintainer'}`,
+    '',
+    'This review was requested by a maintainer tagging you on the PR. Their instruction below is the MAIN directive of this review: prioritize it over the default review flow, while still applying your evidence bar.',
+  ];
+  if (payload.trigger_path) {
+    lines.push(`The request was made inline on \`${payload.trigger_path}\`${payload.trigger_line ? ` line ${payload.trigger_line}` : ''}; weight that area accordingly.`);
+  }
+  lines.push(
+    '',
+    payload.instruction?.trim()
+      ? `### Instruction\n\n${payload.instruction.trim()}`
+      : '### Instruction\n\n(No specific instruction was given. Perform your standard full review.)',
+    '',
+    'The PR conversation may hold context for this request; use `gh_api_read` on the PR comments/reviews endpoints to read it.',
+  );
+  return lines;
+}
+
+/**
+ * The invocation handler: one review per payload, streamed as SSE frames.
+ * bedrock-agentcore stops reading, and closes this generator at its next
+ * yield, when the client disconnects.
+ */
+export function createReviewHandler(opts: ReviewHandlerOpts): (payload: Payload) => AsyncGenerator<RunEvent, void, unknown> {
+  const { env, assembleTools } = opts;
+  const deps: RunDeps = { ...DEFAULT_DEPS, ...opts.deps };
+
+  return async function* (payload: Payload) {
+    const useFallback = payload.use_fallback_model === true;
+    const modelId = useFallback ? env.fallbackModelId : env.modelId;
+    const model = deps.createModel(env, modelId);
+    console.log(`[invoke] model=${modelId}${useFallback ? ' (fallback)' : ''}${isMantleModel(modelId) ? ' (mantle)' : ''}`);
+
+    // Liveness ledger: the SQS worker reads this on redelivery to tell
+    // "slow but alive" from "dead". It is written before workspace prep,
+    // which beats only once at the start, so prep must finish well inside
+    // the watchdog's staleness window. Mention runs append a
+    // nonce: the same head SHA may already carry a completed record
+    // from the PR-opened review, which would make the watchdog ack a
+    // fresh summons as already done.
+    const runKey = `${payload.repo}#${payload.pr_number}#${payload.head_sha ?? 'unknown'}${payload.run_nonce ? `#${payload.run_nonce}` : ''}`;
+    const heartbeat = deps.createHeartbeat({
+      tableName: env.heartbeatTable,
+      region: env.region,
+      runKey,
+      modelId,
+    });
+    heartbeat.beat();
+
+    // Set by post_review / skip_review through onTerminal, only when they succeed.
+    const terminal: { tool: TerminalToolName | null; result: string } = { tool: null, result: '' };
+    const onTerminal = (tool: TerminalToolName, result: string): void => {
+      terminal.tool = tool;
+      terminal.result = result;
+      console.log(`[stream] terminal tool ${tool} succeeded`);
+      // The review is on GitHub now, so the run is complete whatever
+      // happens next. Recording that right away covers exits that never
+      // reach the end of this generator, such as the runtime being
+      // stopped; a record left on "running" or set to "failed" would
+      // make the invoker review the PR again.
+      void heartbeat.finish('completed');
+    };
+
+    let statusComment: StatusComment | undefined;
+    // Everything below runs under this try, so a failure, or the
+    // caller closing the stream early, still stops the status comment
+    // timer and records how the run ended.
+    try {
+      yield { event: 'status', data: { phase: 'auth', model: modelId } };
+      const tokens = deps.createTokenSource({
+        brokerFunction: env.tokenBrokerFunction,
+        region: env.region,
+        installationId: payload.installation_id,
+        repo: payload.repo,
+      });
+      await tokens.get(); // fail fast if the broker refuses this repo
+      const octokit = deps.createOctokit(tokens);
+
+      // Mention-triggered run: take over the receiver's ack comment.
+      // The opener (or fallback notice) goes up before the slow
+      // workspace phase so the requester sees life immediately.
+      if (payload.status_comment_id !== undefined) {
+        const [owner = '', repo = ''] = payload.repo.split('/');
+        statusComment = deps.createStatusComment({
+          octokit,
+          owner,
+          repo,
+          commentId: payload.status_comment_id,
+          region: env.region,
+          summarizerModelId: env.summarizerModelId,
+          summarizerFallbackModelId: env.summarizerFallbackModelId,
+          mantleRegion: env.mantleRegion,
+          reasoningEffort: env.reasoningEffort,
+          isFallback: useFallback,
+        });
+        await statusComment.open();
+      }
+
+      yield { event: 'status', data: { phase: 'workspace' } };
+      const ctx = await deps.prepareWorkspace(payload, octokit, tokens, {
+        workspaceRoot: env.workspaceRoot,
+        appId: Number(env.githubAppId),
+        upstreamRepo: env.upstreamRepo,
+      });
+
+      // Graduated skills: patterns that crossed the reinforcement
+      // threshold and were published by the curator. They go into the
+      // system prompt next to the baked-in skill. Concerns below the
+      // threshold stay with the curator and never reach the reviewer.
+      let systemPrompt = opts.systemPrompt;
+      if (env.skillsRegistryId) {
+        yield { event: 'status', data: { phase: 'graduated_skills' } };
+        const grads = await deps.loadGraduatedSkills({
+          registryId: env.skillsRegistryId,
+          region: env.region,
+        });
+        if (grads.length > 0) systemPrompt = `${opts.systemPrompt}\n\n${renderGraduatedSkills(grads)}`;
+        yield { event: 'status', data: { phase: 'graduated_skills_loaded', count: grads.length } };
+      }
+
+      yield { event: 'status', data: { phase: 'tools' } };
+      const tools = await assembleTools({
+        ctx,
+        octokit,
+        tokens,
+        allowWrite: env.allowWrite,
+        env,
+        statusComment,
+        onTerminal,
+      });
+      if (!isTerminalCallbackWired(onTerminal)) {
+        throw new Error('assembleTools did not pass onTerminal to assembleCommonTools, so the run could not tell when the review is done');
+      }
+
+      yield { event: 'status', data: { phase: 'review', pr: `${ctx.owner}/${ctx.repo}#${ctx.prNumber}` } };
+      const callLimit = new ModelCallLimit(env.maxIterations);
+      const agent = new Agent({
+        model,
+        systemPrompt,
+        tools: toToolList(tools),
+        retryStrategy: new StreamStallRetryStrategy(() => terminal.tool !== null),
+        conversationManager: new ReviewConversationManager(env.maxIterations + TERMINAL_RETRY_CALLS),
+      });
+      callLimit.attach(agent);
+      // Beat on agent activity, not only on relayed frames. If the SSE
+      // consumer closes the stream, Strands drains the rest of the loop
+      // without relaying events; the run must not look dead to the
+      // watchdog while it is still working toward a terminal tool.
+      agent.addHook(BeforeModelCallEvent, () => heartbeat.beat());
+      agent.addHook(AfterToolCallEvent, () => heartbeat.beat());
+
+      const userMessage = [
+        renderPrOverview(ctx),
+        ...(payload.status_comment_id !== undefined ? mentionBlock(payload) : []),
+        '',
+        '---',
+        '',
+        'The workspace is checked out at the PR head. Start from Phase 1 of the reviewer system prompt. When you have completed your review, call either `post_review` (with findings) or `skip_review` (with reason). Do not return text to the user; communicate only through tool calls.',
+      ].join('\n');
+
+      // Text of the latest model call, for the run summary.
+      let finalText = '';
+      const handleAgentEvent = (event: AgentStreamEvent): RunEvent | null => {
+        heartbeat.beat();
+        if (event.type === 'beforeModelCallEvent') {
+          finalText = '';
+          return null;
+        }
+        const text = textDelta(event);
+        if (text !== null) {
+          finalText += text;
+          return { event: 'message', data: { text } };
+        }
+        if (event.type === 'beforeToolCallEvent') {
+          const { name, input } = event.toolUse;
+          let inputHint = '';
+          try { inputHint = JSON.stringify(input ?? {}).slice(0, 200); } catch { /* unserializable input */ }
+          // Tool inputs in the runtime log show where a review spent
+          // its effort, e.g. how many git calls went to the backport check.
+          console.log(`[tool] ${name} ${inputHint}`);
+          statusComment?.note(`${name} ${inputHint}`);
+          return { event: 'tool_use', data: { name } };
+        }
+        return null;
+      };
+
+      try {
+        for await (const event of agent.stream(userMessage)) {
+          const outgoing = handleAgentEvent(event);
+          if (outgoing) yield outgoing;
+        }
+        if (terminal.tool === null) {
+          if (callLimit.reached) console.warn(`[stream] model call limit (${env.maxIterations}) reached without a terminal tool`);
+          callLimit.reserve(TERMINAL_RETRY_CALLS);
+          yield { event: 'status', data: { phase: 'terminal_retry' } };
+          for await (const event of agent.stream(TERMINAL_RETRY_MESSAGE)) {
+            const outgoing = handleAgentEvent(event);
+            if (outgoing) yield outgoing;
+          }
+        }
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : String(err);
+        if (terminal.tool === null) {
+          console.error(`[stream] unhandled error before a terminal tool: ${msg}`);
+          throw err;
+        }
+        // The terminal tool has done its work, so the review is
+        // complete. Failing the run now would make the invoker
+        // redeliver it and post a second review. The usual case is a
+        // model that ends its stream without a closing message right
+        // after the terminal call.
+        console.warn(`[stream] error after terminal tool ${terminal.tool}; treating the run as completed: ${msg}`);
+      }
+
+      if (terminal.tool === null) {
+        throw new Error(`review completed without terminal tool; model_calls=${callLimit.used} final_text_preview=${finalText.slice(0, 400)}`);
+      }
+
+      // onTerminal started this write; wait for it before reporting done.
+      await heartbeat.finish('completed');
+
+      yield {
+        event: 'done',
+        data: {
+          status: 'completed',
+          repo: payload.repo,
+          pr_number: payload.pr_number,
+          head_sha: ctx.headSha,
+          terminal_tool: terminal.tool,
+          terminal_result: terminal.result.slice(0, 600),
+          model_calls: callLimit.used,
+          final_text_preview: finalText.slice(0, 400),
+        },
+      };
+    } finally {
+      statusComment?.stop();
+      // A no-op once the outcome is recorded. Any other exit, including
+      // an early close, is recorded as completed if a terminal tool
+      // succeeded and as failed if not.
+      await heartbeat.finish(terminal.tool !== null ? 'completed' : 'failed');
+    }
+  };
+}
+
+export async function bootstrap(config: RunAgentConfig): Promise<void> {
+  const env = loadEnv();
+  const { prompt: PROMPT_MD, skill: SKILL_MD } = await loadAssets(env);
+  const systemPrompt = `${PROMPT_MD}\n\n---\n\n## Skill: institutional memory\n\n${SKILL_MD}`;
+
+  console.log(`[boot] model=${env.modelId} fallback=${env.fallbackModelId} region=${env.region} bucket=${env.assetsBucket}`);
+
+  const app = new BedrockAgentCoreApp({
+    invocationHandler: {
+      requestSchema,
+      process: createReviewHandler({ env, systemPrompt, assembleTools: config.assembleTools }),
+    },
+  });
+
+  app.run();
+}

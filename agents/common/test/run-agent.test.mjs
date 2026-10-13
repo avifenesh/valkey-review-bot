@@ -1,0 +1,219 @@
+import assert from 'node:assert/strict';
+import test from 'node:test';
+import { z } from 'zod';
+import { tool } from '@strands-agents/sdk';
+import { DynamoDBDocumentClient } from '@aws-sdk/lib-dynamodb';
+import './support/ts-resolve.mjs';
+import { failingTurn, ScriptedModel, textOf, textTurn, toolTurn } from './support/scripted-model.mjs';
+
+const { createReviewHandler } = await import('../src/run-agent.ts');
+const { loadEnv } = await import('../src/config.ts');
+const { buildPostReviewTool, buildSkipTool, createTerminalGate } = await import('../src/tools/gh.ts');
+
+const env = loadEnv({
+  BEDROCK_MODEL_ID: 'primary-model',
+  FALLBACK_MODEL_ID: 'openai.fallback-model',
+  AWS_REGION: 'us-west-2',
+  MANTLE_REGION: 'us-east-1',
+  SUMMARIZER_MODEL_ID: 'summary-model',
+  SUMMARIZER_FALLBACK_MODEL_ID: 'openai.summary-fallback',
+  ASSETS_BUCKET: 'assets',
+  PROMPT_S3_KEY: 'prompt.md',
+  SKILL_S3_KEY: 'skill.md',
+  GITHUB_APP_ID: '123456',
+  TOKEN_BROKER_FUNCTION: 'token-broker',
+  WORKSPACE_ROOT: '/workspace/valkey',
+  HEARTBEAT_TABLE: 'heartbeats',
+});
+
+const ctx = {
+  owner: 'valkey-io', repo: 'valkey', prNumber: 7,
+  headSha: 'h'.repeat(40), baseSha: 'b'.repeat(40), mergeBaseSha: 'm'.repeat(40),
+  headRef: 'fix-leak', baseRef: 'unstable', author: 'contributor',
+  title: 'Fix leak', body: 'Frees the buffer.', state: 'open',
+  additions: 3, deletions: 1, changedFiles: 1, fileList: ['src/server.c'],
+  existingReviews: [], existingReviewComments: [], existingIssueComments: [],
+  previousState: null, upstreamRepo: 'valkey-io/valkey',
+  releaseLines: [{ branch: '9.0', lastCommit: '2026-09-21' }],
+  workspacePath: '/workspace/valkey', diffRefSpec: `${'m'.repeat(40)}..${'h'.repeat(40)}`,
+};
+
+const payload = { repo: 'valkey-io/valkey', pr_number: 7, installation_id: 1, head_sha: ctx.headSha };
+
+const reviewState = {
+  status: 'ready_for_human_review',
+  summary: 'Nothing open.',
+  risk: 'low',
+  risk_reason: 'Only the error path changes.',
+  findings: [],
+  backport: { verdict: 'not_needed', branches: [], reason: 'New code.' },
+  direction: '',
+};
+
+const skipTurn = toolTurn('skip_review', { reason: 'Nothing new met the bar.', state: reviewState });
+const noopTurn = toolTurn('noop', {});
+const noop = tool({ name: 'noop', description: 'does nothing', inputSchema: z.object({}), callback: () => 'ok' });
+
+/** Heartbeat statuses written to DynamoDB, in order. */
+function recordHeartbeats(t) {
+  const written = [];
+  t.mock.method(DynamoDBDocumentClient.prototype, 'send', async (command) => {
+    written.push(command.input.ExpressionAttributeValues[':status']);
+    return {};
+  });
+  return written;
+}
+
+function reviewRun(turns) {
+  const model = new ScriptedModel(turns);
+  const stateBodies = [];
+  const handler = createReviewHandler({
+    env,
+    systemPrompt: 'You review pull requests.',
+    assembleTools: async ({ ctx: prCtx, octokit, tokens, statusComment, onTerminal }) => {
+      const deps = {
+        ctx: prCtx, octokit, tokens, statusComment,
+        stateWriter: { write: async (body) => { stateBodies.push(body); return { id: 1, url: 'https://github.com/state' }; } },
+        terminalGate: createTerminalGate(onTerminal),
+      };
+      return [noop, buildPostReviewTool(deps), buildSkipTool(deps)];
+    },
+    deps: {
+      createModel: () => model,
+      createTokenSource: () => ({ get: async () => 'token' }),
+      createOctokit: () => ({}),
+      prepareWorkspace: async () => ctx,
+      loadGraduatedSkills: async () => [],
+      createStatusComment: () => { throw new Error('only mention runs have a status comment'); },
+    },
+  });
+  return { model, stateBodies, run: () => handler(payload) };
+}
+
+/** Read the handler's frames until `stop` returns true, then close it the way bedrock-agentcore does. */
+async function consume(frames, stop = () => false) {
+  const seen = [];
+  for await (const frame of frames) {
+    seen.push(frame);
+    if (stop(frame)) break;
+  }
+  return seen;
+}
+
+test('a stream closed after a terminal tool succeeded is recorded as completed', async (t) => {
+  const written = recordHeartbeats(t);
+  const r = reviewRun([skipTurn, textTurn('Skipped; the state comment is current.')]);
+  // The first text frame comes from the model call after skip_review returned.
+  const frames = await consume(r.run(), (f) => f.event === 'message');
+  assert.equal(r.stateBodies.length, 1);
+  assert.equal(frames.some((f) => f.event === 'done'), false);
+  assert.deepEqual(written, ['running', 'completed']);
+});
+
+test('the run is recorded as completed as soon as the terminal tool succeeds', async (t) => {
+  // Covers a runtime that is stopped before the handler reaches its end.
+  const written = recordHeartbeats(t);
+  const r = reviewRun([skipTurn, textTurn('Done.')]);
+  const frames = r.run();
+  let frame;
+  do frame = (await frames.next()).value; while (frame.event !== 'message');
+  assert.deepEqual(written, ['running', 'completed']);
+  await frames.return();
+  assert.deepEqual(written, ['running', 'completed']);
+});
+
+test('a stream closed before any terminal tool is recorded as failed', async (t) => {
+  const written = recordHeartbeats(t);
+  const r = reviewRun([skipTurn, textTurn('Done.')]);
+  await consume(r.run(), (f) => f.event === 'status' && f.data.phase === 'review');
+  assert.equal(r.model.calls, 0);
+  assert.deepEqual(written, ['running', 'failed']);
+});
+
+test('a stream closed during a tool call is completed when the drained turn calls a terminal tool', async (t) => {
+  // Closing agent.stream() while a tool runs does not stop Strands: it
+  // drains the rest of the agent loop without yielding, so skip_review
+  // still runs before the handler's finally block.
+  const written = recordHeartbeats(t);
+  const r = reviewRun([noopTurn, skipTurn, textTurn('Done.')]);
+  const frames = await consume(r.run(), (f) => f.event === 'tool_use');
+  assert.deepEqual(frames.filter((f) => f.event === 'tool_use').map((f) => f.data.name), ['noop']);
+  assert.equal(r.stateBodies.length, 1);
+  assert.deepEqual(written, ['running', 'completed']);
+});
+
+test('the heartbeat keeps beating while Strands drains the loop after the stream is closed', async (t) => {
+  recordHeartbeats(t);
+  const model = new ScriptedModel([noopTurn, noopTurn, skipTurn, textTurn('Done.')]);
+  let beats = 0;
+  let beatsWhenClosed = -1;
+  const statuses = [];
+  const handler = createReviewHandler({
+    env,
+    systemPrompt: 'You review pull requests.',
+    assembleTools: async ({ ctx: prCtx, octokit, tokens, statusComment, onTerminal }) => {
+      const deps = {
+        ctx: prCtx, octokit, tokens, statusComment,
+        stateWriter: { write: async () => ({ id: 1, url: 'https://github.com/state' }) },
+        terminalGate: createTerminalGate(onTerminal),
+      };
+      return [noop, buildPostReviewTool(deps), buildSkipTool(deps)];
+    },
+    deps: {
+      createModel: () => model,
+      createTokenSource: () => ({ get: async () => 'token' }),
+      createOctokit: () => ({}),
+      prepareWorkspace: async () => ctx,
+      loadGraduatedSkills: async () => [],
+      createStatusComment: () => { throw new Error('only mention runs have a status comment'); },
+      createHeartbeat: () => ({ beat: () => { beats++; }, finish: async (status) => { statuses.push(status); } }),
+    },
+  });
+  await consume(handler(payload), (f) => {
+    if (f.event !== 'tool_use') return false;
+    beatsWhenClosed = beats;
+    return true;
+  });
+  // The drained turns (one more noop, then skip_review) ran with no frames
+  // relayed, and still beat: once per model call and once per tool result.
+  assert.ok(beats >= beatsWhenClosed + 3, `beats ${beats}, at close ${beatsWhenClosed}`);
+  assert.deepEqual(statuses.at(-1), 'completed');
+});
+
+test('a model error after the terminal tool still completes the run', async (t) => {
+  const written = recordHeartbeats(t);
+  const r = reviewRun([skipTurn, failingTurn(new Error('connection reset'))]);
+  const frames = await consume(r.run());
+  const done = frames.find((f) => f.event === 'done');
+  assert.equal(done?.data.status, 'completed');
+  assert.equal(done.data.terminal_tool, 'skip_review');
+  assert.deepEqual(written, ['running', 'completed']);
+});
+
+test('a run that never calls a terminal tool fails after the retry turn', async (t) => {
+  const written = recordHeartbeats(t);
+  const r = reviewRun([textTurn('Here is my review in prose.')]);
+  await assert.rejects(consume(r.run()), /review completed without terminal tool/);
+  assert.equal(r.model.calls, 2);
+  assert.deepEqual(written, ['running', 'failed']);
+});
+
+test('the terminal-retry turn still sees the PR overview and the whole review', async (t) => {
+  const written = recordHeartbeats(t);
+  const toolCalls = 25; // past what the Strands default window of 40 messages keeps
+  const r = reviewRun([
+    ...Array.from({ length: toolCalls }, () => noopTurn),
+    textTurn('I have looked at everything.'),
+    skipTurn,
+    textTurn('Done.'),
+  ]);
+  const frames = await consume(r.run());
+  assert.ok(frames.some((f) => f.event === 'status' && f.data.phase === 'terminal_retry'));
+  assert.equal(frames.at(-1).data.terminal_tool, 'skip_review');
+
+  const retryCall = r.model.sent[toolCalls + 1];
+  assert.equal(retryCall.length, 2 * toolCalls + 3);
+  assert.match(textOf(retryCall[0]), /^# PR #7 in valkey-io\/valkey/);
+  assert.match(textOf(retryCall.at(-1)), /ended without calling a terminal review tool/);
+  assert.deepEqual(written, ['running', 'completed']);
+});
