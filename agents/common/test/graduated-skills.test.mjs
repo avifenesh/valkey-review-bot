@@ -115,6 +115,13 @@ test('a long run of whitespace renders in linear time', () => {
     assert.ok(ms < 250, `${ms.toFixed(0)} ms for a line of ${line.length} characters`);
     assert.ok(out.includes(want === null ? '### Use when\ntail' : `### Use when\n${want}\ntail`));
   }
+  for (const [description, scope] of [[`Use when${run}x`, 'Use when x'], [`Use when x.${run}Graduated from concern record_id=abc.${run}`, 'Use when x.']]) {
+    const start = performance.now();
+    const out = renderGraduatedSkills([skill({ description })]);
+    const ms = performance.now() - start;
+    assert.ok(ms < 250, `${ms.toFixed(0)} ms for a description of ${description.length} characters`);
+    assert.ok(out.includes(`\nScope: ${scope}\n`));
+  }
 });
 
 test('the introduction says the code at the PR head wins', () => {

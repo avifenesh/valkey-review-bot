@@ -52,8 +52,12 @@ const INTRO = 'These rules graduated from the concerns store after repeated rein
   + 'A rule is a reason to look; the code at the PR head wins. '
   + 'Confirm that the files and names a rule cites exist in this checkout before relying on it.';
 
-/** The provenance sentence submit_skill appends to a description, for operators. */
-const RECORD_ID_SENTENCE_RE = /\s*Graduated from concern record_id=\S*\s*$/;
+/**
+ * The provenance sentence submit_skill appends to a description, for
+ * operators. Matched after whitespace is collapsed, so ' ?' stands in
+ * for a leading \s*, which would take quadratic time on a long run.
+ */
+const RECORD_ID_SENTENCE_RE = / ?Graduated from concern record_id=\S*$/;
 /**
  * The citation the curator ends a skill body with, `_(graduated from concern record_id=<id>)_`.
  * No leading `\s*`: retried at every space of a long run, it takes
@@ -190,7 +194,7 @@ function renderSkillBody(skillMd: string): string {
 
 /** The description on one line, without the record id sentence that means nothing to a reviewer. */
 function scopeLine(description: string): string {
-  return description.replace(RECORD_ID_SENTENCE_RE, '').replace(/\s+/g, ' ').trim();
+  return description.replace(/\s+/g, ' ').trim().replace(RECORD_ID_SENTENCE_RE, '');
 }
 
 /**
