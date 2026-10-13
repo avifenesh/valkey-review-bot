@@ -81,12 +81,19 @@ function fenceWriteOps(inner: WriteOperations, root: string, sensitivePatterns: 
  * only. Drop matches in files that match them, as read refuses those.
  */
 function fenceGrepEngine(inner: GrepEngine, sensitivePatterns: readonly string[]): GrepEngine {
+  // One file can have thousands of matches; check each path once.
+  const verdicts = new Map<string, boolean>();
+  const allowed = (p: string) => {
+    let ok = verdicts.get(p);
+    if (ok === undefined) verdicts.set(p, ok = !matchesAnyPattern(p, sensitivePatterns));
+    return ok;
+  };
   return {
     async *search(input) {
-      for await (const m of inner.search(input)) if (!matchesAnyPattern(m.path, sensitivePatterns)) yield m;
+      for await (const m of inner.search(input)) if (allowed(m.path)) yield m;
     },
     async *count(input) {
-      for await (const c of inner.count(input)) if (!matchesAnyPattern(c.path, sensitivePatterns)) yield c;
+      for await (const c of inner.count(input)) if (allowed(c.path)) yield c;
     },
   };
 }
