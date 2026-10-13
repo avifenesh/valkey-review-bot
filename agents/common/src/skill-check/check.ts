@@ -7,8 +7,11 @@ import type { GitRunner } from './upstream.js';
  * check, and which rare names the upstream diff since then touched.
  *
  * Runs only git plumbing (ls-tree, grep, diff) against the commit; no
- * repository code. No runtime relative imports, so scripts can load this
- * file directly under Node's type stripping.
+ * repository code. Output options a clone's own config could change
+ * (grep line numbers and columns, colour, relative diff paths) are fixed
+ * on the command line, so this also works on a caller's clone. No
+ * runtime relative imports, so scripts can load this file directly
+ * under Node's type stripping.
  */
 
 export interface CheckInput {
@@ -24,6 +27,8 @@ export interface CheckInput {
    * a partial clone would otherwise try to fetch it.
    */
   readonly baseSha?: string;
+  /** The commit to check: HEAD by default, or any revision that names a commit (a full SHA, a tag). */
+  readonly rev?: string;
 }
 
 export interface DiffExcerpt {
@@ -35,10 +40,12 @@ export interface DiffExcerpt {
 }
 
 export interface CheckResult {
-  /** Cited names present at HEAD, in skill order. */
+  /** The commit checked: `rev` resolved to its full SHA. */
+  readonly commit: string;
+  /** Cited names present at the commit, in skill order. */
   readonly present: readonly string[];
   /**
-   * Occurrences at HEAD: words for symbols and configs, the rarest
+   * Occurrences at the commit: words for symbols and configs, the rarest
    * counted component for qualified names (all of them must be present),
    * words starting with the stem for prefixes, matching files for globs
    * and directories, 1 or 0 for paths. A path or directory whose first
@@ -60,7 +67,7 @@ export interface CheckResult {
   readonly clean: boolean;
   /** The base was available and diffed; without it `touched` is empty. */
   readonly compared: boolean;
-  /** Files changed between the base and HEAD. */
+  /** Files changed between the base and the commit. */
   readonly changedFiles: number;
   /** The diff of the candidate files passed DIFF_MAX_BYTES, so `touched` may be incomplete. */
   readonly diffTruncated: boolean;
@@ -76,7 +83,7 @@ export const GREP_PATTERNS_PER_CALL = 10;
 const GREP_CONCURRENCY = 4;
 /** Qualified-name components shorter than this (`c` in `c->flags`) are local names; they are not counted. */
 const COMPONENT_MIN_CHARS = 3;
-/** A name with at most this many occurrences at HEAD is rare enough to report as touched. */
+/** A name with at most this many occurrences at the commit is rare enough to report as touched. */
 export const RARE_MAX = 40;
 export const DIFF_MAX_CANDIDATES = 200;
 export const DIFF_MAX_BYTES = 4 * 1024 * 1024;
@@ -85,7 +92,10 @@ export const EXCERPTS_MAX_CHARS = 24_000;
 const HUNK_MAX_CHARS = 4_000;
 const GREP_MAX_BYTES = 64 * 1024 * 1024;
 
-const REV = 'HEAD';
+/** `git grep` with the output settings a repository's config can change fixed. */
+const GREP = ['-c', 'grep.lineNumber=false', '-c', 'grep.column=false', '-c', 'grep.fullName=false', '-c', 'color.grep=never', 'grep', '--no-color'];
+/** `git diff` likewise: unquoted paths in headers, paths from the top, no merged hunks, no colour. */
+const DIFF = ['-c', 'core.quotePath=false', 'diff', '--no-relative', '--no-color', '--inter-hunk-context=0'];
 const SHA_RE = /^(?:[0-9a-f]{40}|[0-9a-f]{64})$/;
 const WORD_CHARS = 'A-Za-z0-9_';
 const WORD_CHAR_RE = /[A-Za-z0-9_]/;
@@ -103,7 +113,17 @@ function nulList(out: string): string[] {
 
 /** Every file path at `rev`. */
 async function treeFiles(git: GitRunner, rev: string): Promise<string[]> {
-  return nulList(await run(git, ['ls-tree', '-r', '--name-only', '-z', rev]));
+  return nulList(await run(git, ['ls-tree', '-r', '--full-tree', '--name-only', '-z', rev]));
+}
+
+/** The full SHA of the commit `rev` names; throws when it names none. */
+async function resolveCommit(git: GitRunner, rev: string): Promise<string> {
+  // No option-like or multi-word revisions: they would reach git as flags or extra arguments.
+  if (rev.startsWith('-') || !/^[^\s\x00-\x1f\x7f]{1,200}$/.test(rev)) throw new Error(`invalid revision ${JSON.stringify(rev)}`);
+  const r = await git(['rev-parse', '--verify', '-q', `${rev}^{commit}`]);
+  const sha = r.stdout.trim();
+  if (r.code !== 0 || !SHA_RE.test(sha)) throw new Error(`${JSON.stringify(rev)} names no commit in this repository`);
+  return sha;
 }
 
 function basename(p: string): string {
@@ -199,7 +219,7 @@ function chunks<T>(items: readonly T[], size: number): T[][] {
 async function countWords(git: GitRunner, rev: string, words: readonly string[]): Promise<Map<string, number>> {
   const counts = new Map(words.map((w) => [w, 0]));
   const outputs = await inBatches(conflictFreeGroups(words, GREP_PATTERNS_PER_CALL), GREP_CONCURRENCY, (group) =>
-    run(git, ['grep', '-o', '-h', '-I', '-w', '-F', ...group.flatMap((w) => ['-e', w]), rev, '--'], [0, 1]));
+    run(git, [...GREP, '-o', '-h', '-I', '-w', '-F', ...group.flatMap((w) => ['-e', w]), rev, '--'], [0, 1]));
   for (const out of outputs) {
     for (const line of out.split('\n')) {
       const n = counts.get(line);
@@ -227,7 +247,7 @@ async function countPrefixes(git: GitRunner, rev: string, stems: readonly string
   const counts = new Map(stems.map((s) => [s, 0]));
   const groups = chunks(stems, GREP_PATTERNS_PER_CALL);
   const outputs = await inBatches(groups, GREP_CONCURRENCY, (group) =>
-    run(git, ['grep', '-h', '-I', '-F', ...group.flatMap((s) => ['-e', s]), rev, '--'], [0, 1]));
+    run(git, [...GREP, '-h', '-I', '-F', ...group.flatMap((s) => ['-e', s]), rev, '--'], [0, 1]));
   outputs.forEach((out, i) => {
     for (const line of out.split('\n')) {
       for (const s of groups[i]!) counts.set(s, counts.get(s)! + wordStarts(line, s));
@@ -243,7 +263,7 @@ async function filesContaining(git: GitRunner, rev: string, words: readonly stri
     ...chunks(stems, GREP_PATTERNS_PER_CALL).map((group) => ['-F', ...group.flatMap((s) => ['-e', s])]),
   ];
   const outputs = await inBatches(calls, GREP_CONCURRENCY, (patterns) =>
-    run(git, ['grep', '-l', '-z', '-I', ...patterns, rev, '--'], [0, 1]));
+    run(git, [...GREP, '-l', '-z', '-I', ...patterns, rev, '--'], [0, 1]));
   const files = new Set<string>();
   for (const out of outputs) {
     for (const entry of nulList(out)) files.add(entry.startsWith(`${rev}:`) ? entry.slice(rev.length + 1) : entry);
@@ -330,10 +350,11 @@ function capHunk(text: string): string {
 }
 
 /**
- * Check a skill's names against the checked-out commit (HEAD) and, when
- * the base commit is present, against the diff since it.
+ * Check a skill's names against a commit (`rev`, default HEAD) and,
+ * when the base commit is present, against the diff since it.
  */
 export async function checkSkill(git: GitRunner, input: CheckInput): Promise<CheckResult> {
+  const commit = await resolveCommit(git, input.rev ?? 'HEAD');
   const names: CitedName[] = [];
   const seenNames = new Set<string>();
   for (const n of input.names) {
@@ -342,7 +363,7 @@ export async function checkSkill(git: GitRunner, input: CheckInput): Promise<Che
       names.push(n);
     }
   }
-  const files = await treeFiles(git, REV);
+  const files = await treeFiles(git, commit);
   const dirs = directoriesOf(files);
   const dirList = [...dirs];
   const fileTails = withTails(files);
@@ -359,8 +380,8 @@ export async function checkSkill(git: GitRunner, input: CheckInput): Promise<Che
     else if (n.kind === 'qualified') for (const c of countedParts(n.token)) words.add(c);
     else if (n.kind === 'prefix') stems.add(n.token.slice(0, -1));
   }
-  const wordCounts = await countWords(git, REV, [...words]);
-  const stemCounts = await countPrefixes(git, REV, [...stems]);
+  const wordCounts = await countWords(git, commit, [...words]);
+  const stemCounts = await countPrefixes(git, commit, [...stems]);
 
   const counts = new Map<string, number>();
   /** For qualified names, the component the counts came from. */
@@ -403,7 +424,7 @@ export async function checkSkill(git: GitRunner, input: CheckInput): Promise<Che
   const base = input.baseSha;
   if (base !== undefined && SHA_RE.test(base) && (await git(['cat-file', '-e', `${base}^{commit}`])).code === 0) {
     compared = true;
-    const changed = nulList(await run(git, ['diff', '--name-only', '--no-renames', '-z', base, REV]));
+    const changed = nulList(await run(git, [...DIFF, '--name-only', '--no-renames', '-z', base, commit]));
     const changedSet = new Set(changed);
     changedFiles = changed.length;
 
@@ -424,12 +445,12 @@ export async function checkSkill(git: GitRunner, input: CheckInput): Promise<Che
     if (changed.length > 0 && (probes.length > 0 || touchedPaths.length > 0)) {
       const probeWords = [...new Set(probes.filter((p) => !p.stem).map((p) => p.word))];
       const probeStems = [...new Set(probes.filter((p) => p.stem).map((p) => p.word))];
-      const withNames = probes.length > 0 ? await filesContaining(git, REV, probeWords, probeStems) : new Set<string>();
+      const withNames = probes.length > 0 ? await filesContaining(git, commit, probeWords, probeStems) : new Set<string>();
       const candidates = [...new Set([...touchedPaths, ...changed.filter((f) => withNames.has(f))])].slice(0, DIFF_MAX_CANDIDATES);
       if (candidates.length > 0) {
         const r = await git([
-          '--literal-pathspecs', 'diff', '-U0', '--no-color', '--no-renames', '--no-ext-diff', '--no-textconv',
-          '--src-prefix=a/', '--dst-prefix=b/', base, REV, '--', ...candidates,
+          '--literal-pathspecs', ...DIFF, '-U0', '--no-renames', '--no-ext-diff', '--no-textconv',
+          '--src-prefix=a/', '--dst-prefix=b/', base, commit, '--', ...candidates,
         ], { maxBytes: DIFF_MAX_BYTES });
         if (r.code !== 0 && !r.truncated) throw new Error(`git diff exited ${r.code}: ${r.stderr.trim().slice(0, 2000)}`);
         diffTruncated = r.truncated;
@@ -475,6 +496,7 @@ export async function checkSkill(git: GitRunner, input: CheckInput): Promise<Che
   }
 
   return {
+    commit,
     present,
     counts,
     lost,
@@ -490,11 +512,11 @@ export async function checkSkill(git: GitRunner, input: CheckInput): Promise<Che
 }
 
 /**
- * How many files at HEAD each glob matches (a glob without '/' matches
- * basenames). For the obsolete rule: a skill whose area globs all match
- * nothing has lost its subject.
+ * How many files at `rev` (default HEAD) each glob matches (a glob
+ * without '/' matches basenames). For the obsolete rule: a skill whose
+ * area globs all match nothing has lost its subject.
  */
-export async function areaFileCounts(git: GitRunner, globs: readonly string[]): Promise<number[]> {
-  const files = await treeFiles(git, REV);
+export async function areaFileCounts(git: GitRunner, globs: readonly string[], rev = 'HEAD'): Promise<number[]> {
+  const files = await treeFiles(git, await resolveCommit(git, rev));
   return globs.map((g) => globMatches(g, files));
 }

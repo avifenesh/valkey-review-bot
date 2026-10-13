@@ -236,6 +236,47 @@ test('a path rooted at a top-level directory must match exactly; other paths mat
   r.cleanup();
 });
 
+test('a clone whose own config changes grep and diff output is still read correctly', async () => {
+  const r = repo(
+    { 'src/a.c': 'int rare_cfg_name = 1;\nint other_name_x;\n', 'src/b.c': 'x = REPL_STATE_CONNECT;\n' },
+    { 'src/a.c': 'int rare_cfg_name = 2;\nint other_name_x;\n' },
+  );
+  const local = Object.entries({
+    'grep.lineNumber': 'true', 'grep.column': 'true', 'grep.fullName': 'true', 'color.ui': 'always', 'color.grep': 'always',
+    'color.diff': 'always', 'diff.relative': 'true', 'diff.interHunkContext': '10', 'core.quotePath': 'true',
+  });
+  for (const [key, value] of local) execFileSync('git', ['config', key, value], { cwd: r.dir, env });
+  const result = await checkSkill(r.git, {
+    names: names('`rare_cfg_name` `other_name_x` `REPL_STATE_*`'),
+    baseline: ['rare_cfg_name', 'other_name_x', 'REPL_STATE_*'],
+    baseSha: r.baseSha,
+  });
+  assert.deepEqual(result.present, ['rare_cfg_name', 'other_name_x', 'REPL_STATE_*']);
+  assert.equal(result.counts.get('rare_cfg_name'), 1);
+  assert.equal(result.counts.get('REPL_STATE_*'), 1);
+  assert.deepEqual(result.touched, ['rare_cfg_name']);
+  assert.equal(result.excerpts[0].path, 'src/a.c');
+  assert.equal(result.excerpts[0].hunk, '@@ -1 +1 @@\n-int rare_cfg_name = 1;\n+int rare_cfg_name = 2;');
+  r.cleanup();
+});
+
+test('a given revision is checked instead of HEAD', async () => {
+  const r = repo({ 'src/old.c': 'int base_only_name;\n' }, { 'src/old.c': null, 'src/new.c': 'int tip_only_name;\n' });
+  const n = names('`base_only_name` `tip_only_name` `src/old.c` `src/new.c`');
+  const atBase = await checkSkill(r.git, { names: n, rev: r.baseSha });
+  assert.equal(atBase.commit, r.baseSha);
+  assert.deepEqual(atBase.present, ['base_only_name', 'src/old.c']);
+  const atHead = await checkSkill(r.git, { names: n });
+  assert.equal(atHead.commit, r.tipSha);
+  assert.deepEqual(atHead.present, ['tip_only_name', 'src/new.c']);
+  assert.deepEqual(await areaFileCounts(r.git, ['src/old*'], r.baseSha), [1]);
+  assert.deepEqual(await areaFileCounts(r.git, ['src/old*']), [0]);
+  await assert.rejects(checkSkill(r.git, { names: n, rev: '--output=/tmp/x' }), /invalid revision/);
+  await assert.rejects(checkSkill(r.git, { names: n, rev: 'f'.repeat(40) }), /names no commit/);
+  await assert.rejects(areaFileCounts(r.git, ['src/old*'], 'no-such-ref'), /names no commit/);
+  r.cleanup();
+});
+
 test('globs match paths, or basenames when they have no slash', () => {
   assert.equal(globToRegExp('glide-core/src/client/**').test('glide-core/src/client/mod.rs'), true);
   assert.equal(globToRegExp('glide-core/src/client/**').test('glide-core/src/clientx/mod.rs'), false);
