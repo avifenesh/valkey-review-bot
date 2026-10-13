@@ -49,6 +49,13 @@ async function dump(args, responses = {}) {
   return { ...r, calls: cli.calls() };
 }
 
+/** The output block of one record, from its subject line to the blank line after it. */
+const block = (out, subject) => {
+  const start = out.indexOf(`  * subject       : ${subject}`);
+  assert.ok(start >= 0, `no record ${subject}`);
+  return out.slice(start, out.indexOf('\n\n', start));
+};
+
 test('--region applies to every call, wherever it is given', async () => {
   const r = await dump(['--stack', 'ValkeyReviewAgent', '--region', 'eu-west-1']);
   assert.equal(r.code, 0, r.stderr);
@@ -57,6 +64,66 @@ test('--region applies to every call, wherever it is given', async () => {
     ['dynamodb scan', 'eu-west-1'],
   ]);
   assert.match(r.stdout, /^ {2}table: valkey_review_concerns$/m);
+});
+
+test('reserved items are not concern records: the repo skill.md item is shown on its own, others are counted', async () => {
+  const { stdout, code } = await dump(['--table', 'valkey_review_concerns']);
+  assert.equal(code, 0);
+  assert.match(stdout, /^ {2}records: 3$/m);
+  assert.match(stdout, /^ {2}not shown: 1 item\(s\) in buckets that start with #, which are not concern records$/m);
+  assert.ok(!stdout.includes('hidden'));
+  assert.ok(!stdout.includes('--- bucket: #'));
+  assert.ok(stdout.includes([
+    '--- repo skill.md check (#maintenance repo-skill) ---',
+    '    verified      : 9.1.2 on 2026-10-01T00:00:00.000Z',
+    '    last check    : suspect: 1 name missing',
+    '    maintenance   : repo_check requested at 2026-10-13T00:00:00.000Z (repo_check#valkey-review#repo-skill#2026-10-13T00:00:00.000Z)',
+  ].join('\n')));
+});
+
+test('a live graduated record shows its check state, the request in flight and the pending edits', async () => {
+  const { stdout } = await dump(['--table', 'valkey_review_concerns']);
+  assert.equal(block(stdout, 'RDB load?[2J'), [
+    '  * subject       : RDB load?[2J',
+    '    record_id     : r1',
+    '    area          : src/rdb.c',
+    '    reinforcement : 3 (distinct: 2)  decay: 0.9  updated: 2026-09-01T00:00:00.000Z',
+    '    graduated as  : rdb-load at 2026-09-02T00:00:00.000Z (generation 2)',
+    '    skill state   : live',
+    '    verified      : no release tag, unstable@0eb4ba3c1d2e on 2026-10-12T00:00:00.000Z',
+    '    last check    : suspect: 1 of 5 names missing at unstable@0eb4ba3c1d2e: `emptyDB`',
+    '    stale names   : emptyDB (since 2026-10-12T00:00:00.000Z)',
+    '    maintenance   : check requested at 2026-10-13T00:00:00.000Z (check#valkey-review#r1#2026-10-13T00:00:00.000Z)',
+    '    pending edit  : revise at 2026-10-12T00:00:00.000Z (applyEdits off)',
+    '      summary     : renamed fake line?',
+    '      edit 1, evidence: valkey-io/valkey@0eb4ba3c1d2e0eb4ba3c1d2e0eb4ba3c1d2e0eb4:src/db.c:12',
+    '        - Call `emptyDB` first.',
+    '        - Then load.',
+    '        + Call `emptyData` first.',
+    '        + Then load.',
+    '      edit 2, evidence: src/rdb.c:40',
+    '        - `rdbLoad`',
+    '        + `rdbLoadRio`',
+    '    concern       : two',
+    'lines',
+    '    context       : (none)',
+  ].join('\n'));
+});
+
+test('a tombstone shows how it was retired; a record that never graduated shows no lifecycle', async () => {
+  const { stdout } = await dump(['--table', 'valkey_review_concerns']);
+  const tomb = block(stdout, 'old');
+  assert.match(tomb, /^ {4}skill state {3}: retired \(decayed\) at 2026-10-01T00:00:00.000Z, registry status was DRAFT$/m);
+  assert.match(tomb, /^ {4}verified {6}: never$/m);
+  assert.match(tomb, /^ {4}obsolete at {3}: 9\.1\.1$/m);
+  assert.match(tomb, /^ {4}revised at {4}: 2026-09-20T00:00:00.000Z \(the text before it is kept in previous_skill_md\)$/m);
+  const plain = block(stdout, 'plain');
+  for (const label of ['graduated as', 'skill state', 'verified', 'maintenance', 'pending edit']) assert.ok(!plain.includes(label), label);
+});
+
+test('no control or bidi-override character from the table reaches the terminal', async () => {
+  const { stdout } = await dump(['--table', 'valkey_review_concerns']);
+  assert.ok(!/[\u0000-\u0008\u000b-\u001f\u007f-\u009f\u2028\u2029\u202a-\u202e\u2066-\u2069]/.test(stdout));
 });
 
 test('bad arguments print the usage and make no call', async () => {
