@@ -19,18 +19,19 @@
  * The reason is generated from the changed names ("`a` is now `b`",
  * several joined by "; "); an edit cannot supply one, so no caller or
  * model text reaches the skill. Several citations are separated by
- * ", ". The replacement may differ from the original only where a
- * cited line supports it: both are split on the token class
- * [A-Za-z0-9_./:*>-]+, the text between tokens must be identical and the
- * token count equal, and every changed token must be a code name inside
- * an inline code span (backticks) replacing a code name of the same
- * sort, or a number replacing a number, that appears on one of the
- * edit's cited lines. Words outside code spans never change, so an edit
- * cannot turn "NEVER flag" into "ALWAYS flag", add or remove a word, a
- * sentence or punctuation, and the replacement has as many lines as the
- * original. The frontmatter, fenced blocks and
- * already-suppressed pieces are never edited, and suppressed blocks do
- * not nest.
+ * ", ".
+ *
+ * The replacement may differ from the original only where a cited line
+ * supports it. Both are split on the token class [A-Za-z0-9_./:*>-]+;
+ * the text between tokens must be identical and the token count equal.
+ * Every changed token must be a code name inside an inline code span
+ * (backticks) replacing a code name of the same sort, or a number
+ * replacing a number, and appear on one of the edit's cited lines. Words
+ * outside code spans never change, so an edit cannot turn "NEVER flag"
+ * into "ALWAYS flag", add or remove a word, a sentence or punctuation,
+ * and the replacement has as many lines as the original. The
+ * frontmatter, fenced blocks and already-suppressed pieces are never
+ * edited, and suppressed blocks do not nest.
  *
  * No runtime imports, so scripts can load this file directly under
  * Node's type stripping. The token rules repeat names.ts's
