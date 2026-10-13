@@ -243,6 +243,121 @@ test('a reopen has its own key and heartbeat nonce, so it reviews a head whose o
   assert.equal(sent.length, 2);
 });
 
+test('a draft marked ready again reviews when its waiting ready review was skipped', async () => {
+  // On a skipDrafts route the ready review waits (behind another run,
+  // say), the pull request goes back to draft, and the review then
+  // starts: the runtime skips it. Marking the pull request ready again
+  // at the same head must queue a review, not be dropped as a duplicate.
+  const { handler, sent, store, logs } = setup();
+  await handler(delivery('pull_request', prEvent('ready_for_review', {}, GLIDE)));
+  const converted = await handler(delivery('pull_request', prEvent('converted_to_draft', { draft: true }, GLIDE)));
+  assert.equal(converted.statusCode, 200);
+  assert.equal(body(converted).skipped, 'action=converted_to_draft');
+  assert.deepEqual(store.released, [`${GLIDE}#7#abc123#ready`]);
+  assert.equal(logs.at(-2), `[auto-review] route=valkey-glide-review repo=${GLIDE} pr=7 head=abc123 converted_to_draft while a review waits; released ${GLIDE}#7#abc123#ready in case that review is skipped`);
+
+  await store.clearReviewPending(GLIDE, 7, 'pending-1');
+  const again = await handler(delivery('pull_request', prEvent('ready_for_review', {}, GLIDE)));
+  assert.equal(body(again).enqueued, `${GLIDE}#7#abc123#ready`, 'not a duplicate of the skipped review');
+  assert.equal(sent.length, 2);
+  assert.equal(sent[1].body.run_nonce, 'ready');
+  assert.equal(sent[1].body.pending_marker, 'pending-2');
+  assert.equal(store.autoReviews.get(`${GLIDE}#7`), 2, 'it uses a round');
+  assert.equal(body(await handler(delivery('pull_request', prEvent('ready_for_review', {}, GLIDE)))).skipped, 'duplicate', 'a redelivery is still a duplicate');
+});
+
+test('a reopen reviews when the review of the reopen before it was skipped', async () => {
+  // The reopened pull request's review waits, the pull request is closed
+  // again, and the review then starts: the runtime skips it.
+  const { handler, sent, store, logs } = setup();
+  await handler(delivery('pull_request', prEvent('reopened')));
+  assert.equal(body(await handler(delivery('pull_request', prEvent('closed')))).skipped, 'action=closed');
+  assert.deepEqual(store.released, [`${REPO}#7#abc123#reopened`]);
+  assert.equal(logs.at(-2), `[auto-review] route=valkey-review repo=${REPO} pr=7 head=abc123 closed while a review waits; released ${REPO}#7#abc123#reopened in case that review is skipped`);
+
+  await store.clearReviewPending(REPO, 7, 'pending-1');
+  const resp = await handler(delivery('pull_request', prEvent('reopened')));
+  assert.equal(body(resp).enqueued, `${REPO}#7#abc123#reopened`, 'not a duplicate of the skipped review');
+  assert.equal(sent.length, 2);
+  assert.equal(store.autoReviews.get(`${REPO}#7`), 2);
+});
+
+test('back before the waiting review starts, a reopen or ready_for_review joins it and uses no round', async () => {
+  const { handler, sent, store } = setup();
+  await handler(delivery('pull_request', prEvent('opened')));
+  await handler(delivery('pull_request', prEvent('closed')));
+  assert.equal(body(await handler(delivery('pull_request', prEvent('reopened')))).skipped, 'auto-review-pending');
+  await handler(delivery('pull_request', prEvent('ready_for_review', {}, GLIDE)));
+  await handler(delivery('pull_request', prEvent('converted_to_draft', { draft: true }, GLIDE)));
+  assert.equal(body(await handler(delivery('pull_request', prEvent('ready_for_review', {}, GLIDE)))).skipped, 'auto-review-pending');
+  assert.equal(sent.length, 2);
+  assert.equal(store.autoReviews.get(`${REPO}#7`), 1);
+  assert.equal(store.autoReviews.get(`${GLIDE}#7`), 1);
+});
+
+test('with no review waiting, closing or going back to draft keeps the key of a head already reviewed', async () => {
+  // The worker had started the review before the event: the review read
+  // the pull request as it was then, and covered the head. Closing and
+  // reopening (to run CI again, say), or a draft marked ready again,
+  // does not review that head again.
+  const { handler, sent, store } = setup();
+  await handler(delivery('pull_request', prEvent('ready_for_review', {}, GLIDE)));
+  await store.clearReviewPending(GLIDE, 7, 'pending-1');
+  await handler(delivery('pull_request', prEvent('converted_to_draft', { draft: true }, GLIDE)));
+  assert.equal(body(await handler(delivery('pull_request', prEvent('ready_for_review', {}, GLIDE)))).skipped, 'duplicate');
+
+  await handler(delivery('pull_request', prEvent('reopened')));
+  await store.clearReviewPending(REPO, 7, 'pending-2');
+  await handler(delivery('pull_request', prEvent('closed')));
+  assert.equal(body(await handler(delivery('pull_request', prEvent('reopened')))).skipped, 'duplicate');
+  assert.deepEqual(store.released, []);
+  assert.equal(sent.length, 2);
+});
+
+test('closing or going back to draft releases nothing for merges, bots, other routes, or drafts a route reviews', async () => {
+  const store = fakeStore();
+  const reads = [];
+  store.hasPendingReview = async (repo, prNumber) => {
+    reads.push(`${repo}#${prNumber}`);
+    return true;
+  };
+  const { handler, sent } = setup({ store });
+  const left = async (payload) => body(await handler(delivery('pull_request', payload))).skipped;
+  assert.equal(await left(prEvent('converted_to_draft', { draft: true })), 'action=converted_to_draft', 'a route without skipDrafts');
+  assert.equal(await left(prEvent('closed', { merged: true })), 'action=closed');
+  assert.equal(await left(prEvent('closed', { user: { login: 'dependabot[bot]', type: 'Bot' } })), 'action=closed');
+  assert.equal(await left(prEvent('closed', {}, 'someone/else')), 'action=closed');
+  assert.equal(await left(prEvent('closed', {}, 'example-org/mention-only')), 'action=closed');
+  assert.equal(await left(prEvent('closed', { head: {} })), 'action=closed');
+  assert.deepEqual(reads, []);
+  assert.deepEqual(store.released, []);
+
+  assert.equal(await left(prEvent('closed')), 'action=closed');
+  assert.equal(await left(prEvent('converted_to_draft', { draft: true }, GLIDE)), 'action=converted_to_draft');
+  assert.deepEqual(reads, [`${REPO}#7`, `${GLIDE}#7`]);
+  assert.deepEqual(store.released, [`${REPO}#7#abc123#reopened`, `${GLIDE}#7#abc123#ready`]);
+  assert.equal(sent.length, 0, 'these events never review');
+});
+
+test('a store error while closing is logged and the delivery still succeeds', async () => {
+  const errors = [];
+  const original = console.error;
+  console.error = (line) => errors.push(line);
+  try {
+    const store = fakeStore();
+    store.hasPendingReview = async () => {
+      throw Object.assign(new Error('slow down'), { name: 'ThrottlingException' });
+    };
+    const { handler } = setup({ store });
+    const resp = await handler(delivery('pull_request', prEvent('closed')));
+    assert.equal(resp.statusCode, 200);
+    assert.equal(body(resp).skipped, 'action=closed');
+    assert.equal(errors[0], `[store] could not release ${REPO}#7#abc123#reopened after closed; if the waiting review is skipped, a reopened event at this head is dropped as a duplicate`);
+  } finally {
+    console.error = original;
+  }
+});
+
 const push = (sha, pr = {}, repo = REPO) => prEvent('synchronize', { head: { sha }, ...pr }, repo);
 
 test('new commits start a delayed review that holds the pull request\'s pending marker', async () => {

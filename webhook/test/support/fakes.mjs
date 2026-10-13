@@ -139,6 +139,9 @@ export function fakeStore({ budget = Infinity } = {}) {
       pending.delete(prKey(repo, prNumber));
       return true;
     },
+    async hasPendingReview(repo, prNumber) {
+      return pending.has(prKey(repo, prNumber));
+    },
   };
 }
 

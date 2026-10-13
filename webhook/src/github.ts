@@ -12,6 +12,7 @@ export interface WebhookPayload {
     readonly user?: GitHubUser;
     readonly head?: { readonly sha?: string };
     readonly draft?: boolean;
+    readonly merged?: boolean;
   };
   readonly issue?: {
     readonly number?: number;

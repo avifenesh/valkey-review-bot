@@ -21,6 +21,9 @@ import { releaseQuietly, type DeliveryStore } from './store.js';
  *      holds the marker until its run starts and covers every push,
  *      reopen or ready_for_review that comes before then. A review of new
  *      commits first waits in the queue for pushReviewDelaySeconds.
+ *      closed, and converted_to_draft on a skipDrafts route, never
+ *      review; while a review waits, they release the key of a reopen,
+ *      or ready_for_review, at that head (pullRequestLeft).
  *   3. issue_comment, pull_request_review_comment, pull_request_review:
  *      an @mention of the bot is a review request (src/mention.ts).
  *      Everything else, and a thread reply even when it also starts a
@@ -89,6 +92,22 @@ const TRIGGER_NONCES: ReadonlyMap<AutomaticTrigger, string> = new Map([
   ['ready_for_review', 'ready'],
   ['push', 'push'],
 ]);
+/**
+ * The pull_request actions after which the runtime skips a waiting
+ * automatic review, each with the trigger that asks for the review
+ * again: closed until reopened, and, on skipDrafts routes,
+ * converted_to_draft until ready_for_review.
+ */
+const LEAVING_ACTIONS: ReadonlyMap<string, AutomaticTrigger> = new Map([
+  ['closed', 'reopened'],
+  ['converted_to_draft', 'ready_for_review'],
+]);
+
+/** The idempotency key of an automatic review: repo#pr#head_sha, then the trigger's nonce. */
+function reviewKey(repo: string, prNumber: number, headSha: string, trigger: AutomaticTrigger): string {
+  const nonce = TRIGGER_NONCES.get(trigger);
+  return `${repo}#${prNumber}#${headSha}${nonce ? `#${nonce}` : ''}`;
+}
 
 const skip = (reason: string): Outcome => ({ status: 200, body: { ok: true, skipped: reason } });
 const fail = (status: number, error: string): Outcome => ({ status, body: { error } });
@@ -154,9 +173,61 @@ export function createDeliveryHandler(
     return { status: 200, body: { ok: true, enqueued: key } };
   }
 
+  /**
+   * closed, and converted_to_draft on a skipDrafts route. If an
+   * automatic review of the pull request waits, and starts before the
+   * pull request is reopened or marked ready, the runtime skips it and
+   * records its run completed. The reopen or ready_for_review that then
+   * asks for the review again at this head must not be dropped as the
+   * duplicate of an earlier one, so while a review waits, that event's
+   * key is released. If the pull request comes back before the review
+   * starts, the event joins it as usual and uses no round. The head is
+   * then reviewed, but the key is free, so one more close and reopen (or
+   * draft and ready) at that head reviews it again and uses a round.
+   *
+   * With no review waiting the key stays, so closing and reopening a
+   * pull request (to run CI again, say), or a draft marked ready again,
+   * at a head that was already reviewed does not use a round each time.
+   * What remains: an event in the seconds between the worker starting a
+   * review and the runtime reading the pull request finds no review
+   * waiting, yet the runtime skips that review. A reopen or
+   * ready_for_review at this head whose key is already taken is then
+   * dropped.
+   *
+   * The event itself never reviews: it is acknowledged as skipped, and a
+   * store error is logged instead of failing the delivery.
+   */
+  async function pullRequestLeft(payload: WebhookPayload, target: Target, action: string, back: AutomaticTrigger): Promise<Outcome> {
+    const { repo } = target;
+    const outcome = skip(`action=${action}`);
+    const pr = payload.pull_request;
+    const prNumber = pr?.number;
+    const headSha = pr?.head?.sha;
+    if (isBotAuthor(pr?.user) || typeof prNumber !== 'number' || !headSha) return outcome;
+    // A merged pull request cannot be reopened.
+    if (action === 'closed' && pr?.merged === true) return outcome;
+    const route = config.reviewRoutes.get(repo.toLowerCase());
+    if (!route || route.mentionOnly) return outcome;
+    // Other routes neither review on ready_for_review nor skip a draft.
+    if (back === 'ready_for_review' && !route.skipDrafts) return outcome;
+
+    const key = reviewKey(repo, prNumber, headSha, back);
+    try {
+      if (!(await deps.store.hasPendingReview(repo, prNumber))) return outcome;
+      await release(key);
+    } catch (err) {
+      console.error(`[store] could not release ${key} after ${action}; if the waiting review is skipped, a ${back} event at this head is dropped as a duplicate`, err);
+      return outcome;
+    }
+    log(`[auto-review] route=${route.routeId} repo=${repo} pr=${prNumber} head=${headSha} ${action} while a review waits; released ${key} in case that review is skipped`);
+    return outcome;
+  }
+
   async function pullRequest(payload: WebhookPayload, target: Target): Promise<Outcome> {
     const { repo } = target;
     const action = payload.action ?? '';
+    const back = LEAVING_ACTIONS.get(action);
+    if (back) return pullRequestLeft(payload, target, action, back);
     // Narrowed further per route below; anything else never reviews.
     const trigger = REVIEW_TRIGGERS.get(action);
     if (!trigger) return skip(`action=${action}`);
@@ -200,11 +271,14 @@ export function createDeliveryHandler(
     //     then be dropped as the duplicate of a skipped review (opened,
     //     or new commits), nor its run be taken for done by the worker.
     // The cost: a reopen at a head that was already reviewed is reviewed
-    // again, and uses a round. Only the first reopen at a head does: a
-    // later one is a duplicate of it.
+    // again, and uses a round. Only the first reopen at a head does; a
+    // later one is its duplicate, unless pullRequestLeft released its key
+    // because the pull request was closed while a review waited. That is
+    // also how a skipped review of a reopen or ready_for_review, which
+    // holds that trigger's own key, does not drop the next one.
     const pushed = trigger === 'push';
     const nonce = TRIGGER_NONCES.get(trigger);
-    const key = `${repo}#${prNumber}#${headSha}${nonce ? `#${nonce}` : ''}`;
+    const key = reviewKey(repo, prNumber, headSha, trigger);
     if (!(await deps.store.claim(key, { action }))) return skip('duplicate');
 
     // What this review has taken so far, given back newest first when it

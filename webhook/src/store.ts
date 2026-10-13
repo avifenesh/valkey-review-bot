@@ -62,6 +62,11 @@ export interface DeliveryStore {
   markReviewPending(repo: string, prNumber: number, delaySeconds: number): Promise<string | null>;
   /** Removes the pull request's pending marker if it is still `markerId`. */
   clearReviewPending(repo: string, prNumber: number, markerId: string): Promise<boolean>;
+  /**
+   * True while an automatic review of the pull request waits: its
+   * pending marker is there and has not expired. Read consistently.
+   */
+  hasPendingReview(repo: string, prNumber: number): Promise<boolean>;
 }
 
 /**
@@ -274,5 +279,17 @@ export function createDeliveryStore(ddb: DocumentClient, tableName: string, now:
     },
 
     clearReviewPending: (repo, prNumber, markerId) => clearPendingReview(ddb, tableName, repo, prNumber, markerId),
+
+    async hasPendingReview(repo, prNumber) {
+      const resp = await ddb.send(new GetCommand({
+        TableName: tableName,
+        Key: { key: pendingReviewKey(repo, prNumber) },
+        ConsistentRead: true,
+      }));
+      if (!resp.Item) return false;
+      // Expired as markReviewPending counts it: TTL deletes lazily.
+      const ttl = (resp.Item as { ttl?: unknown }).ttl;
+      return !(typeof ttl === 'number' && ttl < epochSeconds());
+    },
   };
 }

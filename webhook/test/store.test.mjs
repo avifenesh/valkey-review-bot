@@ -233,6 +233,30 @@ test('a waiting worker keeps its own marker an hour past now, and no other', asy
   await assert.rejects(extendPendingReview(throttled, TABLE, 'o/r', 7, marker), /slow down/);
 });
 
+test('a review waits while the pull request\'s marker is there and has not expired', async () => {
+  const ddb = fakeDdb();
+  let now = new Date('2026-10-13T08:00:00Z');
+  const store = createDeliveryStore(ddb, TABLE, () => now);
+  assert.equal(await store.hasPendingReview('o/r', 7), false);
+  const marker = await store.markReviewPending('o/r', 7, 300);
+  assert.equal(await store.hasPendingReview('O/R', 7), true);
+  assert.equal(await store.hasPendingReview('o/r', 8), false, 'pull requests are separate');
+  const get = ddb.calls.findLast((c) => c.op === 'GetCommand').input;
+  assert.deepEqual(get, { TableName: TABLE, Key: { key: 'pending#o/r#8' }, ConsistentRead: true });
+
+  now = new Date('2026-10-13T09:05:00Z');
+  assert.equal(await store.hasPendingReview('o/r', 7), true, 'up to its expiry');
+  now = new Date('2026-10-13T09:05:01Z');
+  assert.equal(await store.hasPendingReview('o/r', 7), false, 'expired as markReviewPending counts it, deleted or not');
+
+  now = new Date('2026-10-13T08:00:00Z');
+  await store.clearReviewPending('o/r', 7, marker);
+  assert.equal(await store.hasPendingReview('o/r', 7), false, 'the worker started it');
+
+  const throttled = { send: async () => { throw Object.assign(new Error('slow down'), { name: 'ThrottlingException' }); } };
+  await assert.rejects(createDeliveryStore(throttled, TABLE).hasPendingReview('o/r', 7), /slow down/);
+});
+
 test('releaseQuietly logs a failed release instead of throwing', async () => {
   const errors = [];
   const original = console.error;
