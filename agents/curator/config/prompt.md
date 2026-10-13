@@ -178,6 +178,13 @@ Skip unless: <exact diff condition: file name, function name or identifier that 
 4. **No maintainer names, logins, PR numbers or review ids** anywhere in the skill.
 5. **No time-bound wording** such as "as of 2026" or "before the rebase".
 6. **No filler.** Leave out what the model already knows and any narration about the skill itself.
+7. **Code names in backticks, exactly as spelled in code.** Put every file path, function, struct, macro and config name in backticks, spelled as in the code: `src/replication.c`, `cancelReplicationHandshake`, `REPL_STATE_CONNECTING`, `repl-diskless-sync`. The release check looks up every backticked name in the upstream code, so a misspelled or invented name marks the skill as stale.
+8. **Hypothetical or placeholder names only in fenced blocks.** An angle-bracket placeholder or an invented example identifier goes in a fenced code block, never in backticks in prose, where the check would look it up.
+9. **Defaults in one sentence.** State a default as the backticked name and its value in one sentence, so the check can tie the value to the name:
+
+   ```
+   `<config-name>` defaults to <value>.
+   ```
 
 **Voice**: plain prose, no emojis, no greetings. End with `_(graduated from concern record_id=<id>)_`.
 

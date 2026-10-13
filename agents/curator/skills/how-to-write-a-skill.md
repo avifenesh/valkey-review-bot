@@ -144,6 +144,13 @@ Failure to follow any of these produces a skill that misfires:
 4. **No maintainer names, logins, PR numbers, or review IDs anywhere in the skill.** The pattern is the signal; identities are not. They rot.
 5. **No time-sensitive language.** Don't write "as of 2026" or "before the rebase". The skill outlives its source PR.
 6. **No filler.** Cut anything the model already knows. Cut narration about the skill itself ("This skill helps you..."). Cut general-knowledge restatements.
+7. **Every code name in backticks, exactly as spelled in code.** File paths, functions, structs, macros and config names: `src/replication.c`, `cancelReplicationHandshake`, `REPL_STATE_CONNECTING`, `repl-diskless-sync`. After each upstream release a check looks up every backticked name in the upstream code; a misspelled, paraphrased or invented name reads as one that is gone and marks the skill as stale.
+8. **Hypothetical or placeholder names only in fenced blocks.** An angle-bracket placeholder or an invented example identifier never goes in backticks in prose, where the check would look it up.
+9. **State a default as the backticked name and the value in one sentence**, so the value stays tied to the name it belongs to:
+
+   ```
+   `<config-name>` defaults to <value>.
+   ```
 
 ## Length budget
 

@@ -143,6 +143,10 @@ The rules that are easy to miss:
   check's corrections, and change only what the feedback changes.
   Suppressed blocks (`<!-- suppressed: ... -->` to
   `<!-- /suppressed -->`) stay exactly as they are.
+- **Code names in backticks, spelled as in code.** Every file path,
+  function, struct, macro and config name goes in backticks exactly as
+  the code spells it; placeholders go only in fenced blocks. The
+  release check looks up every backticked name upstream.
 
 ## Things to never do
 

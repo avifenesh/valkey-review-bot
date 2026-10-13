@@ -17,6 +17,18 @@ test('skill authoring guidance asks for reviewer tool calls, not shell commands'
   assert.equal(checkGitArgs(args), null, 'the git tool accepts the example');
 });
 
+test('the prompt and the authoring guide ask for code names in backticks and placeholders in fences', () => {
+  for (const file of ['../config/prompt.md', '../skills/how-to-write-a-skill.md']) {
+    const text = read(file);
+    assert.match(text, /in backticks, exactly as spelled in code/i, file);
+    assert.match(text, /file paths?, functions?, structs?, macros? and config names?/i, file);
+    assert.match(text, /placeholder names? only in fenced blocks/i, file);
+    assert.match(text, /default as the backticked name and (?:its|the) value in one sentence/i, file);
+    // The example of a default is itself in a fenced block, so no placeholder sits in prose.
+    assert.match(text, /```\n\s*`<config-name>` defaults to <value>\.\n\s*```/, file);
+  }
+});
+
 test('the curator is told to start from get_skill and never to touch suppression markers', () => {
   for (const file of ['../config/prompt.md', '../skills/how-to-write-a-skill.md']) {
     const text = read(file);
