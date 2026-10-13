@@ -190,12 +190,23 @@ export function createDeliveryHandler(
       // A review of new commits waits in the queue, so that a burst of
       // pushes gets one review: while it waits, the pull request's pending
       // marker skips later pushes, and the runtime reviews the head as it
-      // is when the run starts. This delivery's key stays claimed then,
-      // since the waiting review covers its head.
+      // is when the run starts.
+      //
+      // A skipped push relies on the marker's owner queuing its review,
+      // but the owner takes the marker before its cap and budget checks
+      // and gives it back when it does not queue (a store error or a
+      // failed send, as well as the cap and the budget). So the skipped
+      // push's key is released, and a redelivery of the push is processed
+      // instead of being dropped as a duplicate. What remains: GitHub does
+      // not redeliver on its own, so in that case this head is reviewed
+      // only after a manual redelivery or the next push; and a redelivery
+      // that comes after the waiting review has started queues another
+      // review of this head.
       let pendingMarker: string | undefined;
       if (pushed) {
         const marker = await deps.store.markReviewPending(repo, prNumber, config.pushReviewDelaySeconds);
         if (marker === null) {
+          await giveBack();
           log(`[auto-review] route=${route.routeId} repo=${repo} pr=${prNumber} head=${headSha} joins the waiting review; skipped`);
           return skip('auto-review-pending');
         }

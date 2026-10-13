@@ -247,9 +247,44 @@ test('pushes while a review of new commits waits are covered by it', async () =>
   assert.equal(sent.length, 1);
   assert.equal(store.autoReviews.get(`${REPO}#7`), 1, 'no round used');
   assert.equal(store.slotsTaken, 1, 'no budget used');
-  assert.ok(store.keys.has(`${REPO}#7#ccc`), 'the key stays claimed: the waiting review covers this head');
-  assert.deepEqual(store.released, []);
+  assert.deepEqual(store.released, [`${REPO}#7#ccc`], 'the key is released in case the waiting review is not queued after all');
+  assert.equal(store.keys.has(`${REPO}#7#ccc`), false);
   assert.equal(store.pending.get(`${REPO}#7`), 'pending-1');
+  assert.equal(body(await handler(delivery('pull_request', push('ccc')))).skipped, 'auto-review-pending', 'a redelivery joins again');
+});
+
+test('a push skipped behind a review that then fails to queue is reviewed on redelivery', async () => {
+  // The first push holds the marker while its send is still in flight;
+  // the second push arrives in that window and is skipped.
+  let failSend;
+  const sent = [];
+  const { handler, store } = setup({
+    sendMessage: async (queueUrl, b, attributes, options) => {
+      if (b.head_sha === 'bbb') {
+        await new Promise((resolve) => { failSend = resolve; });
+        throw new Error('queue unavailable');
+      }
+      sent.push({ b, options });
+    },
+  });
+  const original = console.error;
+  console.error = () => {};
+  try {
+    const first = handler(delivery('pull_request', push('bbb')));
+    while (!failSend) await new Promise((resolve) => setImmediate(resolve));
+    assert.equal(body(await handler(delivery('pull_request', push('ccc')))).skipped, 'auto-review-pending');
+    failSend();
+    assert.equal((await first).statusCode, 500);
+  } finally {
+    console.error = original;
+  }
+  assert.equal(store.pending.size, 0, 'the failed review gave its marker back');
+
+  const resp = await handler(delivery('pull_request', push('ccc')));
+  assert.equal(body(resp).enqueued, `${REPO}#7#ccc`, 'not dropped as a duplicate');
+  assert.equal(sent.length, 1);
+  assert.equal(sent[0].b.head_sha, 'ccc');
+  assert.equal(store.autoReviews.get(`${REPO}#7`), 1);
 });
 
 test('once the worker starts the waiting review, the next push starts the next round, up to the cap', async () => {
