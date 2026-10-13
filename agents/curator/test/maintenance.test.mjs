@@ -757,7 +757,7 @@ test('a repo check with pull requests on proposes code-generated text only', asy
   assert.equal(p.baseSha, 'c'.repeat(40));
   assert.equal(p.baseContent, REPO_FILE);
   assert.ok(p.newContent.includes(`${EDIT.original}\n<!-- /suppressed -->\n${EDIT.replacement}`));
-  assert.match(p.summary, /`emptyDB` is now `emptyData`/);
+  assert.equal(p.summary, `The release check of valkey-io/valkey at 9.1.2 (unstable@${TIP_SHA.slice(0, 12)}) found 1 stale piece(s) in agents/valkey-review/config/skill.md:\n- \`emptyDB\` is now \`emptyData\``);
   assert.equal(p.summary.includes('MODEL'), false);
   assert.deepEqual(p.evidence, [`valkey-io/valkey@${TIP_SHA}:src/db.c:1`]);
   const item = s.table.item(REPO_SKILL_KEY);

@@ -1132,12 +1132,17 @@ function addedBlocks(previous: string, next: string): SuppressedBlock[] {
   return listSuppressedBlocks(next).filter((b) => !old.has(key(b)));
 }
 
-/** The pull request's summary and evidence, generated from the validated blocks only. */
-function proposalText(c: Checked, path_: string, blocks: readonly SuppressedBlock[]): { summary: string; evidence: string[] } {
-  const reasons = blocks.map((b) => b.reason);
-  const summary = `The release check of ${c.upstream} at ${c.label} (${c.ref}) found ${blocks.length} stale piece(s) in ${path_}: ${reasons.join('; ')}`;
+/** Lines of a proposal's summary; each block's reason is at most 300 characters. */
+const SUMMARY_LINES_MAX = 20;
+
+/** The pull request's summary and evidence, generated from the validated blocks only: no model text. */
+function proposalText(c: Checked, file: string, blocks: readonly SuppressedBlock[]): { summary: string; evidence: string[] } {
+  const lines = [
+    `The release check of ${c.upstream} at ${c.label} (${c.ref}) found ${blocks.length} stale piece(s) in ${file}:`,
+    ...blocks.slice(0, SUMMARY_LINES_MAX).map((b) => `- ${b.reason}`),
+  ];
   const evidence = [...new Set(blocks.flatMap((b) => b.evidence.map(formatCitation)))];
-  return { summary: summary.slice(0, 2_000), evidence };
+  return { summary: lines.join('\n'), evidence };
 }
 
 async function* repoCheck(run: Run, req: RepoCheckRequest): AsyncGenerator<StreamFrame, MaintenanceResult> {
