@@ -85,15 +85,86 @@ function stripFrontmatter(skillMd: string): string {
   return end < 0 ? skillMd : lines.slice(end + 1).join('\n');
 }
 
+/*
+ * A release check that finds a stale piece of a skill keeps it in place
+ * between suppression markers and adds the replacement after them:
+ *
+ *   <!-- suppressed: superseded in <tag>, <YYYY-MM-DD>; <reason>; evidence: <repo>@<sha>:<path>:<line> -->
+ *   <the original piece>
+ *   <!-- /suppressed -->
+ *   <the replacement>
+ *
+ * The piece can still hold on release lines older than <tag>, so it stays
+ * for backport reviews, labelled so it is not applied to the current
+ * head. Only the tag reaches the label; the reason and evidence are for
+ * maintainers reading the record.
+ */
+const CITATION = String.raw`[\w.-]+/[\w.-]+@[0-9a-f]{7,40}:[^\s,]+:\d+`;
+const SUPPRESSED_OPEN_RE = new RegExp(
+  String.raw`^(\s*)<!-- suppressed: superseded in ([A-Za-z0-9][\w.+/@-]{0,63}), \d{4}-\d{2}-\d{2}; (?:(?!-->).)+; evidence: ${CITATION}(?:, ${CITATION})* -->\s*$`,
+);
+const SUPPRESSED_CLOSE_RE = /^(\s*)<!-- \/suppressed -->\s*$/;
+
+function suppressedOpenLabel(tag: string): string {
+  return `**Superseded in ${tag}.** The text from here to "End of superseded text" describes code before ${tag}. `
+    + 'It can still hold on older release lines, so it matters for backports to them; do not apply it to the current head.';
+}
+
+const SUPPRESSED_CLOSE_LABEL = '**End of superseded text.**';
+
+/**
+ * Labels for the marker lines of each well-formed suppressed block, by
+ * line index. A block is an open marker and the next close marker, both
+ * outside fenced blocks. Markers that do not pair up, or do not have the
+ * exact form, are left as written.
+ */
+function suppressedLabels(lines: readonly string[], fenced: readonly boolean[]): Map<number, string> {
+  const labels = new Map<number, string>();
+  let open: { at: number; indent: string; tag: string } | null = null;
+  for (let i = 0; i < lines.length; i++) {
+    if (fenced[i]) continue;
+    const opening = SUPPRESSED_OPEN_RE.exec(lines[i]);
+    if (opening) {
+      // Suppression does not nest: a second open marker leaves the first unpaired.
+      open = { at: i, indent: opening[1], tag: opening[2] };
+      continue;
+    }
+    const closing = SUPPRESSED_CLOSE_RE.exec(lines[i]);
+    if (closing && open) {
+      labels.set(open.at, open.indent + suppressedOpenLabel(open.tag));
+      labels.set(i, closing[1] + SUPPRESSED_CLOSE_LABEL);
+      open = null;
+    }
+  }
+  return labels;
+}
+
+function rewriteLines(markdown: string, demoteHeadings: boolean): string {
+  const lines = markdown.split('\n');
+  const fenced = fencedLines(lines);
+  const labels = suppressedLabels(lines, fenced);
+  return lines
+    .map((line, i) => labels.get(i) ?? (demoteHeadings && !fenced[i] ? line.replace(HEADING_RE, '$1#$2') : line))
+    .join('\n');
+}
+
+/**
+ * Replace the suppression markers in skill markdown with labels that
+ * say which release superseded the piece. For skill text that goes into
+ * a prompt as it is, such as the baked-in skill file.
+ */
+export function labelSuppressedPieces(markdown: string): string {
+  return rewriteLines(markdown, false);
+}
+
 /**
  * A skill's body as it sits under its own `##` heading: no frontmatter,
- * and its headings one level down, so its `## Patterns` does not read
- * as a sibling of the skill. Lines in fenced blocks are left alone.
+ * its headings one level down, so its `## Patterns` does not read as a
+ * sibling of the skill, and its superseded pieces labelled. Lines in
+ * fenced blocks are left alone.
  */
 function renderSkillBody(skillMd: string): string {
-  const lines = stripFrontmatter(skillMd).split('\n');
-  const fenced = fencedLines(lines);
-  return lines.map((line, i) => (fenced[i] ? line : line.replace(HEADING_RE, '$1#$2'))).join('\n').trim();
+  return rewriteLines(stripFrontmatter(skillMd), true).trim();
 }
 
 /** The description on one line, without the record id sentence that means nothing to a reviewer. */

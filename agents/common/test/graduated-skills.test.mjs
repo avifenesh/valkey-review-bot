@@ -3,7 +3,7 @@ import test from 'node:test';
 import { AgentRegistryControlClient } from '@aws-sdk/client-agent-registry-control';
 import './support/ts-resolve.mjs';
 
-const { loadGraduatedSkills, renderGraduatedSkills } = await import('../src/graduated-skills.ts');
+const { labelSuppressedPieces, loadGraduatedSkills, renderGraduatedSkills } = await import('../src/graduated-skills.ts');
 const { GRADUATED_SKILL_MAX_CHARS } = await import('../src/skills-registry.ts');
 
 /** Answers list and get calls from `records`, like the registry control plane. */
@@ -133,4 +133,80 @@ test('headings in fenced blocks are left alone', () => {
 test('markdown without a complete frontmatter block is kept whole', () => {
   const out = renderGraduatedSkills([skill({ skillMd: '---\nname: broken\n## Use when\nbody' })]);
   assert.ok(out.includes('---\nname: broken\n### Use when\nbody'));
+});
+
+const SHA = '0eb4ba3c1d2e4f5a6b7c8d9e0f1a2b3c4d5e6f7a';
+const openMarker = (tag = '9.1.2', evidence = `valkey-io/valkey@${SHA}:src/db.c:512`) =>
+  `<!-- suppressed: superseded in ${tag}, 2026-10-13; emptyDB was renamed to emptyData; evidence: ${evidence} -->`;
+const CLOSE = '<!-- /suppressed -->';
+const openLabel = (tag) => `**Superseded in ${tag}.** The text from here to "End of superseded text" describes code before ${tag}. `
+  + 'It can still hold on older release lines, so it matters for backports to them; do not apply it to the current head.';
+const CLOSE_LABEL = '**End of superseded text.**';
+
+const bodyOf = (skillMd) => renderGraduatedSkills([skill({ skillMd })]);
+
+test('a suppressed piece is kept, labelled with the release that superseded it, before its replacement', () => {
+  const piece = ['- `emptyDB(-1, EMPTYDB_NO_FLAGS, NULL)` clears every database;  ', '  callers pass `EMPTYDB_ASYNC` to free in the background.'];
+  const md = ['## Patterns', 'Before.', openMarker(), ...piece, CLOSE, '- `emptyData(-1, EMPTYDB_NO_FLAGS, NULL)` clears every database.', 'After.'].join('\n');
+  const out = bodyOf(md);
+  assert.ok(out.includes(['### Patterns', 'Before.', openLabel('9.1.2'), ...piece, CLOSE_LABEL, '- `emptyData(-1, EMPTYDB_NO_FLAGS, NULL)` clears every database.', 'After.'].join('\n')));
+  assert.doesNotMatch(out, /<!--|-->|renamed to|evidence|valkey-io\/valkey@/);
+});
+
+test('every suppressed block in a skill gets its own label, and headings inside are demoted', () => {
+  const md = [
+    openMarker('v2.5.3', `valkey-io/valkey-glide@${SHA.slice(0, 12)}:glide-core/src/client/mod.rs:88, valkey-io/valkey-glide@${SHA}:glide-core/src/lib.rs:7`),
+    '## Old heading',
+    CLOSE,
+    '## New heading',
+    '',
+    `  ${openMarker('9.0.6')}  `,
+    '  - old item',
+    `  ${CLOSE}`,
+    '  - new item',
+  ].join('\n');
+  assert.ok(bodyOf(md).includes([
+    openLabel('v2.5.3'), '### Old heading', CLOSE_LABEL, '### New heading', '', `  ${openLabel('9.0.6')}`, '  - old item', `  ${CLOSE_LABEL}`, '  - new item',
+  ].join('\n')));
+});
+
+test('suppression markers that do not pair up or do not have the exact form are left as written', () => {
+  const cases = [
+    // an open marker with no close
+    [openMarker(), 'old', 'new'],
+    // a close marker with no open
+    ['old', CLOSE, 'new'],
+    // markers inside a fenced block are text
+    ['```', openMarker(), 'old', CLOSE, '```'],
+    // a close inside a fence does not end a block opened outside it
+    [openMarker(), '```', CLOSE, '```', 'new'],
+    // no evidence, a bad date, a tag with a space, a placeholder
+    ['<!-- suppressed: superseded in 9.1.2, 2026-10-13; renamed -->', 'old', CLOSE],
+    [openMarker().replace('2026-10-13', '13-10-2026'), 'old', CLOSE],
+    [openMarker('9.1.2 beta'), 'old', CLOSE],
+    [openMarker('9.1.2', 'valkey-io/valkey@<sha>:src/db.c:512'), 'old', CLOSE],
+    ['<!-- suppressed: superseded in <release tag>, <YYYY-MM-DD>; <one-line reason>; evidence: <upstream repo>@<commit sha>:<path>:<line> -->', 'old', CLOSE],
+    // a reason that would end the comment early
+    [openMarker().replace('was renamed', 'was --> renamed'), 'old', CLOSE],
+  ];
+  for (const lines of cases) {
+    const md = lines.join('\n');
+    const out = bodyOf(md);
+    assert.ok(out.includes(md), md);
+    assert.doesNotMatch(out, /Superseded in|End of superseded text/, md);
+  }
+});
+
+test('suppression does not nest: a second open marker leaves the first one as written', () => {
+  const md = [openMarker('9.0.6'), 'outer', openMarker('9.1.2'), 'inner', CLOSE, 'new'].join('\n');
+  assert.ok(bodyOf(md).includes([openMarker('9.0.6'), 'outer', openLabel('9.1.2'), 'inner', CLOSE_LABEL, 'new'].join('\n')));
+});
+
+test('labelSuppressedPieces labels markers in skill text without touching anything else', () => {
+  const md = ['# Valkey PR Reviewer Skill', '', '## Subsystem patterns', openMarker(), '`src/dict.c` holds the dict.', CLOSE, '`src/hashtable.c` holds it.', '```', CLOSE, '```'].join('\n');
+  assert.equal(labelSuppressedPieces(md), [
+    '# Valkey PR Reviewer Skill', '', '## Subsystem patterns', openLabel('9.1.2'), '`src/dict.c` holds the dict.', CLOSE_LABEL, '`src/hashtable.c` holds it.', '```', CLOSE, '```',
+  ].join('\n'));
+  const plain = '---\nname: x\n---\n## Use when\nbody';
+  assert.equal(labelSuppressedPieces(plain), plain);
 });
