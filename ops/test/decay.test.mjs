@@ -10,6 +10,7 @@ const DAY = 24 * 3600;
 const HALF_LIFE = 30 * DAY;
 const NOW = Date.parse('2026-06-01T00:00:00.000Z');
 const daysAgo = (n) => new Date(NOW - n * DAY * 1000).toISOString();
+const QUEUE = 'https://sqs.us-east-1.amazonaws.com/123456789012/curator';
 const CONFIG = { tables: { 'valkey-review': 'concerns' }, halfLifeSeconds: HALF_LIFE, floor: 0.05 };
 const GRADUATED_HALF_LIFE = 180 * DAY;
 const LIFECYCLE = { ...CONFIG, graduatedHalfLifeSeconds: GRADUATED_HALF_LIFE };
@@ -37,30 +38,36 @@ test('an unreinforced record crosses the 0.05 floor after about 130 days', () =>
 
 test('configuration is validated', () => {
   const tables = '{"valkey-review":"t1"}';
-  assert.deepEqual(loadDecayConfig({ CONCERNS_TABLES_JSON: tables }), {
+  const base = { CONCERNS_TABLES_JSON: tables, CURATOR_QUEUE_URL: QUEUE };
+  assert.deepEqual(loadDecayConfig(base), {
     tables: { 'valkey-review': 't1' },
     halfLifeSeconds: HALF_LIFE,
     floor: 0.05,
     graduatedHalfLifeSeconds: GRADUATED_HALF_LIFE,
     upstreamRepos: {},
-    curatorQueueUrl: '',
-    checksPerDay: 0,
+    curatorQueueUrl: QUEUE,
+    checksPerDay: 10,
     recheckSeconds: 90 * DAY,
     retireSkills: false,
     maxRetirementsPerDay: 3,
   });
-  assert.equal(loadDecayConfig({ CONCERNS_TABLES_JSON: tables, DECAY_HALF_LIFE_SECONDS: '86400' }).halfLifeSeconds, 86400);
+  // Checks are on by default, so the queue is required unless they are turned off.
+  assert.throws(() => loadDecayConfig({ CONCERNS_TABLES_JSON: tables }), /CURATOR_QUEUE_URL is required when SKILL_CHECKS_PER_DAY is above 0 \(default 10\)/);
+  const off = loadDecayConfig({ CONCERNS_TABLES_JSON: tables, SKILL_CHECKS_PER_DAY: '0' });
+  assert.equal(off.checksPerDay, 0);
+  assert.equal(off.curatorQueueUrl, '');
+  assert.equal(loadDecayConfig({ ...base, DECAY_HALF_LIFE_SECONDS: '86400' }).halfLifeSeconds, 86400);
   assert.throws(() => loadDecayConfig({}), /CONCERNS_TABLES_JSON is required/);
   assert.throws(() => loadDecayConfig({ CONCERNS_TABLES_JSON: '[]' }), /JSON object/);
   assert.throws(() => loadDecayConfig({ CONCERNS_TABLES_JSON: '{"a":""}' }), /table name/);
   for (const bad of ['0', '-5', 'abc', 'Infinity']) {
-    assert.throws(() => loadDecayConfig({ CONCERNS_TABLES_JSON: tables, DECAY_HALF_LIFE_SECONDS: bad }), /DECAY_HALF_LIFE_SECONDS/, bad);
+    assert.throws(() => loadDecayConfig({ ...base, DECAY_HALF_LIFE_SECONDS: bad }), /DECAY_HALF_LIFE_SECONDS/, bad);
   }
-  assert.throws(() => loadDecayConfig({ CONCERNS_TABLES_JSON: tables, DECAY_FLOOR: '1' }), /below 1/);
-  assert.throws(() => loadDecayConfig({ CONCERNS_TABLES_JSON: tables, DECAY_FLOOR: 'x' }), /DECAY_FLOOR/);
-  assert.equal(loadDecayConfig({ CONCERNS_TABLES_JSON: tables, DECAY_GRADUATED_HALF_LIFE_SECONDS: '7776000' }).graduatedHalfLifeSeconds, 90 * DAY);
+  assert.throws(() => loadDecayConfig({ ...base, DECAY_FLOOR: '1' }), /below 1/);
+  assert.throws(() => loadDecayConfig({ ...base, DECAY_FLOOR: 'x' }), /DECAY_FLOOR/);
+  assert.equal(loadDecayConfig({ ...base, DECAY_GRADUATED_HALF_LIFE_SECONDS: '7776000' }).graduatedHalfLifeSeconds, 90 * DAY);
   for (const bad of ['0', '-1', 'soon']) {
-    assert.throws(() => loadDecayConfig({ CONCERNS_TABLES_JSON: tables, DECAY_GRADUATED_HALF_LIFE_SECONDS: bad }), /DECAY_GRADUATED_HALF_LIFE_SECONDS/, bad);
+    assert.throws(() => loadDecayConfig({ ...base, DECAY_GRADUATED_HALF_LIFE_SECONDS: bad }), /DECAY_GRADUATED_HALF_LIFE_SECONDS/, bad);
   }
 });
 
@@ -269,7 +276,6 @@ test('the scan projects exactly the attributes the pass reads', async () => {
 
 // Skill maintenance: retire and check requests on the curator queue.
 
-const QUEUE = 'https://sqs.us-east-1.amazonaws.com/123456789012/curator';
 const FULL = {
   ...LIFECYCLE,
   upstreamRepos: { 'valkey-review': 'valkey-io/valkey' },
@@ -681,7 +687,7 @@ test('skill maintenance settings are validated', () => {
   assert.deepEqual(loadDecayConfig({ ...base, UPSTREAM_REPOS_JSON: '{}', RETIRE_SKILLS: 'false', SKILL_CHECKS_PER_DAY: '0' }).upstreamRepos, {});
 
   assert.throws(() => loadDecayConfig({ ...base, SKILL_CHECKS_PER_DAY: '1' }), /CURATOR_QUEUE_URL is required/);
-  assert.throws(() => loadDecayConfig({ ...base, RETIRE_SKILLS: 'true' }), /CURATOR_QUEUE_URL is required/);
+  assert.throws(() => loadDecayConfig({ ...base, SKILL_CHECKS_PER_DAY: '0', RETIRE_SKILLS: 'true' }), /CURATOR_QUEUE_URL is required/);
   for (const bad of ['-1', '1.5', 'ten']) {
     assert.throws(() => loadDecayConfig({ ...on, SKILL_CHECKS_PER_DAY: bad }), /SKILL_CHECKS_PER_DAY must be an integer of at least 0/, bad);
   }

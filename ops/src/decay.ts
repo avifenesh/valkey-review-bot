@@ -73,6 +73,7 @@ const DEFAULT_HALF_LIFE_SECONDS = 30 * DAY_SECONDS;
 const DEFAULT_GRADUATED_HALF_LIFE_SECONDS = 180 * DAY_SECONDS;
 const DEFAULT_FLOOR = 0.05;
 const DEFAULT_RECHECK_SECONDS = 90 * DAY_SECONDS;
+const DEFAULT_CHECKS_PER_DAY = 10;
 const DEFAULT_MAX_RETIREMENTS_PER_DAY = 3;
 
 /** A maintenance request younger than this is in flight: the record gets no new one. */
@@ -144,12 +145,13 @@ export function loadDecayConfig(env: Env): DecayConfig {
   const floor = positiveNumber(env, 'DECAY_FLOOR', DEFAULT_FLOOR);
   if (floor >= 1) throw new Error(`DECAY_FLOOR must be below 1, got ${floor}`);
 
-  // Off unless the deployment turns them on, so the job runs without a queue.
-  const checksPerDay = integerSetting(env, 'SKILL_CHECKS_PER_DAY', 0, 0);
+  // Checks are on by default, so the queue is required unless the
+  // deployment sets SKILL_CHECKS_PER_DAY=0 (and leaves RETIRE_SKILLS off).
+  const checksPerDay = integerSetting(env, 'SKILL_CHECKS_PER_DAY', DEFAULT_CHECKS_PER_DAY, 0);
   const retireSkills = booleanSetting(env, 'RETIRE_SKILLS');
   const curatorQueueUrl = env.CURATOR_QUEUE_URL?.trim() ?? '';
   if ((checksPerDay > 0 || retireSkills) && !curatorQueueUrl) {
-    throw new Error('env CURATOR_QUEUE_URL is required when SKILL_CHECKS_PER_DAY is above 0 or RETIRE_SKILLS is true');
+    throw new Error(`env CURATOR_QUEUE_URL is required when SKILL_CHECKS_PER_DAY is above 0 (default ${DEFAULT_CHECKS_PER_DAY}) or RETIRE_SKILLS is true`);
   }
 
   return {
