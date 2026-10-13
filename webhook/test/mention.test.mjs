@@ -330,17 +330,51 @@ function threadReplyGitHub(parentAuthor) {
   });
 }
 
-test('a thread reply in a thread this App started checks the fix against its comment', async () => {
+test('a thread reply in a thread this App started is answered against its comment', async () => {
   const m = detectMention('pull_request_review_comment', reviewComment('@example-reviewer fixed, please re-check', { in_reply_to_id: 150 }), opts);
   const { deps, enqueued } = mentionDeps(threadReplyGitHub(BOT));
   await handleMention(m, target, deps);
   const [envelope] = enqueued;
-  assert.match(envelope.instruction, /re-review request/);
+  assert.match(envelope.instruction, /^This is a reply to you in a review thread\./);
   assert.match(envelope.instruction, /> This leaks the buffer on the error path\./);
   assert.match(envelope.instruction, /comment on "src\/server\.c" line 40:/);
   assert.equal(envelope.trigger_path, 'src/server.c');
   assert.equal(envelope.trigger_line, 40);
   assert.equal(envelope.run_nonce, 'm202');
+});
+
+test('the thread-reply instruction covers fix claims, disputes and questions', async () => {
+  const replies = [
+    'fixed, please re-check',
+    'this is not a leak, the caller frees the buffer',
+    'why does the error path leak the buffer?',
+  ];
+  for (const reply of replies) {
+    const m = detectMention('pull_request_review_comment', reviewComment(`@example-reviewer ${reply}`, { in_reply_to_id: 150 }), opts);
+    const { deps, enqueued } = mentionDeps(threadReplyGitHub(BOT));
+    await handleMention(m, target, deps);
+    const { instruction } = enqueued[0];
+    assert.ok(instruction.includes(`\n@maintainer replied: ${reply}\n`), reply);
+    assert.match(instruction, /If it says the concern is fixed, verify the fix: confirm it, or say exactly what remains\./);
+    assert.match(instruction, /If it disputes the concern or explains why the code is correct, re-check your claim against the code: if the reply is right, say so and withdraw the finding; if not, show the evidence\./);
+    assert.match(instruction, /If it asks a question, answer it from the code\./);
+    assert.match(instruction, /never act as the author or apply changes\.$/);
+  }
+});
+
+test('a bare tag in a thread this App started asks for the fix to be checked', async () => {
+  let screened = false;
+  const m = detectMention('pull_request_review_comment', reviewComment('@example-reviewer', { in_reply_to_id: 150 }), opts);
+  const { deps, enqueued } = mentionDeps(threadReplyGitHub(BOT), { approveInstruction: async () => { screened = true; return { allow: true, reason: '' }; } });
+  await handleMention(m, target, deps);
+  assert.match(enqueued[0].instruction, /\n@maintainer replied: \(asked you to check the fix\)\n/);
+  assert.equal(screened, false, 'no requester text to screen');
+});
+
+test('the safety gate is told that disputing a finding is review text', async () => {
+  const client = fakeBedrock(() => converseReply('{"verdict":"allow","reason":"ok"}'));
+  await createSafetyGate({ client, modelId: 'm' })('this is not a leak, the caller frees the buffer');
+  assert.match(client.calls[0].input.system[0].text, /ALLOW replies to the bot's review comments that say a concern is fixed, argue that a finding is wrong, or ask about it\./);
 });
 
 test('a thread reply in another bot\'s thread is an ordinary summons', async () => {
