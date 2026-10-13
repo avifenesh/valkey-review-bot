@@ -162,18 +162,45 @@ test('every write is also conditioned on the decay_score as read, or its absence
   for (const w of ddb.writes) assert.equal(w.input.ExpressionAttributeNames['#ds'], 'decay_score');
 });
 
+/**
+ * Whether a write's ConditionExpression holds for `item`. Supports what
+ * the decay pass writes: clauses of `#a = :v`, attribute_exists(#a) and
+ * attribute_not_exists(#a) joined by AND. Anything else throws, so a new
+ * form of condition cannot pass unevaluated.
+ */
+function conditionHolds(input, item) {
+  const names = input.ExpressionAttributeNames ?? {};
+  const values = input.ExpressionAttributeValues ?? {};
+  const attr = (ref) => {
+    assert.ok(ref in names, `${ref} is not in ExpressionAttributeNames`);
+    return names[ref];
+  };
+  return input.ConditionExpression.split(' AND ').every((clause) => {
+    let m;
+    if ((m = /^(#\w+) = (:\w+)$/.exec(clause))) {
+      assert.ok(m[2] in values, `${m[2]} is not in ExpressionAttributeValues`);
+      return item[attr(m[1])] === values[m[2]];
+    }
+    if ((m = /^attribute_not_exists\((#\w+)\)$/.exec(clause))) return !(attr(m[1]) in item);
+    if ((m = /^attribute_exists\((#\w+)\)$/.exec(clause))) return attr(m[1]) in item;
+    throw new Error(`unsupported condition clause: ${clause}`);
+  });
+}
+
+const conditionalFailure = () => Object.assign(new Error('The conditional request failed'), { name: 'ConditionalCheckFailedException' });
+
 test('a record the curator re-scored after the scan is skipped', async () => {
-  const ddb = fakeDdb(
-    [[{ area_bucket: 'src', record_id: 'penalised', decay_score: 1, updated_at: daysAgo(30), decayed_at: daysAgo(1) }]],
-    (_op, input) => {
-      // The curator lowered the score to 0.4 between the scan and the write.
-      if (input.ExpressionAttributeValues[':ds'] !== 0.4) {
-        throw Object.assign(new Error('conditional'), { name: 'ConditionalCheckFailedException' });
-      }
-      return {};
-    },
-  );
+  const scanned = { area_bucket: 'src', record_id: 'penalised', decay_score: 1, updated_at: daysAgo(30), decayed_at: daysAgo(1) };
+  // The curator lowered the score to 0.4 between the scan and the write;
+  // updated_at and decayed_at are unchanged.
+  const stored = { ...scanned, decay_score: 0.4 };
+  const ddb = fakeDdb([[scanned]], (_op, input) => {
+    if (!conditionHolds(input, stored)) throw conditionalFailure();
+    return {};
+  });
   const stats = await decayTable(ddb, 'concerns', CONFIG, NOW);
+  assert.equal(ddb.writes.length, 1);
+  assert.equal(ddb.writes[0].input.ExpressionAttributeValues[':ds'], 1, 'the write expects the score the scan read');
   assert.equal(stats.skipped, 1);
   assert.equal(stats.decayed, 0);
 });
