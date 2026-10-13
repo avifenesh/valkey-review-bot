@@ -193,6 +193,14 @@ describe('curator role', () => {
     expect(statements.flatMap(actionsOf).filter((a) => a.startsWith('secretsmanager:'))).toEqual([]);
   });
 
+  test('the curator runtime is updated only after its prompts are uploaded', () => {
+    const t = s.template(s.stacks.curator);
+    const runtime = Object.values<any>(t.findResources('AWS::BedrockAgentCore::Runtime'))[0];
+    const uploads = Object.keys(t.findResources('Custom::CDKBucketDeployment')).filter((id) => id.startsWith('CuratorAssets'));
+    expect(uploads.length).toBe(1);
+    expect(runtime.DependsOn).toEqual(expect.arrayContaining(uploads));
+  });
+
   test('each runtime uses the role defined in its own stack', () => {
     for (const stack of [s.stacks.reviewers.get('valkey-review')!, s.stacks.reviewers.get('valkey-glide-review')!, s.stacks.curator]) {
       const t = s.template(stack);

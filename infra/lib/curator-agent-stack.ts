@@ -75,7 +75,7 @@ export class CuratorAgentStack extends cdk.Stack {
         throw new Error(`curator ${name} must be in the same directory as promptPath (got ${file} and ${promptDir})`);
       }
     }
-    new s3deploy.BucketDeployment(this, 'CuratorAssets', {
+    const assets = new s3deploy.BucketDeployment(this, 'CuratorAssets', {
       sources: [
         s3deploy.Source.asset(promptDir, {
           exclude: ['*', `!${promptBasename}`, `!${skillBasename}`, `!${checkPromptBasename}`],
@@ -181,6 +181,9 @@ export class CuratorAgentStack extends cdk.Stack {
     // The service checks image access when it creates the runtime, so the
     // role's policies must exist first.
     this.runtime.node.addDependency(this.role);
+    // The runtime reads curator/skill-check.md at boot; update it only after
+    // the upload, so a new version never boots before its prompt exists.
+    this.runtime.node.addDependency(assets);
 
     new cdk.CfnOutput(this, 'CuratorRuntimeArn', {
       value: this.runtime.attrAgentRuntimeArn,
