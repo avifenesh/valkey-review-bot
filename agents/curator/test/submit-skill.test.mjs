@@ -780,7 +780,7 @@ const revising = (requestedAt) => ({
   maintenance_requested_at: requestedAt,
   maintenance_reason: 'check',
 });
-/** The revise run's first write, as ops/src/decay.ts states it. */
+/** The condition of a revise run's first write: its own claim, and the name it checked. */
 const reviseClaim = (id = CHECK_ID) => ({
   ConditionExpression: '#mid = :id AND #grn = :name',
   ExpressionAttributeNames: { '#mid': 'maintenance_id', '#grn': 'graduated_record_name' },
