@@ -456,7 +456,7 @@ export interface Stats {
   readonly wouldRetire: number;
   /** Candidates over a per-pass cap; they are due again at the next pass. */
   readonly deferred: number;
-  /** Retirement candidates left alone because the curator refused their retirement lately. */
+  /** Records below the floor not requested for retirement because the curator refused it lately; they can still get checks. */
   readonly retireBackoff: number;
   /** Items in reserved buckets other than REPO_SKILL_KEY, left unwritten. */
   readonly reserved: number;
