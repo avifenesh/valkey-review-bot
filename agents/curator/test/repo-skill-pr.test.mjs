@@ -217,7 +217,6 @@ function deps(gh, over = {}) {
     baseBranch: 'main',
     getToken: async () => { tokens++; return TOKEN; },
     fetch: gh.fetch,
-    now: () => new Date('2026-10-13T08:00:00Z'),
     ...over,
   };
   Object.defineProperty(d, 'tokens', { get: () => tokens });
@@ -346,6 +345,59 @@ test('new edits for the same release rebuild the branch and update the open pull
   assert.match(gh.pulls[0].body, /`rdbLoad\*` is now `rdbLoadAll\*`/);
   assert.deepEqual(gh.writes().filter((c) => c.method === 'PATCH').map((c) => c.path),
     [`/repos/${REPO}/git/refs/heads/skill-check/valkey-review/9.1.2`, `/repos/${REPO}/pulls/1`]);
+});
+
+test('a retry finishes the pull request text an attempt that moved the branch did not write', async () => {
+  const gh = fakeGitHub();
+  const tip = gh.tip();
+  await proposeRepoSkillChange(proposal({ baseSha: tip }), deps(gh));
+  const more = edited(NEW, '`rdbLoad*` caller', '`rdbLoadAll*` caller', { ...CTX, flagged: ['rdbLoad*'] });
+  const p = proposal({
+    baseSha: tip,
+    newContent: more,
+    summary: '`emptyDB` is now `emptyData`; `rdbLoad*` is now `rdbLoadAll*`.',
+    evidence: [`valkey-io/valkey@${UPSTREAM_SHA}:src/server.h:10`, `valkey-io/valkey@${UPSTREAM_SHA}:src/rdb.h:42`],
+  });
+  const failing = async (url, init = {}) => (init.method === 'PATCH' && String(url).endsWith('/pulls/1')
+    ? json(502, { message: 'Server Error' })
+    : gh.fetch(url, init));
+  await assert.rejects(proposeRepoSkillChange(p, deps(gh, { fetch: failing })), /PATCH pulls\/1 returned 502/);
+  // The branch moved, the pull request still shows the first run's text.
+  assert.equal(gh.filesAt(gh.tip(BRANCH))[PATH], more);
+  assert.doesNotMatch(gh.pulls[0].body, /rdbLoadAll/);
+
+  const head = gh.tip(BRANCH);
+  assert.deepEqual(await proposeRepoSkillChange(p, deps(gh)), { action: 'updated', branch: BRANCH, url: `https://github.com/${REPO}/pull/1` });
+  assert.equal(gh.tip(BRANCH), head);
+  assert.match(gh.pulls[0].body, /`rdbLoad\*` is now `rdbLoadAll\*`/);
+  assert.match(gh.pulls[0].body, /src\/rdb\.h#L42/);
+  assert.equal(gh.pulls.length, 1);
+
+  // Once the text matches, a retry writes nothing, whatever the day.
+  const before = gh.writes().length;
+  assert.equal((await proposeRepoSkillChange(p, deps(gh))).action, 'unchanged');
+  assert.equal(gh.writes().length, before);
+});
+
+test('the pull request text is dated by the check\'s markers, not the clock', async () => {
+  const gh = fakeGitHub();
+  const newContent = edited(BASE, '`emptyDB` must', '`emptyData` must', { ...CTX, date: '2026-09-01' });
+  await proposeRepoSkillChange(proposal({ baseSha: gh.tip(), newContent }), deps(gh));
+  assert.match(gh.pulls[0].body, /release check of 2026-09-01,/);
+});
+
+test('a pull request title or body changed since is brought back to the proposal\'s text', async () => {
+  const gh = fakeGitHub();
+  const p = proposal({ baseSha: gh.tip() });
+  await proposeRepoSkillChange(p, deps(gh));
+  const text = { title: gh.pulls[0].title, body: gh.pulls[0].body };
+  // A body edited on the web comes back with CRLF; that alone is not a change.
+  gh.pulls[0].body = text.body.replaceAll('\n', '\r\n');
+  assert.equal((await proposeRepoSkillChange(p, deps(gh))).action, 'unchanged');
+  gh.pulls[0].title = 'Something else';
+  gh.pulls[0].body = 'Edited';
+  assert.equal((await proposeRepoSkillChange(p, deps(gh))).action, 'updated');
+  assert.deepEqual({ title: gh.pulls[0].title, body: gh.pulls[0].body }, text);
 });
 
 test('commits a maintainer added to the branch are never overwritten', async () => {

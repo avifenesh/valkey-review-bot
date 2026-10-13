@@ -35,8 +35,11 @@ import {
  *   it is left alone. One that holds something else is rebuilt, unless
  *   it has commits the check did not make (a maintainer's fixups), which
  *   are never overwritten;
- * - opens a pull request when none is open from the branch, and updates
- *   the open one's title and body when it rebuilt the branch;
+ * - opens a pull request when none is open from the branch, and brings
+ *   the open one's title and body to this proposal's text on every
+ *   attempt, so a run that moved the branch and failed before the text
+ *   is finished by its retry. The text is built from the proposal alone
+ *   (dated by its markers), so a retry finds nothing to change;
  * - never writes the base branch: the only ref it writes is the
  *   skill-check branch.
  * A retry after any partial run converges on the same branch and pull
@@ -69,8 +72,6 @@ export interface RepoSkillPrDeps {
   /** A token from the skills-repo broker (createSkillsRepoTokenSource). */
   readonly getToken: () => Promise<string>;
   readonly fetch?: typeof fetch;
-  /** The date shown in the pull request body. */
-  readonly now?: () => Date;
 }
 
 export type RepoSkillPrResult = {
@@ -305,7 +306,8 @@ export function insertionProblem(base: string, next: string, release: string): s
   return typeof derived === 'string' ? derived : null;
 }
 
-function proposalProblem(p: RepoSkillProposal): string | null {
+/** Why the proposal is refused, or its edits. */
+function checkProposal(p: RepoSkillProposal): DerivedEdits | string {
   const strings = [p.reviewerId, p.releaseLabel, p.path, p.baseSha, p.baseContent, p.newContent, p.summary];
   if (strings.some((s) => typeof s !== 'string') || !Array.isArray(p.evidence)) return 'the proposal is malformed';
   if (!REVIEWER_ID_RE.test(p.reviewerId)) return `reviewer id ${JSON.stringify(p.reviewerId)} is not valid`;
@@ -320,7 +322,7 @@ function proposalProblem(p: RepoSkillProposal): string | null {
   if (p.evidence.some((e) => typeof e !== 'string' || !e.trim() || e.length > EVIDENCE_MAX_CHARS || hasControl(e, false))) {
     return 'an evidence entry is empty, too long or not one line';
   }
-  return insertionProblem(p.baseContent, p.newContent, p.releaseLabel);
+  return deriveEdits(p.baseContent, p.newContent, p.releaseLabel);
 }
 
 interface ApiResponse {
@@ -436,7 +438,7 @@ function skillsRepo(api: Api, repo: string, baseBranch: string) {
       const head = encodeURIComponent(`${owner}:${branch}`);
       const r = await api('GET', `repos/${repo}/pulls?head=${head}&state=open&per_page=10`);
       if (r.status !== 200) throw apiError(`GET pulls from ${branch}`, r);
-      const pulls = Array.isArray(r.json) ? r.json as { number?: unknown; html_url?: unknown; head?: { ref?: unknown } }[] : [];
+      const pulls = Array.isArray(r.json) ? r.json as PullJson[] : [];
       const pr = pulls.find((x) => x.head?.ref === branch && Number.isInteger(x.number));
       return pr ? pull(pr) : null;
     },
@@ -446,7 +448,7 @@ function skillsRepo(api: Api, repo: string, baseBranch: string) {
       const r = await api('POST', `repos/${repo}/pulls`, { title, head: branch, base: baseBranch, body });
       if (r.status === 422) return r;
       if (r.status !== 201) throw apiError(`POST pulls from ${branch}`, r);
-      return pull(r.json as { number?: unknown; html_url?: unknown });
+      return pull(r.json as PullJson);
     },
     async updatePull(number: number, title: string, body: string): Promise<void> {
       const r = await api('PATCH', `repos/${repo}/pulls/${number}`, { title, body });
@@ -457,14 +459,31 @@ function skillsRepo(api: Api, repo: string, baseBranch: string) {
 
 type SkillsRepo = ReturnType<typeof skillsRepo>;
 
+interface PullJson {
+  readonly number?: unknown;
+  readonly html_url?: unknown;
+  readonly title?: unknown;
+  readonly body?: unknown;
+  readonly head?: { readonly ref?: unknown };
+}
+
 interface Pull {
   readonly number: number;
   readonly url?: string;
+  readonly title: string;
+  /** '' when GitHub has none. */
+  readonly body: string;
 }
 
-function pull(pr: { number?: unknown; html_url?: unknown }): Pull {
+function pull(pr: PullJson): Pull {
   const number = field(pr.number, 'pull request number', (v): v is number => Number.isInteger(v));
-  return typeof pr.html_url === 'string' && pr.html_url ? { number, url: pr.html_url } : { number };
+  const text = { title: typeof pr.title === 'string' ? pr.title : '', body: typeof pr.body === 'string' ? pr.body : '' };
+  return typeof pr.html_url === 'string' && pr.html_url ? { number, url: pr.html_url, ...text } : { number, ...text };
+}
+
+/** Whether the pull request shows this title and body; GitHub may store a body edited on the web with CRLF. */
+function showsText(pr: Pull, title: string, body: string): boolean {
+  return pr.title === title && pr.body.replace(/\r\n/g, '\n').trimEnd() === body.trimEnd();
 }
 
 function withUrl(result: RepoSkillPrResult, pr: Pull): RepoSkillPrResult {
@@ -504,8 +523,9 @@ export async function proposeRepoSkillChange(p: RepoSkillProposal, deps: RepoSki
   const named = typeof p.reviewerId === 'string' && REVIEWER_ID_RE.test(p.reviewerId)
     && typeof p.releaseLabel === 'string' && isReleaseLabel(p.releaseLabel);
   const branch = named ? repoSkillBranch(p.reviewerId, p.releaseLabel) : '';
-  const problem = proposalProblem(p) ?? (isRefName(branch) && branch !== deps.baseBranch ? null : `cannot use branch ${JSON.stringify(branch)}`);
-  if (problem) return { action: 'refused', branch, reason: problem };
+  const checked = checkProposal(p);
+  if (typeof checked === 'string') return { action: 'refused', branch, reason: checked };
+  if (!isRefName(branch) || branch === deps.baseBranch) return { action: 'refused', branch, reason: `cannot use branch ${JSON.stringify(branch)}` };
 
   const gh = skillsRepo(githubApi(await deps.getToken(), deps.fetch ?? fetch), deps.repo, deps.baseBranch);
   const tip = await gh.branchSha(deps.baseBranch);
@@ -533,7 +553,7 @@ export async function proposeRepoSkillChange(p: RepoSkillProposal, deps: RepoSki
     rebuilt = true;
   }
 
-  const body = prBody(p, (deps.now ?? (() => new Date()))().toISOString().slice(0, 10));
+  const body = prBody(p, checked.date);
   let open = await gh.openPull(branch);
   if (!open) {
     const created = await gh.createPull(branch, title, body);
@@ -542,9 +562,11 @@ export async function proposeRepoSkillChange(p: RepoSkillProposal, deps: RepoSki
     open = await gh.openPull(branch);
     if (!open) throw apiError(`POST pulls from ${branch}`, created);
   }
-  if (!rebuilt) return withUrl({ action: 'unchanged', branch }, open);
-  await gh.updatePull(open.number, title, body);
-  return withUrl({ action: 'updated', branch }, open);
+  // Whether or not this attempt moved the branch: an earlier one may have
+  // moved it and failed before the text, so the text is checked every time.
+  const retitled = !showsText(open, title, body);
+  if (retitled) await gh.updatePull(open.number, title, body);
+  return withUrl({ action: rebuilt || retitled ? 'updated' : 'unchanged', branch }, open);
 }
 
 /**
