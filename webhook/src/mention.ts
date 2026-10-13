@@ -246,6 +246,27 @@ const THREAD_REPLY_DIRECTIVE = [
 
 const MAX_THREAD_REPLY_CHARS = 6_000;
 const QUOTE_CUT = '\n> [comment truncated]';
+const MAX_PATH_CHARS = 300;
+
+/**
+ * finding.path as a JSON string of at most MAX_PATH_CHARS characters,
+ * escapes and quotes included. A longer name is cut and ends in an
+ * ellipsis inside the quotes, so the string stays well formed.
+ */
+function quotePath(path: string): string {
+  const quoted = JSON.stringify(path);
+  if (quoted.length <= MAX_PATH_CHARS) return quoted;
+  // The two quotes and the ellipsis.
+  let size = 3;
+  let kept = '';
+  for (const ch of path) {
+    const n = JSON.stringify(ch).length - 2;
+    if (size + n > MAX_PATH_CHARS) break;
+    kept += ch;
+    size += n;
+  }
+  return JSON.stringify(`${kept}\u2026`);
+}
 
 /**
  * The App's comment as a markdown quote of at most max characters. A
@@ -318,8 +339,10 @@ async function startRun(
   let instruction = requestText;
   if (finding) {
     // finding.path is a file name from the PR, so it is quoted as a JSON
-    // string rather than set in backticks the name could close.
-    const loc = finding.path ? `${JSON.stringify(finding.path)}${finding.line ? ` line ${finding.line}` : ''}` : 'the PR';
+    // string rather than set in backticks the name could close. It is
+    // also bounded, so even with the longest reply the quote has room
+    // and the directive is never cut.
+    const loc = finding.path ? `${quotePath(finding.path)}${finding.line ? ` line ${finding.line}` : ''}` : 'the PR';
     const opening = `This is a reply to you in a review thread. You left this review comment on ${loc}:`;
     const reply = `@${mention.actor} replied: ${requestText || '(asked you to check the fix)'}`;
     // Six newlines join the seven lines below.

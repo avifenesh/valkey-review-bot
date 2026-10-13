@@ -435,6 +435,32 @@ test('a long App comment is cut so the reply and the directive survive', async (
   assert.match(instruction, /never act as the author or apply changes\.$/);
 });
 
+test('a long file name is cut so the directive survives the longest reply', async () => {
+  const reply = 'the caller frees it '.repeat(250);
+  for (const path of [`src/${'deep/'.repeat(400)}server.c`, `src/${'\n'.repeat(1_000)}a.c`]) {
+    const github = fakeGitHub({
+      [`GET repos/${REPO}/collaborators/maintainer/permission`]: permission(true),
+      [`GET repos/${REPO}/pulls/7`]: openPr,
+      [`GET repos/${REPO}/pulls/comments/150`]: { status: 200, json: { body: 'short', user: { login: BOT, type: 'Bot' }, path, line: 40 } },
+      [`POST repos/${REPO}/issues/7/comments`]: ack,
+    });
+    const m = detectMention('pull_request_review_comment', reviewComment(`@example-reviewer ${reply}`, { in_reply_to_id: 150 }), opts);
+    const { deps, enqueued } = mentionDeps(github);
+    await handleMention(m, target, deps);
+    const { instruction } = enqueued[0];
+    assert.ok(instruction.length <= 6_000, `${instruction.length} characters`);
+    assert.ok(instruction.includes('\n\nAnswer the reply against the code at this location in the current PR head. '));
+    assert.match(instruction, /never act as the author or apply changes\.$/);
+    assert.ok(instruction.includes('\n\n> short\n\n@maintainer replied: '), 'a short comment is not marked truncated');
+    // The name stays one well-formed JSON string, cut with an ellipsis.
+    const quoted = instruction.match(/comment on ("(?:[^"\\]|\\.)*") line 40:\n/)[1];
+    assert.ok(quoted.length <= 300, `${quoted.length} characters`);
+    const shown = JSON.parse(quoted);
+    assert.ok(path.startsWith(shown.slice(0, -1)));
+    assert.ok(shown.endsWith('\u2026'));
+  }
+});
+
 test('a short App comment is quoted whole', async () => {
   const m = detectMention('pull_request_review_comment', reviewComment('@example-reviewer fixed, please re-check', { in_reply_to_id: 150 }), opts);
   const { deps, enqueued } = mentionDeps(threadReplyGitHub(BOT));
