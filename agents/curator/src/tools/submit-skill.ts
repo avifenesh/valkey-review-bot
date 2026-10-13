@@ -24,14 +24,37 @@ import { errorText, fail, ok } from './run.js';
  * same few seconds can still meet on one name.
  */
 
+/** A skill record in the reviewer's registry, as getSkillByName returns it. */
+export interface PublishedSkill {
+  readonly name: string;
+  readonly status: string;
+  readonly description: string;
+  readonly skillMd: string;
+}
+
 export interface SkillPublisher {
   upsert(input: UpsertSkillInput): Promise<{ action: 'created' | 'updated'; recordArn: string; status: string }>;
   /** Whether the registry has a skill record with exactly this name, in any status. */
   exists(name: string): Promise<boolean>;
+  /**
+   * The record with exactly this name, in any status, with its markdown;
+   * null when there is none. Optional until the runtime wires it
+   * (getSkillByName); without it get_skill reports that it cannot read
+   * the registry.
+   */
+  get?(name: string): Promise<PublishedSkill | null>;
 }
 
 export interface SubmitSkillDeps extends ConcernsDeps {
   readonly registry: SkillPublisher;
+}
+
+/** The provenance sentence submit_skill appends to every description, for operators. */
+const PROVENANCE_RE = /\s*Graduated from concern record_id=\S*\s*$/;
+
+/** A registry description without the provenance sentence, as the model writes it. */
+export function withoutProvenance(description: string): string {
+  return description.replace(PROVENANCE_RE, '');
 }
 
 const SLUG_MAX = 60;
@@ -155,7 +178,7 @@ Do not delete the source record afterwards; it stays as the skill's provenance.`
 
         const result = await deps.registry.upsert({
           name: recordName,
-          description: `${input.description}\n\nGraduated from concern record_id=${input.source_record_id}.`,
+          description: `${withoutProvenance(input.description)}\n\nGraduated from concern record_id=${input.source_record_id}.`,
           skillMd: withRecordName(input.skill_md, recordName),
         });
         published = true;

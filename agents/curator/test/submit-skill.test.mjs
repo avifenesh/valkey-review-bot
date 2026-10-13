@@ -223,3 +223,10 @@ test('submit_skill refuses a reserved area_bucket', async () => {
   assert.equal(published.length, 0);
   assert.equal(run.take('skill_submit', 'next'), null);
 });
+
+test('submit_skill adds the provenance sentence once, even to a description copied from get_skill', async () => {
+  const { submit, published } = setup({ item: { area_bucket: 'src', record_id: 'r1', reinforcement_count: 4 } });
+  const out = parse(await submit.invoke({ ...INPUT, description: `${INPUT.description}\n\nGraduated from concern record_id=r1.` }));
+  assert.equal(out.ok, true);
+  assert.equal(published[0].description, `${INPUT.description}\n\nGraduated from concern record_id=r1.`);
+});

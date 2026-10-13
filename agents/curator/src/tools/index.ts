@@ -2,6 +2,7 @@ import type { Tool } from '@strands-agents/sdk';
 import { buildConcernsTools } from './concerns-ddb.js';
 import { buildSubmitSkillTool, type SubmitSkillDeps } from './submit-skill.js';
 import { buildListSkillAuthoringTool, type SkillAuthoringDeps } from './skill-authoring.js';
+import { buildGetSkillTool } from './get-skill.js';
 import { buildCuratorDoneTool } from './done.js';
 
 /**
@@ -14,6 +15,7 @@ import { buildCuratorDoneTool } from './done.js';
  *   update_concern, merge_concerns,
  *   delete_concern                            change it, once per run
  *   list_skill_authoring                      skill-writing guidance, at graduation
+ *   get_skill                                 a graduated record's published skill
  *   submit_skill                              graduate a record to the reviewer's registry
  *   curator_done                              end the run
  */
@@ -21,6 +23,7 @@ export function assembleCuratorTools(deps: SubmitSkillDeps & { readonly authorin
   return [
     ...buildConcernsTools(deps),
     buildListSkillAuthoringTool(deps.authoring),
+    buildGetSkillTool(deps),
     buildSubmitSkillTool(deps),
     buildCuratorDoneTool(deps.run),
   ];

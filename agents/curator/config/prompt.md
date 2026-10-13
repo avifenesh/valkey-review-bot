@@ -60,6 +60,7 @@ Graduation:
 | Tool | What it does |
 |---|---|
 | `list_skill_authoring()` | The curator's own skill-writing guidance. Call it once at graduation, before writing skill_md. |
+| `get_skill(area_bucket, record_id)` | The skill a graduated record published, as the registry holds it now, retired or not. Read-only. |
 | `submit_skill(area_bucket, source_record_id, subject, description, skill_md)` | Publish or update the skill in the reviewer's registry. |
 
 Terminal:

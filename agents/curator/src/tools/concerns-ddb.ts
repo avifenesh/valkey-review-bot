@@ -210,9 +210,9 @@ async function oneWrite(
   }
 }
 
-const areaBucketField = z.string().min(1).max(200)
+export const areaBucketField = z.string().min(1).max(200)
   .describe('Partition key, e.g. "glide-core" or "src/replication.c"');
-const recordIdField = z.string().min(1).max(100);
+export const recordIdField = z.string().min(1).max(100);
 const areaField = z.array(z.string().min(1).max(300)).min(1).max(10)
   .describe('File-glob patterns the record applies to, e.g. ["glide-core/src/client/**"]');
 
