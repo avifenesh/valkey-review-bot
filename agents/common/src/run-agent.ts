@@ -7,7 +7,7 @@ import { loadEnv, loadAssets, type AgentEnv } from './config.js';
 import { createOctokit, createTokenSource, type TokenSource } from './github-auth.js';
 import { createHeartbeat } from './heartbeat.js';
 import { prepareWorkspace, renderPrOverview, type PrContext } from './workspace.js';
-import { loadGraduatedSkills, renderGraduatedSkills } from './graduated-skills.js';
+import { labelSuppressedPieces, loadGraduatedSkills, renderGraduatedSkills } from './graduated-skills.js';
 import { createStatusComment, type StatusComment } from './status-comment.js';
 import { ModelCallLimit, ReviewConversationManager, StreamStallRetryStrategy, textDelta } from './agent-loop.js';
 import { createConverseModel, createMantleModel, isMantleModel } from './models.js';
@@ -444,10 +444,20 @@ export async function* asBusyTask<T>(app: AsyncTaskTracker, name: string, frames
   }
 }
 
+/**
+ * The reviewer prompt followed by the baked-in skill. A release check
+ * proposes repo skill changes by pull request in suppress-and-add form,
+ * so once one merges the skill holds suppression markers; they become
+ * the same labels graduated skills get.
+ */
+export function baseSystemPrompt(promptMd: string, skillMd: string): string {
+  return `${promptMd}\n\n---\n\n## Skill: institutional memory\n\n${labelSuppressedPieces(skillMd)}`;
+}
+
 export async function bootstrap(config: RunAgentConfig): Promise<void> {
   const env = loadEnv();
   const { prompt: PROMPT_MD, skill: SKILL_MD } = await loadAssets(env);
-  const systemPrompt = `${PROMPT_MD}\n\n---\n\n## Skill: institutional memory\n\n${SKILL_MD}`;
+  const systemPrompt = baseSystemPrompt(PROMPT_MD, SKILL_MD);
 
   console.log(`[boot] model=${env.modelId} fallback=${env.fallbackModelId} region=${env.region} bucket=${env.assetsBucket}`);
 

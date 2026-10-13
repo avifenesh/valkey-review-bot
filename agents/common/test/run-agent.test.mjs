@@ -7,7 +7,7 @@ import { BedrockAgentCoreApp } from 'bedrock-agentcore/runtime';
 import './support/ts-resolve.mjs';
 import { failingTurn, ScriptedModel, textOf, textTurn, toolTurn } from './support/scripted-model.mjs';
 
-const { asBusyTask, createReviewHandler, mentionBlock } = await import('../src/run-agent.ts');
+const { asBusyTask, baseSystemPrompt, createReviewHandler, mentionBlock } = await import('../src/run-agent.ts');
 const { loadEnv } = await import('../src/config.ts');
 const { buildPostReviewTool, buildSkipTool, createTerminalGate } = await import('../src/tools/gh.ts');
 
@@ -304,4 +304,16 @@ test('a mention file path from the PR is quoted, so it cannot end the sentence',
   const text = mentionBlock({ repo: 'o/r', pr_number: 1, instruction: 'check the error path', trigger_path: path, trigger_line: 9 }).join('\n');
   assert.ok(text.includes(`The request was made inline on ${JSON.stringify(path)} line 9;`));
   assert.equal(text.match(/^### Instruction$/gm).length, 1);
+});
+
+test('suppressed pieces of the baked-in skill reach the reviewer labelled', () => {
+  const marker = `<!-- suppressed: superseded in 9.1.2, 2026-10-13; \`emptyDB\` is now \`emptyData\`; evidence: valkey-io/valkey@${'a'.repeat(40)}:src/db.c:512 -->`;
+  const skill = ['# Valkey PR Reviewer Skill', '', marker, '- `emptyDB` clears every database.', '<!-- /suppressed -->', '- `emptyData` clears every database.'].join('\n');
+  const prompt = baseSystemPrompt('You review pull requests.', skill);
+  assert.ok(prompt.startsWith('You review pull requests.\n\n---\n\n## Skill: institutional memory\n\n# Valkey PR Reviewer Skill\n\n'));
+  assert.ok(prompt.includes('\n**Superseded in 9.1.2.** The text from here to "End of superseded text" describes code before 9.1.2.'));
+  assert.ok(prompt.includes('\n- `emptyDB` clears every database.\n**End of superseded text.**\n- `emptyData` clears every database.'));
+  assert.doesNotMatch(prompt, /<!--|evidence:/);
+  // A skill without markers goes in as written.
+  assert.ok(baseSystemPrompt('P', '# Skill\n\n## Use when\nbody').endsWith('\n\n# Skill\n\n## Use when\nbody'));
 });
