@@ -217,6 +217,7 @@ function deps(gh, over = {}) {
   const d = {
     repo: REPO,
     baseBranch: 'main',
+    reviewerIds: ['valkey-review', 'valkey-glide-review'],
     getToken: async () => { tokens++; return TOKEN; },
     fetch: gh.fetch,
     ...over,
@@ -524,6 +525,28 @@ test('only the reviewer\'s own repo skill file can be proposed', async () => {
   }
 });
 
+test('only a configured reviewer\'s skill can be proposed, never the curator\'s', async () => {
+  for (const reviewerId of ['curator', 'common', 'valkey-search-review']) {
+    const d = deps(NO_GITHUB);
+    const result = await proposeRepoSkillChange(proposal({ baseSha: 'b'.repeat(40), reviewerId, path: `agents/${reviewerId}/config/skill.md` }), d);
+    assert.deepEqual(result, {
+      action: 'refused',
+      branch: '',
+      reason: `${reviewerId} is not a configured reviewer (valkey-review, valkey-glide-review)`,
+    }, reviewerId);
+    assert.equal(d.tokens, 0, reviewerId);
+  }
+  // Another configured reviewer is fine.
+  const gh = fakeGitHub({ 'agents/valkey-glide-review/config/skill.md': BASE });
+  const result = await proposeRepoSkillChange(proposal({
+    baseSha: gh.tip(),
+    reviewerId: 'valkey-glide-review',
+    path: 'agents/valkey-glide-review/config/skill.md',
+  }), deps(gh));
+  assert.equal(result.action, 'opened');
+  assert.equal(result.branch, 'skill-check/valkey-glide-review/9.1.2');
+});
+
 test('anything but suppress-and-add insertions for the release is refused before GitHub is called', async () => {
   const inPlace = BASE.replace('`emptyDB` must', '`emptyData` must');
   const cases = {
@@ -610,6 +633,14 @@ test('the base branch is never the branch written', async () => {
 test('malformed configuration throws', async () => {
   for (const over of [{ repo: 'valkey-review-bot' }, { repo: 'a/b/c' }, { baseBranch: '' }, { baseBranch: 'a..b' }, { signOff: 'no email' }, { signOff: 'Name <a@b>\nSigned-off-by: x <y@z>' }]) {
     await assert.rejects(proposeRepoSkillChange(proposal({ baseSha: 'b'.repeat(40) }), deps(NO_GITHUB, over)), /skills repo|base branch|signOff/, JSON.stringify(over));
+  }
+  for (const reviewerIds of [undefined, [], 'valkey-review', ['Valkey-Review'], ['valkey-review', 7]]) {
+    await assert.rejects(proposeRepoSkillChange(proposal({ baseSha: 'b'.repeat(40) }), deps(NO_GITHUB, { reviewerIds })),
+      /reviewerIds must list the configured reviewer ids/, JSON.stringify(reviewerIds));
+  }
+  for (const reviewerIds of [['valkey-review', 'curator'], ['common']]) {
+    await assert.rejects(proposeRepoSkillChange(proposal({ baseSha: 'b'.repeat(40) }), deps(NO_GITHUB, { reviewerIds })),
+      /reviewerIds names (curator|common), which is not a reviewer/, JSON.stringify(reviewerIds));
   }
 });
 

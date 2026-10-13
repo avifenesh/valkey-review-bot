@@ -23,7 +23,8 @@ import {
  * generates from the validated edits.
  *
  * What it does, per (reviewer, release):
- * - refuses any path but agents/<reviewerId>/config/skill.md, and any
+ * - refuses any reviewer but the configured ones (never the curator),
+ *   any path but agents/<reviewerId>/config/skill.md, and any
  *   new content that is not the base content plus suppress-and-add
  *   edits for that release that keep the registry skills' edit contract
  *   (skill-check/edits.ts), re-derived from the two texts;
@@ -67,6 +68,13 @@ export interface RepoSkillPrDeps {
   /** The bot's repository, "owner/name" (skillsRepo.repo). */
   readonly repo: string;
   readonly baseBranch: string;
+  /**
+   * The configured reviewer ids (the curator's CONCERNS_TABLES_JSON
+   * keys). Only their skill files can be proposed. The curator and the
+   * shared agents/common package are never reviewers, and a list naming
+   * either is refused as misconfigured.
+   */
+  readonly reviewerIds: readonly string[];
   /** "Name <email>" for the DCO line. Default: the App bot identity GitHub gives the commit. */
   readonly signOff?: string;
   /** A token from the skills-repo broker (createSkillsRepoTokenSource). */
@@ -95,6 +103,8 @@ const BRANCH_PREFIX = 'skill-check/';
 const REPO_RE = /^[A-Za-z0-9](?:[A-Za-z0-9-]{0,38})\/(?!\.\.?$)[A-Za-z0-9._-]{1,100}$/;
 const SHA_RE = /^[0-9a-f]{40}$/;
 const REVIEWER_ID_RE = /^[a-z0-9][a-z0-9-]{0,99}$/;
+/** Directories under agents/ that are not reviewers: the curator's own skill is never proposed. */
+const NOT_REVIEWERS: ReadonlySet<string> = new Set(['curator', 'common']);
 const SIGN_OFF_RE = /^[^<>\x00-\x1f\x7f]+ <[^<>\s@]+@[^<>\s@]+>$/;
 const MARKER_LIKE_RE = /^\s*<!--\s*\/?\s*suppressed\b/;
 /** The token class the edit contract splits pieces on (skill-check/edits.ts). */
@@ -307,10 +317,11 @@ export function insertionProblem(base: string, next: string, release: string): s
 }
 
 /** Why the proposal is refused, or its edits. */
-function checkProposal(p: RepoSkillProposal): DerivedEdits | string {
+function checkProposal(p: RepoSkillProposal, reviewerIds: readonly string[]): DerivedEdits | string {
   const strings = [p.reviewerId, p.releaseLabel, p.path, p.baseSha, p.baseContent, p.newContent, p.summary];
   if (strings.some((s) => typeof s !== 'string') || !Array.isArray(p.evidence)) return 'the proposal is malformed';
   if (!REVIEWER_ID_RE.test(p.reviewerId)) return `reviewer id ${JSON.stringify(p.reviewerId)} is not valid`;
+  if (!reviewerIds.includes(p.reviewerId)) return `${p.reviewerId} is not a configured reviewer (${reviewerIds.join(', ')})`;
   if (p.path !== repoSkillPath(p.reviewerId)) return `only ${repoSkillPath(p.reviewerId)} can be proposed, not ${JSON.stringify(p.path)}`;
   if (!isReleaseLabel(p.releaseLabel)) return `release ${JSON.stringify(p.releaseLabel)} is not a GA tag or <branch>@<sha12>`;
   if (!SHA_RE.test(p.baseSha)) return 'baseSha is not a full commit SHA';
@@ -497,6 +508,12 @@ function checkDeps(deps: RepoSkillPrDeps): void {
   if (!REPO_RE.test(deps.repo)) throw new Error(`skills repo must be "owner/name", got ${JSON.stringify(deps.repo)}`);
   if (!isRefName(deps.baseBranch)) throw new Error(`base branch ${JSON.stringify(deps.baseBranch)} is not a branch name`);
   if (deps.signOff !== undefined && !SIGN_OFF_RE.test(deps.signOff)) throw new Error('signOff must be "Name <email>"');
+  const ids: unknown = deps.reviewerIds;
+  if (!Array.isArray(ids) || ids.length === 0 || ids.some((id) => typeof id !== 'string' || !REVIEWER_ID_RE.test(id))) {
+    throw new Error('reviewerIds must list the configured reviewer ids');
+  }
+  const notReviewers = (ids as string[]).filter((id) => NOT_REVIEWERS.has(id));
+  if (notReviewers.length > 0) throw new Error(`reviewerIds names ${notReviewers.join(', ')}, which is not a reviewer`);
 }
 
 /** Why the branch may not be rebuilt: it holds commits the release check did not make. */
@@ -555,10 +572,10 @@ async function buildCommit(gh: SkillsRepo, tip: string, p: RepoSkillProposal, ti
 
 export async function proposeRepoSkillChange(p: RepoSkillProposal, deps: RepoSkillPrDeps): Promise<RepoSkillPrResult> {
   checkDeps(deps);
-  const named = typeof p.reviewerId === 'string' && REVIEWER_ID_RE.test(p.reviewerId)
+  const named = typeof p.reviewerId === 'string' && deps.reviewerIds.includes(p.reviewerId)
     && typeof p.releaseLabel === 'string' && isReleaseLabel(p.releaseLabel);
   const branch = named ? repoSkillBranch(p.reviewerId, p.releaseLabel) : '';
-  const checked = checkProposal(p);
+  const checked = checkProposal(p, deps.reviewerIds);
   if (typeof checked === 'string') return { action: 'refused', branch, reason: checked };
   if (!isRefName(branch) || branch === deps.baseBranch) return { action: 'refused', branch, reason: `cannot use branch ${JSON.stringify(branch)}` };
 
