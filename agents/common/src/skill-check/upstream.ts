@@ -1,0 +1,231 @@
+import { execFile } from 'node:child_process';
+import { mkdir, readdir, rm } from 'node:fs/promises';
+import path from 'node:path';
+import type { Citation, LineResolver } from './edits.js';
+
+/**
+ * A checkout of a public upstream repository for the release check.
+ *
+ * A fresh `git init` that fetches one branch tip (and the commit of the
+ * last check) with depth 1 and no blobs, then checks the tip out, which
+ * fetches the tip's blobs in one batch. The repository is new, so it has
+ * no hooks, and git reads no system or global config and gets no
+ * credentials. Nothing here talks to the network except git itself, on
+ * the URL the caller gives.
+ *
+ * No runtime relative imports, so scripts can load this file directly
+ * under Node's type stripping.
+ */
+
+export interface GitResult {
+  /** Exit status; -1 when the output went past `maxBytes` and git was stopped. */
+  readonly code: number;
+  readonly stdout: string;
+  readonly stderr: string;
+  /** stdout went past `maxBytes`; `stdout` holds what came before. */
+  readonly truncated: boolean;
+}
+
+export interface GitCallOptions {
+  readonly timeoutMs?: number;
+  readonly maxBytes?: number;
+}
+
+/**
+ * Run git with an argv (no shell) in one directory. A non-zero exit is
+ * returned, not thrown; a timeout or a git that cannot start throws.
+ */
+export type GitRunner = (args: readonly string[], opts?: GitCallOptions) => Promise<GitResult>;
+
+const GIT_TIMEOUT_MS = 10 * 60_000;
+const GIT_MAX_BYTES = 64 * 1024 * 1024;
+const FILE_MAX_BYTES = 16 * 1024 * 1024;
+
+/** Same filter as tools/child-env.ts buildChildEnv. */
+const CREDENTIAL_NAME = /^(AWS_|AMAZON_|GH_|GITHUB_)|TOKEN|SECRET|PASSWORD|CREDENTIAL|PRIVATE_KEY/i;
+
+const SHA_RE = /^(?:[0-9a-f]{40}|[0-9a-f]{64})$/;
+const BRANCH_RE = /^(?!-)(?!.*\.\.)(?!.*\/\/)(?!.*\/$)(?!.*\.lock$)[A-Za-z0-9._\/-]{1,200}$/;
+
+/**
+ * Environment for upstream git: the process environment without
+ * credentials or inherited GIT_* settings (GIT_CONFIG_COUNT and the like
+ * can inject config), plus no system or global config, no prompts, and
+ * the low-speed abort workspace.ts uses.
+ */
+export function upstreamGitEnv(base: NodeJS.ProcessEnv = process.env): NodeJS.ProcessEnv {
+  const env: NodeJS.ProcessEnv = {};
+  for (const [name, value] of Object.entries(base)) {
+    if (!CREDENTIAL_NAME.test(name) && !name.startsWith('GIT_')) env[name] = value;
+  }
+  return {
+    ...env,
+    GIT_CONFIG_NOSYSTEM: '1',
+    GIT_CONFIG_GLOBAL: '/dev/null',
+    GIT_TERMINAL_PROMPT: '0',
+    GIT_OPTIONAL_LOCKS: '0',
+    // Abort a transfer that stays under 1 KB/s for 60 seconds.
+    GIT_HTTP_LOW_SPEED_LIMIT: '1000',
+    GIT_HTTP_LOW_SPEED_TIME: '60',
+  };
+}
+
+export function createGitRunner(cwd: string, env: NodeJS.ProcessEnv = upstreamGitEnv()): GitRunner {
+  return (args, opts = {}) => new Promise((resolve, reject) => {
+    const timeoutMs = opts.timeoutMs ?? GIT_TIMEOUT_MS;
+    execFile('git', [...args], {
+      cwd,
+      env,
+      encoding: 'utf8',
+      timeout: timeoutMs,
+      killSignal: 'SIGKILL',
+      maxBuffer: opts.maxBytes ?? GIT_MAX_BYTES,
+      windowsHide: true,
+    }, (err, stdout, stderr) => {
+      if (!err) return resolve({ code: 0, stdout, stderr, truncated: false });
+      const e = err as NodeJS.ErrnoException & { code?: string | number; killed?: boolean; signal?: string | null };
+      if (e.code === 'ERR_CHILD_PROCESS_STDIO_MAXBUFFER') return resolve({ code: -1, stdout, stderr, truncated: true });
+      if (e.killed || e.signal) return reject(new Error(`git ${args[0] ?? ''} timed out after ${Math.round(timeoutMs / 1000)}s`));
+      if (typeof e.code === 'number') return resolve({ code: e.code, stdout, stderr, truncated: false });
+      reject(new Error(`could not run git: ${e.message}`));
+    });
+  });
+}
+
+async function mustRun(git: GitRunner, args: readonly string[], opts?: GitCallOptions): Promise<string> {
+  const r = await git(args, opts);
+  if (r.code !== 0) throw new Error(`git ${args.join(' ')} exited ${r.code}: ${(r.stderr || r.stdout).trim().slice(0, 2000)}`);
+  return r.stdout;
+}
+
+export interface PrepareOptions {
+  /** Directory for the new repository; created when missing, must be empty otherwise. */
+  readonly dir: string;
+  /** https:// URL of the public repository, without credentials (file:// for tests). */
+  readonly url: string;
+  /** Commit of the last check. Fetched too when the remote still has it, so the check can diff against it. */
+  readonly verifiedSha?: string;
+  /** Branch to check instead of the remote's default branch. */
+  readonly branch?: string;
+  /** Environment for git. Default upstreamGitEnv(). */
+  readonly env?: NodeJS.ProcessEnv;
+}
+
+export interface UpstreamCheckout {
+  /** The remote's default branch (its HEAD), or the `branch` option when given. */
+  readonly defaultBranch: string;
+  /** The commit checked out, detached. */
+  readonly tipSha: string;
+  /** verifiedSha is present locally and can be diffed against the tip. */
+  readonly baseAvailable: boolean;
+  /** A runner in the checkout, with the same environment. */
+  readonly git: GitRunner;
+}
+
+function checkUrl(url: string): void {
+  // Only anonymous https, or a local file:// repository. No user info, so no credentials in the URL.
+  if (!/^https:\/\/[A-Za-z0-9.-]+(?::\d+)?\/[^\s@]+$/.test(url) && !/^file:\/\/\/[^\s]+$/.test(url)) {
+    throw new Error(`upstream URL must be https:// without credentials, or file:// (got ${JSON.stringify(url)})`);
+  }
+}
+
+/** Parse `git ls-remote --symref` output into the HEAD symref target and ref tips. */
+function parseLsRemote(out: string): { head: string | null; refs: Map<string, string> } {
+  let head: string | null = null;
+  const refs = new Map<string, string>();
+  for (const line of out.split('\n')) {
+    const sym = /^ref: refs\/heads\/(\S+)\tHEAD$/.exec(line);
+    if (sym) {
+      head = sym[1]!;
+      continue;
+    }
+    const m = /^([0-9a-f]{40}|[0-9a-f]{64})\t(\S+)$/.exec(line);
+    if (m) refs.set(m[2]!, m[1]!);
+  }
+  return { head, refs };
+}
+
+/**
+ * Create the checkout: init, register origin as a promisor remote with
+ * blob:none, find the branch and its tip with ls-remote, fetch the tip
+ * and (best effort) verifiedSha at depth 1 without blobs, then check out
+ * the tip detached.
+ */
+export async function prepareUpstreamCheckout(opts: PrepareOptions): Promise<UpstreamCheckout> {
+  checkUrl(opts.url);
+  if (opts.branch !== undefined && !BRANCH_RE.test(opts.branch)) throw new Error(`invalid branch name ${JSON.stringify(opts.branch)}`);
+  await mkdir(opts.dir, { recursive: true });
+  if ((await readdir(opts.dir)).length > 0) throw new Error(`checkout directory ${opts.dir} is not empty`);
+
+  const git = createGitRunner(opts.dir, opts.env ?? upstreamGitEnv());
+  // --template= copies no templates, so not even sample hooks exist.
+  await mustRun(git, ['init', '-q', '--template=']);
+  await mustRun(git, ['remote', 'add', 'origin', opts.url]);
+  await mustRun(git, ['config', 'remote.origin.promisor', 'true']);
+  await mustRun(git, ['config', 'remote.origin.partialclonefilter', 'blob:none']);
+
+  const wanted = opts.branch === undefined ? ['HEAD'] : ['HEAD', `refs/heads/${opts.branch}`];
+  const listing = parseLsRemote(await mustRun(git, ['ls-remote', '--symref', 'origin', ...wanted], { timeoutMs: 2 * 60_000 }));
+  const branch = opts.branch ?? listing.head;
+  if (!branch || !BRANCH_RE.test(branch)) throw new Error(`could not tell the default branch of ${opts.url}`);
+  if (!listing.refs.has(`refs/heads/${branch}`) && !(opts.branch === undefined && listing.refs.has('HEAD'))) {
+    throw new Error(`${opts.url} has no branch ${branch}`);
+  }
+
+  const fetchArgs = ['fetch', '-q', '--depth=1', '--filter=blob:none', '--no-tags', '--no-recurse-submodules', 'origin'];
+  await mustRun(git, [...fetchArgs, `+refs/heads/${branch}:refs/remotes/origin/${branch}`]);
+  // The fetched tip, not the one ls-remote printed: the branch can move in between.
+  const tipSha = (await mustRun(git, ['rev-parse', '--verify', '-q', `refs/remotes/origin/${branch}^{commit}`])).trim();
+
+  let baseAvailable = false;
+  const base = opts.verifiedSha;
+  if (base !== undefined && SHA_RE.test(base)) {
+    if (base !== tipSha) await git([...fetchArgs, base]);
+    // Look without fetching: in a partial clone a missing object is otherwise fetched on access.
+    const local = createGitRunner(opts.dir, { ...(opts.env ?? upstreamGitEnv()), GIT_NO_LAZY_FETCH: '1' });
+    baseAvailable = (await local(['cat-file', '-e', `${base}^{commit}`])).code === 0;
+  }
+
+  await mustRun(git, ['-c', 'advice.detachedHead=false', 'checkout', '-q', '--detach', '--force', tipSha]);
+  return { defaultBranch: branch, tipSha, baseAvailable, git };
+}
+
+/** Delete a checkout directory. Refuses a relative path or a filesystem root. */
+export async function removeCheckout(dir: string): Promise<void> {
+  const full = path.resolve(dir);
+  if (!path.isAbsolute(dir) || full === path.parse(full).root) throw new Error(`refusing to remove ${JSON.stringify(dir)}`);
+  await rm(full, { recursive: true, force: true });
+}
+
+function isRepoPath(p: string): boolean {
+  if (p.length === 0 || p.includes('\0') || p.startsWith('/')) return false;
+  return p.split('/').every((part) => part !== '' && part !== '.' && part !== '..');
+}
+
+/**
+ * A LineResolver for edits.ts that reads cited lines from the checkout
+ * with `git cat-file blob <sha>:<path>`. It answers only for `at`, the
+ * checked-out commit, so no citation makes git fetch other objects.
+ * Each file is read once.
+ */
+export function createLineResolver(git: GitRunner, at: { readonly repo: string; readonly sha: string }): LineResolver {
+  if (!SHA_RE.test(at.sha)) throw new Error(`not a full commit SHA: ${JSON.stringify(at.sha)}`);
+  const files = new Map<string, Promise<string[] | null>>();
+  const read = async (file: string): Promise<string[] | null> => {
+    const r = await git(['cat-file', 'blob', `${at.sha}:${file}`], { maxBytes: FILE_MAX_BYTES });
+    if (r.code !== 0 || r.truncated || r.stdout.includes('\0')) return null;
+    const lines = r.stdout.split('\n');
+    if (lines[lines.length - 1] === '') lines.pop();
+    return lines.map((l) => (l.endsWith('\r') ? l.slice(0, -1) : l));
+  };
+  return async (c: Citation) => {
+    if (c.repo.toLowerCase() !== at.repo.toLowerCase() || c.sha !== at.sha) return null;
+    if (!isRepoPath(c.path) || !Number.isInteger(c.line) || c.line < 1) return null;
+    let lines = files.get(c.path);
+    if (!lines) {
+      lines = read(c.path);
+      files.set(c.path, lines);
+    }
+    return (await lines)?.[c.line - 1] ?? null;
+  };
+}
