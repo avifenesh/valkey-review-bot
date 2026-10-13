@@ -4,7 +4,7 @@ import './support/ts-resolve.mjs';
 
 const {
   decayedScore, decayTable, isReservedBucket, loadDecayConfig, MAINTENANCE_RETRY_DAYS, parseDecayEvent, releaseTags,
-  REPO_SKILL_KEY, RESERVED_BUCKET_PREFIX, summaryLine,
+  REPO_SKILL_KEY, RESERVED_BUCKET_PREFIX, runDecay, summaryLine,
 } = await import('../src/decay.ts');
 
 const DAY = 24 * 3600;
@@ -52,8 +52,11 @@ test('configuration is validated', () => {
     retireSkills: false,
     maxRetirementsPerDay: 3,
   });
-  // Checks are on by default, so the queue is required unless they are turned off.
-  assert.throws(() => loadDecayConfig({ CONCERNS_TABLES_JSON: tables }), /CURATOR_QUEUE_URL is required when SKILL_CHECKS_PER_DAY is above 0 \(default 10\)/);
+  // Checks are on by default; a missing queue does not stop the job (see runDecay).
+  const noQueue = loadDecayConfig({ CONCERNS_TABLES_JSON: tables, RETIRE_SKILLS: 'true' });
+  assert.equal(noQueue.curatorQueueUrl, '');
+  assert.equal(noQueue.checksPerDay, 10);
+  assert.equal(noQueue.retireSkills, true);
   const off = loadDecayConfig({ CONCERNS_TABLES_JSON: tables, SKILL_CHECKS_PER_DAY: '0' });
   assert.equal(off.checksPerDay, 0);
   assert.equal(off.curatorQueueUrl, '');
@@ -706,6 +709,52 @@ test('release tags are looked up once per upstream, and not at all when checks a
   assert.deepEqual(asked.sort(), ['valkey-io/valkey', 'valkey-io/valkey-glide']);
   assert.deepEqual(tags, { 'valkey-review': '9.1.2', 'valkey-glide-review': null, fork: '9.1.2' });
   assert.deepEqual(await releaseTags({ ...config, checksPerDay: 0 }, async () => assert.fail('no lookup')), {});
+  assert.deepEqual(await releaseTags({ ...config, curatorQueueUrl: '' }, async () => assert.fail('no lookup')), {});
+});
+
+test('without a curator queue the pass still decays every table and warns once', async (t) => {
+  const log = quietLogs(t);
+  const warn = t.mock.method(console, 'warn', () => {});
+  const config = { ...FULL, tables: { 'valkey-review': 't1', 'valkey-glide-review': 't2' }, curatorQueueUrl: '' };
+  const tables = {
+    t1: [REPO_SKILL_CHECKED, live('unchecked', { verified_at: undefined }), faded('gone'), { area_bucket: 'src', record_id: 'old', decay_score: 1, updated_at: daysAgo(400) }],
+    t2: [live('fresh'), faded('gone2')],
+  };
+  const writes = [];
+  const ddb = {
+    async send(command) {
+      if (command.constructor.name === 'ScanCommand') return { Items: project(tables[command.input.TableName], command.input) };
+      writes.push({ op: command.constructor.name, input: command.input });
+      return {};
+    },
+  };
+  const sqs = fakeSqs();
+  const result = await runDecay(config, { recheckAll: true, dryRun: false }, {
+    ddb, sqs, nowMs: NOW, lookup: async () => assert.fail('no release lookup without a queue'),
+  });
+
+  assert.deepEqual(warn.mock.calls.map((c) => c.arguments[0]), [
+    '[decay] CURATOR_QUEUE_URL is not set: no skill checks or retirements are queued this pass (SKILL_CHECKS_PER_DAY=10, RETIRE_SKILLS=true); scores are decayed as usual',
+  ]);
+  assert.equal(sqs.sent.length, 0);
+  assert.deepEqual(result.releases, {});
+  assert.deepEqual(result.tables.map((s) => [s.table, s.decayed, s.deleted, s.wouldRetire, s.checksRequested, s.errors]), [
+    ['t1', 2, 1, 1, 0, 0],
+    ['t2', 2, 0, 1, 0, 0],
+  ]);
+  assert.equal(claims({ writes }).length, 0);
+  const lines = log.mock.calls.map((c) => c.arguments[0]);
+  assert.equal(lines.filter((l) => l.startsWith('[decay] t1 scanned=') || l.startsWith('[decay] t2 scanned=')).length, 2);
+});
+
+test('no queue warning when the queue is set or nothing would be queued', async (t) => {
+  quietLogs(t);
+  const warn = t.mock.method(console, 'warn', () => {});
+  for (const config of [FULL, { ...FULL, curatorQueueUrl: '', checksPerDay: 0, retireSkills: false }]) {
+    const result = await runDecay(config, { recheckAll: false, dryRun: false }, { ddb: fakeDdb([[]]), sqs: fakeSqs(), nowMs: NOW, lookup: async () => '9.1.2' });
+    assert.equal(result.tables.length, 1);
+  }
+  assert.equal(warn.mock.calls.length, 0);
 });
 
 test('skill maintenance settings are validated', () => {
@@ -731,8 +780,7 @@ test('skill maintenance settings are validated', () => {
   });
   assert.deepEqual(loadDecayConfig({ ...base, UPSTREAM_REPOS_JSON: '{}', RETIRE_SKILLS: 'false', SKILL_CHECKS_PER_DAY: '0' }).upstreamRepos, {});
 
-  assert.throws(() => loadDecayConfig({ ...base, SKILL_CHECKS_PER_DAY: '1' }), /CURATOR_QUEUE_URL is required/);
-  assert.throws(() => loadDecayConfig({ ...base, SKILL_CHECKS_PER_DAY: '0', RETIRE_SKILLS: 'true' }), /CURATOR_QUEUE_URL is required/);
+  assert.equal(loadDecayConfig({ ...base, SKILL_CHECKS_PER_DAY: '1', CURATOR_QUEUE_URL: '  ' }).curatorQueueUrl, '');
   for (const bad of ['-1', '1.5', 'ten']) {
     assert.throws(() => loadDecayConfig({ ...on, SKILL_CHECKS_PER_DAY: bad }), /SKILL_CHECKS_PER_DAY must be an integer of at least 0/, bad);
   }

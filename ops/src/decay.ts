@@ -23,9 +23,9 @@ import { isRepoName, latestReleaseTag, RELEASE_TAG_RE } from './releases.js';
  * set) is a tombstone and is left as it is.
  *
  * For a live graduated record the pass queues work for the curator on
- * the curator queue (see MaintenanceMessage):
+ * the curator queue, CURATOR_QUEUE_URL (see MaintenanceMessage):
  * - "retire" when its score falls below the floor. With RETIRE_SKILLS
- *   off, or in a dry run, it only logs would-retire.
+ *   off, without a queue, or in a dry run, it only logs would-retire.
  * - "check" when a fact check is due: the record was never checked, it
  *   was re-published since its last check, the highest GA release of
  *   the reviewer's upstream differs from the one it was checked at, or
@@ -60,7 +60,7 @@ export interface DecayConfig {
   readonly graduatedHalfLifeSeconds: number;
   /** reviewer_id -> upstream owner/name whose releases trigger checks. Reviewers without one get no checks. */
   readonly upstreamRepos: Readonly<Record<string, string>>;
-  /** Queue the curator reads; '' when checks and retirement are both off. */
+  /** Queue the curator reads; '' when unset, and then nothing is queued. */
   readonly curatorQueueUrl: string;
   /** Check requests per reviewer per pass; 0 turns checks off. */
   readonly checksPerDay: number;
@@ -149,14 +149,11 @@ export function loadDecayConfig(env: Env): DecayConfig {
   const floor = positiveNumber(env, 'DECAY_FLOOR', DEFAULT_FLOOR);
   if (floor >= 1) throw new Error(`DECAY_FLOOR must be below 1, got ${floor}`);
 
-  // Checks are on by default, so the queue is required unless the
-  // deployment sets SKILL_CHECKS_PER_DAY=0 (and leaves RETIRE_SKILLS off).
+  // Checks are on by default. Without a queue the pass still decays
+  // scores and only skips the maintenance requests (see runDecay).
   const checksPerDay = integerSetting(env, 'SKILL_CHECKS_PER_DAY', DEFAULT_CHECKS_PER_DAY, 0);
   const retireSkills = booleanSetting(env, 'RETIRE_SKILLS');
   const curatorQueueUrl = env.CURATOR_QUEUE_URL?.trim() ?? '';
-  if ((checksPerDay > 0 || retireSkills) && !curatorQueueUrl) {
-    throw new Error(`env CURATOR_QUEUE_URL is required when SKILL_CHECKS_PER_DAY is above 0 (default ${DEFAULT_CHECKS_PER_DAY}) or RETIRE_SKILLS is true`);
-  }
 
   return {
     tables,
@@ -824,14 +821,14 @@ export async function decayTable(
 
 /**
  * Highest GA release per reviewer with an upstream, one lookup per
- * distinct repository, in parallel. Skipped when checks are off, since
- * the tag only triggers checks.
+ * distinct repository, in parallel. Skipped when checks are off or there
+ * is no curator queue, since the tag only triggers checks.
  */
 export async function releaseTags(
   config: DecayConfig,
   lookup: (repo: string) => Promise<string | null> = latestReleaseTag,
 ): Promise<Record<string, string | null>> {
-  if (config.checksPerDay === 0) return {};
+  if (config.checksPerDay === 0 || !config.curatorQueueUrl) return {};
   const reviewers = Object.keys(config.tables).filter((id) => config.upstreamRepos[id]);
   const byRepo = new Map<string, Promise<string | null>>();
   for (const id of reviewers) {
@@ -844,9 +841,46 @@ export async function releaseTags(
 }
 
 export interface DecayResult {
-  /** reviewer_id -> highest GA release of its upstream, null when unknown. Empty when checks are off. */
+  /** reviewer_id -> highest GA release of its upstream, null when unknown. Empty when checks are off or there is no queue. */
   readonly releases: Readonly<Record<string, string | null>>;
   readonly tables: readonly Stats[];
+}
+
+/** What runDecay talks to. */
+export interface DecayDeps {
+  readonly ddb: SendClient;
+  /** Client for the curator queue; unused without CURATOR_QUEUE_URL. */
+  readonly sqs?: SendClient;
+  readonly lookup?: (repo: string) => Promise<string | null>;
+  readonly nowMs?: number;
+}
+
+/**
+ * One pass over every reviewer's table. Without CURATOR_QUEUE_URL it
+ * still decays and deletes as usual and queues nothing; when the settings
+ * ask for checks or retirements it says so in one warning per pass.
+ */
+export async function runDecay(config: DecayConfig, request: DecayRequest, deps: DecayDeps): Promise<DecayResult> {
+  if (request.recheckAll || request.dryRun) console.log(`[decay] manual pass recheck_all=${request.recheckAll} dry_run=${request.dryRun}`);
+  if (!config.curatorQueueUrl && (config.checksPerDay > 0 || config.retireSkills)) {
+    console.warn(`[decay] CURATOR_QUEUE_URL is not set: no skill checks or retirements are queued this pass`
+      + ` (SKILL_CHECKS_PER_DAY=${config.checksPerDay}, RETIRE_SKILLS=${config.retireSkills}); scores are decayed as usual`);
+  }
+
+  const releases = await releaseTags(config, deps.lookup);
+  const now = deps.nowMs ?? Date.now();
+  const out: Stats[] = [];
+  for (const [reviewerId, tableName] of Object.entries(config.tables)) {
+    const s = await decayTable(deps.ddb, tableName, config, now, {
+      ...request,
+      reviewerId,
+      releaseTag: releases[reviewerId] ?? null,
+      sqs: deps.sqs,
+    });
+    console.log(summaryLine(s));
+    out.push(s);
+  }
+  return { releases, tables: out };
 }
 
 let client: DynamoDBDocumentClient | undefined;
@@ -854,23 +888,7 @@ let sqsClient: SQSClient | undefined;
 
 export async function handler(event?: unknown): Promise<DecayResult> {
   const config = loadDecayConfig(process.env);
-  const request = parseDecayEvent(event);
   client ??= DynamoDBDocumentClient.from(new DynamoDBClient({}));
   if (config.curatorQueueUrl) sqsClient ??= new SQSClient({});
-  if (request.recheckAll || request.dryRun) console.log(`[decay] manual pass recheck_all=${request.recheckAll} dry_run=${request.dryRun}`);
-
-  const releases = await releaseTags(config);
-  const now = Date.now();
-  const out: Stats[] = [];
-  for (const [reviewerId, tableName] of Object.entries(config.tables)) {
-    const s = await decayTable(client, tableName, config, now, {
-      ...request,
-      reviewerId,
-      releaseTag: releases[reviewerId] ?? null,
-      sqs: sqsClient,
-    });
-    console.log(summaryLine(s));
-    out.push(s);
-  }
-  return { releases, tables: out };
+  return runDecay(config, parseDecayEvent(event), { ddb: client, sqs: sqsClient });
 }
