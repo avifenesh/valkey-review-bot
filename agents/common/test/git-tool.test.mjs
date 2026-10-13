@@ -44,6 +44,26 @@ test('the git tool ignores a gitconfig in HOME', async () => {
   }
 });
 
+test('--text never turns on a configured textconv driver', async () => {
+  const dir = repo();
+  const env = { ...process.env, GIT_CONFIG_NOSYSTEM: '1', GIT_CONFIG_GLOBAL: '/dev/null' };
+  execFileSync('git', ['config', 'diff.up.textconv', 'sed s/hello/CONVERTED/'], { cwd: dir, env });
+  writeFileSync(path.join(dir, '.gitattributes'), 'README.md diff=up\n');
+  // The driver is live: git run directly with --textconv applies it.
+  assert.match(execFileSync('git', ['cat-file', '--textconv', 'HEAD:README.md'], { cwd: dir, env }).toString(), /CONVERTED/);
+  const tool = buildGitTool({ workspaceRoot: dir });
+  for (const args of [
+    ['cat-file', '--text', 'HEAD:README.md'],
+    ['show', '--text', 'HEAD'],
+    ['log', '--text', '-p', '-1'],
+    ['diff', '--text', '4b825dc642cb6eb9a060e54bf8d69288fbee4904', 'HEAD'],
+    ['blame', '--text', 'README.md'],
+    ['grep', '--text', 'hello'],
+  ]) {
+    assert.doesNotMatch(await tool.invoke({ args }), /CONVERTED/, args.join(' '));
+  }
+});
+
 test('git diff does not read a file outside the repository', async () => {
   const dir = repo();
   const secret = path.join(tempDir('git-tool-outside-'), 'secret.txt');

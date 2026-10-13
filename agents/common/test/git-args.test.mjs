@@ -97,6 +97,19 @@ test('an O inside the value of a diff or log option is fine', () => {
   ok(['rev-list', '--count', 'HEAD']);
 });
 
+test('--text and --filter pass only where they are real options', () => {
+  for (const sub of ['diff', 'show', 'log', 'reflog', 'blame', 'grep']) ok([sub, '--text']);
+  ok(['rev-list', '--filter=blob:none', '--objects', 'HEAD']);
+  // cat-file has no --text, and older git no --filter: they abbreviate --textconv and --filters.
+  rejected(['cat-file', '--text', 'HEAD:README.md'], /--textconv/);
+  rejected(['cat-file', '--filter', 'HEAD:README.md'], /--filters/);
+  rejected(['cat-file', '--filter=blob:none', 'HEAD:README.md'], /--filters/);
+  rejected(['log', '--ignore-rev', 'abc123'], /--ignore-revs-file/);
+  // Names that exist on Object.prototype are just unknown options.
+  ok(['log', '--constructor']);
+  ok(['log', '--__proto__']);
+});
+
 test('blame and grep options that merely look similar are fine', () => {
   ok(['blame', '--ignore-rev', 'abc123', 'README.md']);
   ok(['blame', '-w', '-M', '-C', '-L', '1,5', 'README.md']);

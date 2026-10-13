@@ -32,8 +32,18 @@ const FORBIDDEN_LONG_OPTIONS: readonly string[] = [
   'pathspec-from-file',  // read pathspecs from any file
 ];
 
-/** Real options that happen to be a prefix of a forbidden one. */
-const EXACT_PREFIX_OK: ReadonlySet<string> = new Set(['text', 'filter', 'ignore-rev']);
+/**
+ * Real options that happen to be a prefix of a forbidden one, and the
+ * subcommands that have them. Elsewhere git may expand them to the
+ * forbidden option: cat-file has no --text, so there `--text` means
+ * --textconv, and older git has no cat-file --filter, so `--filter`
+ * means --filters.
+ */
+const EXACT_PREFIX_OK: ReadonlyMap<string, ReadonlySet<string>> = new Map([
+  ['text', new Set(['diff', 'show', 'log', 'reflog', 'blame', 'grep'])],
+  ['filter', new Set(['rev-list'])],
+  ['ignore-rev', new Set(['blame'])],
+]);
 
 interface ShortOptionRule {
   /** Letters that run a program or read a file named by their value. */
@@ -119,8 +129,9 @@ function longOptionName(arg: string): string | null {
   return arg.slice(2, eq === -1 ? undefined : eq);
 }
 
-function forbiddenLongOption(name: string): string | undefined {
-  return FORBIDDEN_LONG_OPTIONS.find((f) => f === name || (f.startsWith(name) && !EXACT_PREFIX_OK.has(name)));
+function forbiddenLongOption(sub: string, name: string): string | undefined {
+  const exact = EXACT_PREFIX_OK.get(name)?.has(sub) ?? false;
+  return FORBIDDEN_LONG_OPTIONS.find((f) => f === name || (f.startsWith(name) && !exact));
 }
 
 /** The forbidden short option in a bundle such as "-nO", if any. */
@@ -192,7 +203,7 @@ export function checkGitArgs(args: readonly string[]): string | null {
     if (short) return `argument "${arg}" is not allowed: git ${sub} -${short} runs a program or reads an arbitrary file.`;
     const long = longOptionName(arg);
     if (long !== null) {
-      const forbidden = forbiddenLongOption(long);
+      const forbidden = forbiddenLongOption(sub, long);
       if (forbidden) return `argument "${arg}" is not allowed (--${forbidden} writes files, runs a helper, or reads outside the repository).`;
     }
   }
