@@ -38,7 +38,8 @@ The reviewer runs as a GitHub App. On the Valkey repositories it appears as
 ## How it learns
 
 Comments, review-thread replies and submitted reviews that repository owners, members and
-collaborators post on pull requests are feedback for a curator agent, whether or not they
+collaborators post on pull requests in the repositories the bot serves (and any
+curator-only repositories) are feedback for a curator agent, whether or not they
 answer the bot. Summons, acknowledgements, very short comments and other noise are left
 out. For a reply in a thread the bot started, the curator also gets the bot's comment.
 The curator records each piece of feedback as a concern. Each maintainer counts once per
@@ -82,8 +83,9 @@ See [docs/architecture.md](docs/architecture.md) for the request flow in detail,
 
 The reviewer runs on AWS: Amazon Bedrock models, Bedrock AgentCore runtimes, AWS Agent
 Registry, Lambda, SQS and DynamoDB. [infra/README.md](infra/README.md) lists the
-prerequisites (Docker that can build linux/arm64 images, a GitHub App, a Secrets Manager
-secret, three registries, model access), every configuration key, and the deploy
+prerequisites (Node.js 24+, Docker that can build linux/arm64 images, the AWS CLI, a
+GitHub App, a Secrets Manager secret, three registries, model access), every configuration
+key, and the deploy
 commands. All deployment-specific values live in `infra/deploy.config.json`, which is not
 committed. Use an AWS account that runs nothing else: code from the pull requests under
 review can use the reviewer runtime's AWS role, as [SECURITY.md](SECURITY.md) describes.

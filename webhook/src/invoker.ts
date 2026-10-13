@@ -77,9 +77,9 @@ async function handleOne(record: SqsRecord): Promise<void> {
   }));
   if (!resp.response) throw new Error(`no response body for ${tag}`);
 
-  // Read the event stream to the end; the runtime works for as long as
-  // the stream is open. Only the done event decides the outcome, the
-  // rest is logged for tracing.
+  // Read the event stream to the end. Only the done event decides the
+  // outcome, the rest is logged for tracing. A review keeps running after
+  // the stream closes; watchdog.ts decides what a redelivery does.
   let buffered = '';
   let done = false;
   for await (const chunk of resp.response as AsyncIterable<Uint8Array>) {

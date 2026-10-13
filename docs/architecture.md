@@ -78,7 +78,7 @@ HTTP API -> receiver -+-> route queue -> route worker -> reviewer runtime -> Git
 6. A tag in a reply inside a review thread starts a run only on routes with
    `threadReplyReview`. If the App started that thread, the instruction quotes
    the App's comment and asks the run to check the claimed fix. The reply is
-   then also handled as feedback.
+   handled as feedback either way.
 
 ### Curator feedback
 
@@ -338,9 +338,12 @@ loads graduated skills, assembles the tools and starts the loop.
 
 Each git process has a 10 minute limit and aborts a transfer that stays below
 1 KB/s for 60 seconds. It runs with `GIT_CONFIG_GLOBAL=/dev/null`, so
-`~/.gitconfig` and `~/.config/git/config` are ignored: in a warm container an
-earlier run's build code or write tool could have left one there, and the
-fetches carry the token.
+`~/.gitconfig` and `~/.config/git/config` are ignored. The token-carrying
+fetches all happen here, before any PR code runs. The invoker sets no
+runtime session ID, so each run gets a new session and container; the
+setting covers a container that is reused, where an earlier run's build
+code could have left a global config or edited the clone's `.git/config`
+(which this setting does not cover).
 
 ### The PR overview and untrusted text
 
@@ -361,11 +364,12 @@ instruction the main directive and names the file and line of an inline tag.
 The last line tells the model to start at Phase 1 and finish with a terminal
 tool.
 
-File paths outside the fenced blocks are written as JSON strings, so a file
-name cannot close the sentence around it: the inline tag's path in
-`mentionBlock`, and the path in the re-review instruction that
+The two file paths the prompts write outside the fenced blocks are JSON
+strings, so a file name cannot close the sentence around it: the inline
+tag's path in `mentionBlock`, and the path in the re-review instruction that
 `webhook/src/mention.ts` builds. The base branch stays unfenced, because only
-maintainers create branches in the base repository.
+maintainers create branches in the base repository. The previous state
+comment is shown unfenced too: the App wrote it, from validated tool input.
 
 ### Loop limits
 
@@ -398,7 +402,8 @@ maintainers create branches in the base repository.
   after each tool call), so the watchdog still sees a live run. When the
   handler exits, the run is recorded as `completed` if a terminal tool
   succeeded and `failed` otherwise. A run that ends without one after its
-  stream closed logs its model call count and final text.
+  stream closed logs its model call count and the first 400 characters of
+  its final text.
 - While a run is in progress, `asBusyTask` keeps it registered as an async
   task of the `BedrockAgentCoreApp`, so the runtime's `/ping` reports
   `HealthyBusy` and AgentCore does not stop the session at its 15-minute
@@ -430,10 +435,10 @@ each `config/prompt.md` describe the same set to the model.
 
 `git`, `gh_api_read`, `make` and `build` run their command through
 `runBounded` (`tools/spawn.ts`), in a process group of its own. The time and
-output limits apply to everything the command started, such as sub-makes and
-test binaries: at either limit the whole group gets SIGTERM, then SIGKILL
-after a grace period (3 seconds for `make` and `build`, 2 seconds
-otherwise).
+output limits apply to everything in that group, such as sub-makes and test
+binaries: at either limit the whole group gets SIGTERM, then SIGKILL after a
+grace period (3 seconds for `make` and `build`, 2 seconds otherwise). A
+process that starts its own session or group is not stopped.
 
 ### Review phases
 
@@ -534,10 +539,10 @@ and any repository that is not one of its reviewer's review routes
 It then asks GitHub, as the App, for the App's installation on the
 repository (`GET /repos/{owner}/{name}/installation`), and refuses the
 request when there is none, when it is not the caller's `installation_id`,
-or when its account is not the repository's owner. GitHub resolves repository names inside the
-installation a token is requested from, so without this check another
-installation of the App could give a token for a same-named repository of
-another owner. The broker then returns an installation token for that one
+or when its account is not the repository's owner. GitHub resolves
+repository names inside the installation a token is requested from, so
+without this check another installation of the App could give a token for
+a same-named repository of another owner. The broker then returns an installation token for that one
 repository with `pull_requests: write` and `metadata: read`, and its
 expiry. The installation check adds one GitHub call per token.
 
@@ -577,13 +582,14 @@ substrate key, read its own skills registry, get, put and update any item
 in the shared heartbeat table, invoke its own token broker, write its own
 runtime log groups, and pull from the CDK bootstrap container-assets
 repository, which holds the images of every CDK app in the account and
-region that uses the same bootstrap qualifier. It has no Secrets Manager access, no concerns
-table access and no registry writes. The curator can call its models, read
-its own prefix in the assets bucket, read and write the concerns tables,
-write the reviewer registries, read its own registry, write its own runtime
-log groups and pull from the same repository. It holds no GitHub
-credentials and makes no GitHub calls. [infra/README.md](../infra/README.md#stacks)
-lists the actions.
+region that uses the same bootstrap qualifier. It has no Secrets Manager
+access, no concerns table access and no registry writes. The curator can
+call its models, read its own prefix in the assets bucket (and list the
+bucket), read and write the concerns tables, write the reviewer registries,
+read its own registry, write its own runtime log groups and pull from the
+same repository. It holds no GitHub credentials and makes no GitHub calls.
+[infra/README.md](../infra/README.md#stacks) lists the grants in more
+detail.
 
 ## 6. The curator
 

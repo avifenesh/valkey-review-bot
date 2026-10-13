@@ -27,8 +27,12 @@ away from it:
   the repository's `.git/config`.
 - Build and test processes the reviewer starts get an environment with AWS,
   GitHub, token and secret variables removed, and start in the checked-out
-  workspace. They are not otherwise sandboxed inside the container, so code from
-  a pull request can use the runtime's own AWS role. That role is kept small:
+  workspace. They are not otherwise sandboxed inside the container. They run as
+  the same user as the runtime, so assume code from a pull request can obtain
+  the run's installation token (`pull_requests: write` and `metadata: read` on
+  one routed repository, valid for up to an hour): the token's scope, not its
+  secrecy, is what limits it. The same code can use the runtime's own AWS role,
+  which allows:
   - its models;
   - `s3:GetObject` on its own prefix in the assets bucket (no bucket listing),
     and `kms:Decrypt` on the substrate key, which also encrypts the concerns

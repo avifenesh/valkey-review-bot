@@ -18,8 +18,8 @@ export interface SubstrateStackProps extends cdk.StackProps {
 
 /**
  * Resources shared by every agent in one account and region: the KMS key,
- * the prompt and skill bucket, the GitHub App secret, the token broker and
- * the run heartbeat table. Each agent stack creates its own execution role
+ * the prompt and skill bucket, the GitHub App secret, one token broker per
+ * reviewer and the run heartbeat table. Each agent stack creates its own execution role
  * and grants it only what that agent uses.
  */
 export class SubstrateStack extends cdk.Stack {

@@ -57,8 +57,8 @@ permissions are granted only when an `openai.*` model is configured.
 1. Install Node.js 24 or later, Docker and the AWS CLI. `cdk deploy`
    builds the three agent images for linux/arm64. On an x86 machine
    Docker needs arm64 emulation (buildx with QEMU; Docker Desktop
-   includes it), or deploy from an arm64 machine. The AWS CLI is used by
-   the scripts' `--stack` option.
+   includes it), or deploy from an arm64 machine. The operator scripts in
+   `scripts/` use the AWS CLI.
 2. Bootstrap CDK in the target account and region, preferably an account
    used for nothing else (see [Stacks](#stacks)):
    `npx cdk bootstrap aws://ACCOUNT/REGION`. If you use a custom qualifier,
@@ -120,7 +120,7 @@ repository root:
 
 ```sh
 (cd agents/common && npm ci)
-node scripts/publish-curator-skills.mjs --stack ValkeyReviewerCurator
+node scripts/publish-curator-skills.mjs --stack ValkeyReviewerCurator --region REGION
 ```
 
 The script runs the registry code in `agents/common`, so that package

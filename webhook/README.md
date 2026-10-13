@@ -19,9 +19,11 @@ What happens to a delivery:
   `webhook_secret` from the GitHub App secret. On a mismatch the secret is
   fetched again, at most once a minute, so a rotated secret is picked up.
   Payload fields are logged only for verified deliveries.
-- `pull_request` `opened`, `reopened` and `ready_for_review` start an
-  automatic review on a review route, after the route gates (bot authors,
-  `mentionOnly`, `skipDrafts`, `authorAllowlist`), an idempotency check on
+- `pull_request` `opened` and `reopened` start an automatic review on a
+  review route. On `skipDrafts` routes a draft is skipped and reviewed on
+  `ready_for_review` instead; other routes ignore `ready_for_review`. The
+  route gates (bot authors, `mentionOnly`, `skipDrafts`, `authorAllowlist`)
+  come first, then an idempotency check on
   `repo#pr#head_sha` and the route's daily budget. New commits do not start
   a review.
 - A comment that tags the bot (`@your-app-slug`) from a user with push
