@@ -1,0 +1,47 @@
+import { BedrockRuntimeClient } from '@aws-sdk/client-bedrock-runtime';
+import { DynamoDBClient } from '@aws-sdk/client-dynamodb';
+import { GetSecretValueCommand, SecretsManagerClient } from '@aws-sdk/client-secrets-manager';
+import { SendMessageCommand, SQSClient } from '@aws-sdk/client-sqs';
+import { DynamoDBDocumentClient } from '@aws-sdk/lib-dynamodb';
+import { loadReceiverConfig } from './config.js';
+import { createDeliveryHandler } from './delivery.js';
+import { createAppSecretSource, createInstallationTokens, githubApi } from './github.js';
+import { createSafetyGate } from './mention.js';
+import { createDeliveryStore } from './store.js';
+
+/**
+ * Receiver Lambda behind the HTTP API. Wires the AWS clients and the
+ * configuration into the delivery handler in src/delivery.ts, which has
+ * the logic.
+ */
+
+const config = loadReceiverConfig(process.env);
+
+const sm = new SecretsManagerClient({});
+const sqs = new SQSClient({});
+const secrets = createAppSecretSource(async () =>
+  (await sm.send(new GetSecretValueCommand({ SecretId: config.githubSecretArn }))).SecretString);
+const installationToken = createInstallationTokens(secrets);
+
+export const handler = createDeliveryHandler(config, {
+  webhookSecret: async (refresh) => {
+    const { webhookSecret } = await (refresh ? secrets.refresh() : secrets.get());
+    if (!webhookSecret) throw new Error('GitHub App secret has no webhook_secret');
+    return webhookSecret;
+  },
+  store: createDeliveryStore(DynamoDBDocumentClient.from(new DynamoDBClient({})), config.idempotencyTable),
+  sendMessage: async (queueUrl, body, attributes) => {
+    await sqs.send(new SendMessageCommand({
+      QueueUrl: queueUrl,
+      MessageBody: JSON.stringify(body),
+      MessageAttributes: Object.fromEntries(Object.entries(attributes).map(([name, value]) => [
+        name,
+        typeof value === 'number'
+          ? { DataType: 'Number', StringValue: String(value) }
+          : { DataType: 'String', StringValue: value },
+      ])),
+    }));
+  },
+  github: async (installationId) => githubApi(await installationToken(installationId)),
+  approveInstruction: createSafetyGate({ client: new BedrockRuntimeClient({}), modelId: config.safetyModelId }),
+});

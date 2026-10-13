@@ -1,0 +1,139 @@
+import assert from 'node:assert/strict';
+import * as fs from 'node:fs';
+import test from 'node:test';
+import './support/ts-resolve.mjs';
+
+const { heartbeatRunKey } = await import('../src/review-envelope.ts');
+const { CURATOR_MAX_RECEIVES, decide } = await import('../src/watchdog.ts');
+
+const MIN = 60_000;
+const NOW = Date.parse('2026-10-13T12:00:00Z');
+const review = { repo: 'example-org/valkey', pr_number: 7, installation_id: 42, head_sha: 'abc123' };
+const curator = { reviewer_id: 'valkey-review', feedback_id: 'rc-1', kind: 'review_comment_reply', repo: 'example-org/valkey', pr_number: 7 };
+
+function input(overrides = {}) {
+  const reads = [];
+  return {
+    reads,
+    value: {
+      envelope: review,
+      receiveCount: 2,
+      sentAt: NOW - 20 * MIN,
+      now: NOW,
+      runBudgetMs: 90 * MIN,
+      staleMs: 12 * MIN,
+      readHeartbeat: async (key) => { reads.push(key); return undefined; },
+      ...overrides,
+    },
+  };
+}
+
+const withHeartbeat = (record) => ({ readHeartbeat: async () => record });
+
+test('the first receive of a review invokes the primary model without reading the heartbeat', async () => {
+  const { value, reads } = input({ receiveCount: 1 });
+  assert.deepEqual(await decide(value), { action: 'invoke', useFallbackModel: false, reason: 'first attempt' });
+  assert.equal(reads.length, 0);
+});
+
+test('a completed run is not repeated', async () => {
+  const { value } = input(withHeartbeat({ status: 'completed', last_activity: NOW - 30 * MIN }));
+  assert.equal((await decide(value)).action, 'delete');
+});
+
+test('a live run is left alone until the next visibility timeout', async () => {
+  const { value } = input(withHeartbeat({ status: 'running', last_activity: NOW - 3 * MIN }));
+  assert.deepEqual(await decide(value), { action: 'wait', reason: 'heartbeat 180s ago' });
+});
+
+test('a dead run is retried on the fallback model', async () => {
+  for (const record of [
+    undefined,
+    { status: 'running' },
+    { status: 'failed', last_activity: NOW - MIN },
+    { status: 'running', last_activity: NOW - 13 * MIN },
+  ]) {
+    const { value } = input(withHeartbeat(record));
+    const decision = await decide(value);
+    assert.equal(decision.action, 'invoke', JSON.stringify(record));
+    assert.equal(decision.useFallbackModel, true);
+  }
+});
+
+test('the staleness threshold comes from the input', async () => {
+  const { value } = input({ staleMs: 2 * MIN, ...withHeartbeat({ status: 'running', last_activity: NOW - 3 * MIN }) });
+  assert.equal((await decide(value)).action, 'invoke');
+});
+
+test('a review past its run budget is abandoned without reading the heartbeat', async () => {
+  const { value, reads } = input({ sentAt: NOW - 91 * MIN, receiveCount: 7 });
+  const decision = await decide(value);
+  assert.equal(decision.action, 'delete');
+  assert.equal(decision.error, true);
+  assert.match(decision.reason, /91 min > 90 min/);
+  assert.equal(reads.length, 0);
+
+  const longer = input({ sentAt: NOW - 91 * MIN, runBudgetMs: 120 * MIN });
+  assert.equal((await decide(longer.value)).action, 'invoke');
+});
+
+test('a healthy long review ends on its budget before the queue dead-letters it', async () => {
+  // infra: 16-minute visibility timeout, dead letter after 8 receives.
+  let receive = 1;
+  let decision;
+  for (; receive <= 8; receive++) {
+    const sentAt = NOW - (receive - 1) * 16 * MIN;
+    const { value } = input({ receiveCount: receive, sentAt, ...withHeartbeat({ status: 'running', last_activity: NOW - MIN }) });
+    decision = await decide(value);
+    if (decision.action === 'delete') break;
+  }
+  assert.equal(decision.action, 'delete');
+  assert.ok(receive < 8, `ended on receive ${receive}`);
+});
+
+test('the heartbeat is read under the run key of the envelope', async () => {
+  const { value, reads } = input({ envelope: { ...review, run_nonce: 'ready' } });
+  await decide(value);
+  assert.deepEqual(reads, ['example-org/valkey#7#abc123#ready']);
+});
+
+test('curator messages run on every receive up to the queue limit, then are deleted', async () => {
+  for (let receive = 1; receive <= CURATOR_MAX_RECEIVES; receive++) {
+    const { value, reads } = input({ envelope: curator, receiveCount: receive });
+    const decision = await decide(value);
+    assert.equal(decision.action, 'invoke');
+    assert.equal(decision.useFallbackModel, false);
+    assert.equal(reads.length, 0, 'curator runs have no heartbeat');
+  }
+  const { value } = input({ envelope: curator, receiveCount: CURATOR_MAX_RECEIVES + 1 });
+  const decision = await decide(value);
+  assert.equal(decision.action, 'delete');
+  assert.equal(decision.error, true);
+});
+
+test('heartbeatRunKey matches the runtime formula', () => {
+  assert.equal(heartbeatRunKey(review), 'example-org/valkey#7#abc123');
+  assert.equal(heartbeatRunKey({ ...review, run_nonce: 'm101' }), 'example-org/valkey#7#abc123#m101');
+  assert.equal(heartbeatRunKey({ ...review, run_nonce: '' }), 'example-org/valkey#7#abc123');
+  assert.equal(heartbeatRunKey({ repo: 'o/r', pr_number: 1 }), 'o/r#1#unknown');
+  assert.equal(heartbeatRunKey({ repo: 'o/r', pr_number: 1, head_sha: '' }), 'o/r#1#');
+});
+
+test('heartbeatRunKey stays byte-identical to agents/common/src/run-agent.ts', () => {
+  // The runtime writes the heartbeat under this key; the invoker must
+  // read the same one. Evaluate the runtime's own expression on the same
+  // payloads and compare.
+  const source = fs.readFileSync(new URL('../../agents/common/src/run-agent.ts', import.meta.url), 'utf8');
+  const match = source.match(/const runKey = (`[^\n]*`);\n/);
+  assert.ok(match, 'run-agent.ts no longer builds runKey inline; update this test and heartbeatRunKey together');
+  const runtimeKey = new Function('payload', `return ${match[1]};`);
+  for (const payload of [
+    review,
+    { ...review, run_nonce: 'm101' },
+    { ...review, run_nonce: 'ready' },
+    { repo: 'o/r', pr_number: 1, installation_id: 2 },
+    { repo: 'o/r', pr_number: 1, installation_id: 2, head_sha: '' },
+  ]) {
+    assert.equal(heartbeatRunKey(payload), runtimeKey(payload), JSON.stringify(payload));
+  }
+});
