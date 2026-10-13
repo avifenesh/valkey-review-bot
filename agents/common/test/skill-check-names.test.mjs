@@ -65,6 +65,12 @@ test('double-backtick spans are read', () => {
   assert.deepEqual(tokens(skill('Use `` server.primary `` here.')), ['server.primary']);
 });
 
+test('an escaped backtick is text, not a span delimiter', () => {
+  assert.deepEqual(tokens(skill('Use \\` for `name_one` and \\` for `name_two`.')), ['name_one', 'name_two']);
+  // Two backslashes escape each other, not the backtick.
+  assert.deepEqual(tokens(skill('Ends in \\\\`d_name` here.')), ['d_name']);
+});
+
 test('the frontmatter description contributes paths and A::b names, but not its prose', () => {
   const md = skill('Body cites `bodyOnly_name`.',
     'Use when reviewing a PR that touches glide-core/src/timeout_watchdog.rs, src/modules/ or `src/rdb.c`, or calls ConnectionManager::reconnect. Not for valkey-io/valkey forks, Node.js or e.g. the server.c file.');

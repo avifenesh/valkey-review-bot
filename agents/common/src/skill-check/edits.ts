@@ -29,7 +29,9 @@
  * replacing a number, and appear on one of the edit's cited lines. Words
  * outside code spans never change, so an edit cannot turn "NEVER flag"
  * into "ALWAYS flag", add or remove a word, a sentence or punctuation,
- * and the replacement has as many lines as the original. The
+ * and the replacement has as many lines as the original. An escaped
+ * backtick (\`) is text, not a span delimiter, and a line whose
+ * backticks do not pair up is never edited. The
  * frontmatter, fenced blocks and already-suppressed pieces are never
  * edited, and suppressed blocks do not nest.
  *
@@ -136,8 +138,6 @@ const TOKEN_RE = /[A-Za-z0-9_.\/:*>-]+/g;
 const WORD_CHAR_RE = /[A-Za-z0-9_]/;
 /** A number, or a version such as 9.0.1 or v9.0. */
 const NUMBER_RE = /^v?[0-9]+(?:\.[0-9]+)*$/;
-/** Inline code spans, CommonMark style (matching backtick runs), as names.ts reads them. */
-const CODE_SPAN_RE = /(?<!`)(`+)(?!`)(.+?)(?<!`)\1(?!`)/g;
 
 const FENCE_OPEN_RE = /^ {0,3}(`{3,}|~{3,})/;
 const FENCE_CLOSE_RE = /^ {0,3}(`{3,}|~{3,})\s*$/;
@@ -401,6 +401,39 @@ interface Tokens {
   readonly spans: [number, number][];
 }
 
+/**
+ * The inline code spans of one line, as [start, end) of their content.
+ * Backtick runs pair as in CommonMark (a run closes at the next run of
+ * the same length), as names.ts reads them, but a run after an odd
+ * number of backslashes is literal text, never a delimiter. `clear` is
+ * false when an unescaped run pairs with none, or an escaped one falls
+ * inside a span: a reader of the raw text could not tell which words
+ * are code.
+ */
+function lineCodeSpans(line: string): { spans: [number, number][]; clear: boolean } {
+  const runs: { start: number; end: number; escaped: boolean }[] = [];
+  for (const m of line.matchAll(/`+/g)) {
+    let slashes = 0;
+    while (m.index - slashes > 0 && line[m.index - slashes - 1] === '\\') slashes++;
+    runs.push({ start: m.index, end: m.index + m[0].length, escaped: slashes % 2 === 1 });
+  }
+  const delimiters = runs.filter((r) => !r.escaped);
+  const spans: [number, number][] = [];
+  let clear = true;
+  for (let i = 0; i < delimiters.length; i++) {
+    const open = delimiters[i]!;
+    const close = delimiters.findIndex((r, k) => k > i && r.end - r.start === open.end - open.start);
+    if (close < 0) {
+      clear = false;
+      continue;
+    }
+    spans.push([open.end, delimiters[close]!.start]);
+    i = close;
+  }
+  if (runs.some((r) => r.escaped && spans.some(([s, e]) => r.start >= s && r.start < e))) clear = false;
+  return { spans, clear };
+}
+
 function splitTokens(text: string): Tokens {
   const tokens: string[] = [];
   const starts: number[] = [];
@@ -413,11 +446,13 @@ function splitTokens(text: string): Tokens {
     last = m.index + m[0].length;
   }
   seps.push(text.slice(last));
-  // '.' does not match '\n', so a span never crosses a line, as in names.ts.
-  const spans: [number, number][] = [...text.matchAll(CODE_SPAN_RE)].map((m) => {
-    const start = m.index + m[1]!.length;
-    return [start, start + m[2]!.length];
-  });
+  // A span never crosses a line, as in names.ts.
+  const spans: [number, number][] = [];
+  let lineStart = 0;
+  for (const line of text.split('\n')) {
+    for (const [s, e] of lineCodeSpans(line).spans) spans.push([lineStart + s, lineStart + e]);
+    lineStart += line.length + 1;
+  }
   return { tokens, starts, seps, spans };
 }
 
@@ -716,6 +751,11 @@ function plan(skillMd: string, edits: readonly SuppressEdit[], ctx: EditContext)
       if (!ctx.flagged.some((name) => containsWord(original, name))) {
         fail('the original contains none of the flagged names');
       }
+    }
+    const unclear = want.findIndex((line) => !lineCodeSpans(line).clear);
+    if (unclear >= 0) {
+      fail(`line ${unclear + 1} of the original has a backtick that pairs with none, or an escaped one inside a code span, `
+        + 'so which of its words are code is unclear; such a line is not edited');
     }
     if (replacementLines.some((l) => OPEN_LIKE_RE.test(l.trim()) || CLOSE_LIKE_RE.test(l.trim()))) {
       fail('the replacement must not contain suppression markers');

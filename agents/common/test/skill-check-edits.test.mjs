@@ -193,6 +193,32 @@ test('words outside code spans never change, even to a word on the cited line', 
   assert.deepEqual(await problems(line, 'Use when touching src/db.c or `src/dbx.c`.', ['src/db.c']), [], 'the same name in backticks may change');
 });
 
+test('an escaped backtick is text, and a line whose backticks do not pair up is not edited', async () => {
+  const lines = [
+    'Write \\`NEVER\\` flag `emptyDB` callers.',
+    'Use `emptyDB and NEVER flag `callers_x`.',
+    'Call `emptyDB\\` and `.',
+    'Use \\` for `emptyDB` and \\` for `emptyDB_x`.',
+  ];
+  const skillMd = ['---', 'name: p', 'description: "x"', '---', ...lines, ''].join('\n');
+  const table = { 'src/db.c:1': '/* ALWAYS emptyData */' };
+  const problems = async (original, replacement, flagged = ['emptyDB', 'NEVER']) =>
+    (await validateEdits(skillMd, [{ original, replacement, evidence: [cite('src/db.c', 1)] }], ctx({ flagged }), resolver(table))).problems;
+  assert.deepEqual(await problems(lines[0], lines[0].replace('NEVER', 'ALWAYS')),
+    ['edit 1: "ALWAYS" replaces "NEVER" outside a code span; only names in backticks and numbers may change']);
+  const unclear = 'edit 1: line 1 of the original has a backtick that pairs with none, or an escaped one inside a code span, '
+    + 'so which of its words are code is unclear; such a line is not edited';
+  // CommonMark reads "emptyDB and NEVER flag " as a span; the raw text reads as prose.
+  assert.deepEqual(await problems(lines[1], lines[1].replace('NEVER', 'ALWAYS')), [unclear]);
+  assert.deepEqual(await problems(lines[1], lines[1].replace('emptyDB', 'emptyData')), [unclear]);
+  assert.deepEqual(await problems(lines[2], lines[2].replace('emptyDB', 'emptyData')), [unclear]);
+  // Escaped backticks outside spans leave the spans between them as they are.
+  assert.deepEqual(await problems(lines[3], lines[3].replace('`emptyDB`', '`emptyData`')), []);
+  const twoLines = `${lines[0]}\n${lines[1]}`;
+  assert.deepEqual(await problems(twoLines, twoLines.replace('`emptyDB`', '`emptyData`')),
+    [unclear.replace('line 1', 'line 2')]);
+});
+
 test('numbers may change in prose, with emphasis, sentence punctuation or a version form', async () => {
   const lines = ['`hash-max-listpack-entries` defaults to **512**.', 'Since v9.0 (and 9.0.1) `emptyDB` is lazy.'];
   const skillMd = ['---', 'name: p', 'description: "x"', '---', ...lines, ''].join('\n');

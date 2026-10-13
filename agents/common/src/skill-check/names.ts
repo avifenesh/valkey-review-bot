@@ -106,12 +106,26 @@ function normalizeSpan(span: string): string | null {
   return t;
 }
 
-/** Inline code spans on one line, CommonMark style: matching backtick runs, one padding space trimmed. */
+/**
+ * Inline code spans on one line, CommonMark style: a backtick run closes
+ * at the next run of the same length, and one padding space is trimmed.
+ * A run after an odd number of backslashes is text, not a delimiter, as
+ * edits.ts reads spans.
+ */
 function codeSpans(line: string): string[] {
+  const runs = [...line.matchAll(/`+/g)].filter((m) => {
+    let slashes = 0;
+    while (m.index - slashes > 0 && line[m.index - slashes - 1] === '\\') slashes++;
+    return slashes % 2 === 0;
+  });
   const out: string[] = [];
-  for (const m of line.matchAll(/(?<!`)(`+)(?!`)(.+?)(?<!`)\1(?!`)/g)) {
-    const inner = m[2]!;
+  for (let i = 0; i < runs.length; i++) {
+    const open = runs[i]!;
+    const close = runs.findIndex((r, k) => k > i && r[0].length === open[0].length);
+    if (close < 0) continue;
+    const inner = line.slice(open.index + open[0].length, runs[close]!.index);
     out.push(inner.length > 2 && inner.startsWith(' ') && inner.endsWith(' ') ? inner.slice(1, -1) : inner);
+    i = close;
   }
   return out;
 }
