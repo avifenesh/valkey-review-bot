@@ -32,6 +32,8 @@ import { errorText, fail, ok, type TouchedRecord } from './run.js';
  * re-publishes under a generation name, the subject's slug with a
  * suffix derived from "<record_id>#g<n>". A skill an operator retired
  * (retired_reason "operator") is never published again by the curator.
+ * A REJECTED registry record always counts as an operator's retirement,
+ * whatever the retire run's marker says.
  *
  * A new generation is claimed on the record while it stays a tombstone:
  * the claim sets the new name and previous_record_name and removes
@@ -333,12 +335,16 @@ async function sendWithRetries(deps: SubmitSkillDeps, build: () => UpdateCommand
  * calls its skill live, so it was deprecated outside this run. Record
  * that on the source record, best effort, and return the refusal.
  *
- * maintenance_deprecating = name means the lifecycle's own retire run
- * started the deprecation (ops/src/decay.ts); the reason is then
- * obsolete or decayed, and a reinforcement can publish the skill again
- * under a new name. Without that marker an operator retired it.
+ * `status` is the registry status that showed the record retired.
+ * maintenance_deprecating = name on a DEPRECATED record means the
+ * lifecycle's own retire run started the deprecation (ops/src/decay.ts);
+ * the reason is then obsolete or decayed, and a reinforcement can
+ * publish the skill again under a new name. Without that marker an
+ * operator retired it. REJECTED is always an operator's retirement,
+ * marker or not: the lifecycle never rejects a record. The write is
+ * conditioned on the marker as read either way.
  */
-async function markRetired(deps: SubmitSkillDeps, key: Key, name: string, reinforced: boolean): Promise<string> {
+async function markRetired(deps: SubmitSkillDeps, key: Key, name: string, status: string | undefined, reinforced: boolean): Promise<string> {
   let lifecycle = false;
   try {
     const current = await getRecord(deps, key.area_bucket, key.record_id);
@@ -346,11 +352,11 @@ async function markRetired(deps: SubmitSkillDeps, key: Key, name: string, reinfo
       return `skill "${name}" was retired while this run worked; read the record again with get_concern`;
     }
     const marker = current.maintenance_deprecating;
-    lifecycle = marker === name;
+    lifecycle = marker === name && status !== 'REJECTED';
     const reason = lifecycle ? (current.obsolete_release !== undefined ? 'obsolete' : 'decayed') : 'operator';
     const conditions = ['#grn = :name', 'attribute_not_exists(#ret)'];
     const values: Record<string, unknown> = { ':name': name, ':now': new Date().toISOString(), ':reason': reason };
-    if (lifecycle) {
+    if (marker === name) {
       conditions.push('#mdep = :name');
     } else if (marker === undefined) {
       conditions.push('attribute_not_exists(#mdep)');
@@ -436,7 +442,7 @@ async function chooseTarget(
     if (!deps.registry.get) return `cannot read the published skill "${current}" (no registry reader is configured), so it is not updated`;
     const published = await deps.registry.get(current);
     if (published && isRetiredStatus(published.status)) {
-      return markRetired(deps, { area_bucket: input.area_bucket, record_id: input.source_record_id }, current, reinforced);
+      return markRetired(deps, { area_bucket: input.area_bucket, record_id: input.source_record_id }, current, published.status, reinforced);
     }
     // update_concern corrects a published skill; it does not create a missing one.
     if (!published && !reinforced) return `the registry has no skill named "${current}"; only a reinforcement can publish it`;
@@ -560,11 +566,12 @@ Do not delete the source record afterwards; it stays as the skill's provenance.`
             skillMd,
           });
         } catch (err) {
-          if ((err as { name?: string } | null)?.name !== 'SkillRetiredError') throw err;
+          const retired = err as { name?: string; status?: unknown } | null;
+          if (retired?.name !== 'SkillRetiredError') throw err;
           // The claim left the record a tombstone, and the lifecycle never retires a tombstone's skill.
           const refusal = target.tombstone
             ? await markGenerationRetired(deps, key, target.name, source)
-            : await markRetired(deps, key, target.name, reinforced);
+            : await markRetired(deps, key, target.name, typeof retired.status === 'string' ? retired.status : undefined, reinforced);
           return fail(`submit_skill: ${refusal}`);
         }
         published = true;

@@ -298,7 +298,9 @@ function fakeRegistry(records = {}) {
       calls.push(`upsert ${input.name}`);
       const existing = skills.get(input.name);
       if (existing && ['DEPRECATED', 'REJECTED'].includes(existing.status)) {
-        throw Object.assign(new Error(`skill "${input.name}" is ${existing.status}`), { name: 'SkillRetiredError' });
+        throw Object.assign(new Error(`skill "${input.name}" is ${existing.status}`), {
+          name: 'SkillRetiredError', skillName: input.name, recordId: `id-${input.name}`, status: existing.status,
+        });
       }
       const status = existing ? 'UPDATING' : 'CREATING';
       skills.set(input.name, { name: input.name, status, description: input.description, skillMd: input.skillMd });
@@ -524,6 +526,79 @@ test('a deprecation the lifecycle started is marked decayed or obsolete, and the
   const out = parse(await edited.submit.invoke(INPUT));
   assert.equal(out.ok, false);
   assert.match(out.error, /only a reinforcement can publish it again/);
+});
+
+test('a REJECTED skill is an operator retirement whatever the retire run\'s marker says', async () => {
+  // The lifecycle never rejects a record (ops/src/decay.ts), so even this
+  // record's own marker does not make a rejection the lifecycle's.
+  const REJECTED = { [OLD]: { status: 'REJECTED', skillMd: 'old body' } };
+  for (const marker of [OLD, undefined, 'an-older-generation']) {
+    for (const extra of [{}, { obsolete_release: '9.1.2' }]) {
+      const name = `marker ${marker} ${JSON.stringify(extra)}`;
+      const item = live({ ...(marker ? { maintenance_deprecating: marker } : {}), ...extra });
+      const w = world({ item, skills: REJECTED });
+      const out = parse(await w.submit.invoke(INPUT));
+      assert.equal(out.ok, false, name);
+      assert.match(out.error, /skill "replication-handshake-cancel-paths" was retired by an operator; it is not published again/, name);
+      const rec = w.record();
+      assert.equal(rec.retired_reason, 'operator', name);
+      assert.ok(rec.retired_at, name);
+      assert.equal(rec.maintenance_deprecating, marker, `${name}: the marker is left as it was`);
+      assertUpdatesWellFormed(w.ddb);
+
+      // A later reinforcement does not publish the rejected skill under a new name.
+      const again = parse(await w.nextRun().submit.invoke(INPUT));
+      assert.equal(again.ok, false, name);
+      assert.match(again.error, /retired by an operator/, name);
+      assert.deepEqual([...w.registry.skills.keys()], [OLD], `${name}: nothing was published`);
+    }
+  }
+
+  // An update_concern run gets the operator refusal too, not "only a reinforcement".
+  const edited = world({ item: live({ maintenance_deprecating: OLD }), skills: REJECTED, reinforced: false, edited: true });
+  const out = parse(await edited.submit.invoke(INPUT));
+  assert.equal(out.ok, false);
+  assert.match(out.error, /retired by an operator; it is not published again/);
+  assert.equal(edited.record().retired_reason, 'operator');
+});
+
+test('a skill rejected between the read and the update is an operator retirement whatever the marker says', async () => {
+  // getSkillByName saw it live; a registry approver rejected it before upsertSkill ran.
+  const registry = fakeRegistry({ [OLD]: { status: 'PENDING_APPROVAL', skillMd: 'old body' } });
+  const get = registry.get;
+  registry.get = async (name) => {
+    const seen = await get(name);
+    registry.skills.set(OLD, { ...registry.skills.get(OLD), status: 'REJECTED' });
+    return seen;
+  };
+  const w = world({ item: live({ maintenance_deprecating: OLD }), registry });
+  const out = parse(await w.submit.invoke(INPUT));
+  assert.equal(out.ok, false);
+  assert.match(out.error, /retired by an operator; it is not published again/);
+  assert.ok(registry.calls.includes(`upsert ${OLD}`), 'the refusal came from upsert');
+  assert.equal(w.record().retired_reason, 'operator');
+  assert.equal(w.record().maintenance_deprecating, OLD);
+});
+
+test('a rejection is not recorded when the marker changes before the write', async () => {
+  // The reason does not depend on the marker, but the write is still conditioned on it as read.
+  const isRetirement = (command) => command.constructor.name === 'UpdateCommand' && command.input.UpdateExpression === 'SET #ret = :now, #rr = :reason';
+  const cases = {
+    'a marker appears': [undefined, (row) => { row.maintenance_deprecating = OLD; }],
+    'the marker goes': [OLD, (row) => { delete row.maintenance_deprecating; }],
+    'an older marker is replaced': ['an-older-generation', (row) => { row.maintenance_deprecating = OLD; }],
+  };
+  for (const [name, [marker, change]] of Object.entries(cases)) {
+    const item = live(marker ? { maintenance_deprecating: marker } : {});
+    const skills = { [OLD]: { status: 'REJECTED', skillMd: 'old body' } };
+    const w = world({ item, skills, intercept: (command, row) => { if (isRetirement(command)) change(row); } });
+    let out;
+    const logged = await capturingLogs(async () => { out = parse(await w.submit.invoke(INPUT)); });
+    assert.equal(out.ok, false, name);
+    assert.match(out.error, /retired by an operator/, name);
+    assert.ok(!('retired_at' in w.record()), `${name}: no retirement is recorded`);
+    assert.match(logged.warn.join('\n'), /retirement of "replication-handshake-cancel-paths" not recorded on r1: ConditionalCheckFailedException/, name);
+  }
 });
 
 test('a retirement is not recorded when the retire run\'s marker changes before the write', async () => {
