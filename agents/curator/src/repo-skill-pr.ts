@@ -1,5 +1,14 @@
 import { createHash } from 'node:crypto';
-import { isReleaseLabel, parseCitation, parseSuppressed } from '../../common/src/skill-check/edits.js';
+import {
+  applyEdits,
+  checkEdits,
+  isReleaseLabel,
+  parseCitation,
+  parseSuppressed,
+  type EditContext,
+  type SuppressEdit,
+  type SuppressedBlock,
+} from '../../common/src/skill-check/edits.js';
 
 /**
  * Repo-skill pull requests (amendment A2).
@@ -15,8 +24,9 @@ import { isReleaseLabel, parseCitation, parseSuppressed } from '../../common/src
  *
  * What it does, per (reviewer, release):
  * - refuses any path but agents/<reviewerId>/config/skill.md, and any
- *   new content that is not the base content plus well-formed
- *   suppress-and-add insertions for that release;
+ *   new content that is not the base content plus suppress-and-add
+ *   edits for that release that keep the registry skills' edit contract
+ *   (skill-check/edits.ts), re-derived from the two texts;
  * - returns base-moved when the base branch moved past baseSha and the
  *   file changed since; when only other files changed, the commit is
  *   built on the new tip;
@@ -86,6 +96,8 @@ const SHA_RE = /^[0-9a-f]{40}$/;
 const REVIEWER_ID_RE = /^[a-z0-9][a-z0-9-]{0,99}$/;
 const SIGN_OFF_RE = /^[^<>\x00-\x1f\x7f]+ <[^<>\s@]+@[^<>\s@]+>$/;
 const MARKER_LIKE_RE = /^\s*<!--\s*\/?\s*suppressed\b/;
+/** The token class the edit contract splits pieces on (skill-check/edits.ts). */
+const TOKEN_RE = /[A-Za-z0-9_.\/:*>-]+/g;
 
 /** A branch or tag name git and GitHub accept, kept to a safe character set. */
 function isRefName(name: string): boolean {
@@ -188,22 +200,43 @@ function hasControl(text: string, allowNewline: boolean): boolean {
   return (allowNewline ? /[\x00-\x08\x0b-\x1f\x7f]/ : /[\x00-\x1f\x7f]/).test(text);
 }
 
+/** The suppress-and-add edits a proposal adds to its base, and the date their markers carry. */
+interface DerivedEdits {
+  readonly edits: readonly SuppressEdit[];
+  /** YYYY-MM-DD of the check that wrote them. */
+  readonly date: string;
+}
+
 /**
- * Why `next` is not `base` plus suppress-and-add insertions for
- * `release`, or null when it is. Each insertion is an opening marker
- * before lines of the base kept as they are, the closing marker, and as
- * many replacement lines, which is what applyEdits renders. Nothing of
- * the base may change or go.
+ * Re-derive the edits `next` adds to `base` and check them with the
+ * registry skills' edit contract, or say why they fail it.
+ *
+ * First the alignment: each insertion is an opening marker before lines
+ * of the base kept as they are, the closing marker, and as many
+ * replacement lines; nothing of the base may change or go. Then the
+ * insertions, as edits of the base, go through skill-check's checkEdits
+ * (piece size, edit count, growth, which tokens may change, frontmatter,
+ * fenced and already-suppressed lines), and applyEdits must render
+ * `next` from them byte for byte, so the marker text, its generated
+ * reason and the line endings are the library's own. All edits of one
+ * proposal come from one check: one release, one date, one upstream
+ * commit.
+ *
+ * Two rules need the check's run rather than the content: which names
+ * the check flagged, and whether the cited lines hold the new names.
+ * The caller enforces them (validateEdits with the check's context), and
+ * the pull request links every cited line for maintainers; here every
+ * name of an edit's original counts as flagged.
  */
-export function insertionProblem(base: string, next: string, release: string): string | null {
+function deriveEdits(base: string, next: string, release: string): DerivedEdits | string {
   const parsed = parseSuppressed(next);
   if (parsed.problems.length > 0) return `the new content has malformed suppression markers: ${parsed.problems[0]}`;
   const opens = new Map(parsed.blocks.map((b) => [b.startLine - 1, b]));
   const b = base.split('\n');
   const n = next.split('\n');
+  const added: { block: SuppressedBlock; edit: SuppressEdit }[] = [];
   let i = 0;
   let j = 0;
-  let added = 0;
   while (i < n.length) {
     if (j < b.length && n[i] === b[j]) {
       i++;
@@ -222,13 +255,54 @@ export function insertionProblem(base: string, next: string, release: string): s
     for (let k = after; k < after + kept; k++) {
       if (MARKER_LIKE_RE.test(n[k]!)) return `the replacement after the suppressed block at line ${i + 1} holds a marker`;
     }
+    // applyEdits drops one final newline of a piece, so one is added: a piece may end in an empty line.
+    const original = `${n.slice(i + 1, i + 1 + kept).join('\n')}\n`;
+    const replacement = `${n.slice(after, after + kept).join('\n')}\n`;
+    added.push({ block, edit: { original, replacement, evidence: block.evidence } });
     i = after + kept;
     j += kept;
-    added++;
   }
   if (j !== b.length) return 'the new content drops lines of the base content';
-  if (added === 0) return 'the new content adds no suppress-and-add edit';
-  return null;
+  if (added.length === 0) return 'the new content adds no suppress-and-add edit';
+
+  const dates = [...new Set(added.map((a) => a.block.date))];
+  if (dates.length > 1) return `the new suppressed blocks carry ${dates.length} dates (${dates.join(', ')}); the edits of one check carry one`;
+  const cited = added[0]!.block.evidence[0]!;
+  const edits = added.map((a) => a.edit);
+  const flagged = [...new Set(edits.flatMap((e) => (e.original.match(TOKEN_RE) ?? []).flatMap((t) => [t, t.replace(/:\d+(?:-\d+)?$/, '')])))];
+  const ctx: EditContext = {
+    flagged,
+    release,
+    date: dates[0]!,
+    upstream: { repo: cited.repo, sha: cited.sha },
+    // The file's own limit; the edit contract's growth cap still holds.
+    maxChars: MAX_FILE_BYTES,
+  };
+  let problems: string[];
+  let rendered: string;
+  try {
+    problems = checkEdits(base, edits, ctx);
+    rendered = problems.length === 0 ? applyEdits(base, edits, ctx) : '';
+  } catch (err) {
+    return `the suppress-and-add edits cannot be checked: ${err instanceof Error ? err.message : String(err)}`;
+  }
+  if (problems.length > 0) {
+    const more = problems.length > 3 ? `; and ${problems.length - 3} more` : '';
+    return `the suppress-and-add edits break the edit contract: ${problems.slice(0, 3).join('; ')}${more}`;
+  }
+  if (rendered !== next) {
+    return 'the new content is not what its suppress-and-add edits render: the marker text, its reason or the line endings differ';
+  }
+  return { edits, date: ctx.date };
+}
+
+/**
+ * Why `next` is not `base` plus suppress-and-add edits for `release`
+ * that keep the edit contract, or null when it is (see deriveEdits).
+ */
+export function insertionProblem(base: string, next: string, release: string): string | null {
+  const derived = deriveEdits(base, next, release);
+  return typeof derived === 'string' ? derived : null;
 }
 
 function proposalProblem(p: RepoSkillProposal): string | null {
