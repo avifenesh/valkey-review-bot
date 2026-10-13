@@ -306,6 +306,30 @@ test('with retirement off a retire message is only reported', async () => {
   assert.ok(lines.some((l) => l.includes('[maintenance] retire') && l.includes('outcome="would-retire"')), lines.join('\n'));
 });
 
+test('a dry run records no retirement the registry already shows, and says what it would record', async () => {
+  const cases = [
+    ['check', record(), { name: NAME, skillMd: SKILL_MD, status: 'DEPRECATED' }, 'operator'],
+    ['check', record({ maintenance_deprecating: NAME }), null, 'decayed'],
+    ['check', record(), { name: NAME, skillMd: SKILL_MD, status: 'REJECTED' }, 'operator'],
+    ['retire', record({ ...retireClaim }), { name: NAME, skillMd: SKILL_MD, status: 'DEPRECATED' }, 'operator'],
+    ['retire', record({ ...retireClaim, maintenance_deprecating: NAME }), { name: NAME, skillMd: SKILL_MD, status: 'DEPRECATED' }, 'decayed'],
+    ['retire', record({ ...retireClaim }), null, 'decayed'],
+  ];
+  for (const [kind, item, skill, reason] of cases) {
+    const s = setup({ item, skill, settings: { retireSkills: true } });
+    const message = kind === 'check' ? checkMessage({ dry_run: true }) : retireMessage({ dry_run: true });
+    const { result, lines } = await run(message, s.deps);
+    const label = `${kind} ${skill?.status ?? 'missing'}`;
+    assert.deepEqual(result, { status: 'completed', decision: 'would-record-retirement' }, label);
+    const after = s.table.item(KEY);
+    for (const attr of ['retired_at', 'retired_reason', 'retired_from_status', 'check_outcome']) assert.equal(after[attr], undefined, `${label}: ${attr}`);
+    assert.equal(after.maintenance_deprecating, item.maintenance_deprecating, label);
+    assert.ok(claimGone(after), label);
+    assert.equal(s.registry.calls.some((c) => c[0] === 'deprecate'), false, label);
+    assert.ok(lines.some((l) => l.startsWith(`[maintenance] ${kind} `) && l.includes('outcome="would-record-retirement"') && l.includes(`retired_reason="${reason}"`)), `${label}\n${lines.join('\n')}`);
+  }
+});
+
 test('a message whose claim is not on the record writes nothing', async () => {
   for (const item of [record({ maintenance_id: 'check#other' }), record({ maintenance_id: undefined }), null]) {
     const s = setup({ item, settings: { retireSkills: true } });

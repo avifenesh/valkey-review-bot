@@ -90,9 +90,10 @@ import type { SkillPublisher } from './tools/submit-skill.js';
  * (CHECK_APPLY_EDITS, RETIRE_SKILLS, CHECK_OPEN_PULL_REQUESTS), never
  * writes the registry or opens a pull request. Every run logs one
  * "[maintenance] ..." report line, plus one line per proposed edit. A
- * dry run also leaves the verification and the standing as they are:
- * it records only the audit's result (pending_revision) and releases
- * the claim, so the next real pass checks again.
+ * dry run also writes nothing the feedback path or the decay job acts
+ * on: no tombstone, no outcome, verification, names or standing. It
+ * records only the audit's result for the operator (pending_revision)
+ * and releases the claim, so the next real pass checks again.
  */
 
 const RECORD_NAME_RE = /^[a-z0-9][a-z0-9-]{0,99}$/;
@@ -525,6 +526,20 @@ async function tombstone(run: Run, reason: string, fromStatus: string | undefine
   return ok;
 }
 
+/**
+ * Record a retirement the registry already shows (the skill is
+ * DEPRECATED, REJECTED or gone). A dry run writes no tombstone: it
+ * releases the claim and reports what it would have recorded.
+ */
+async function retirement(run: Run, reason: string, fromStatus: string | undefined, markerRead: boolean | null): Promise<MaintenanceResult> {
+  if (run.req.dry_run) {
+    await run.release();
+    run.log(run.req.reason, { outcome: 'would-record-retirement', retired_reason: reason, registry_status: fromStatus ?? 'none', mode: 'report' });
+    return completed('would-record-retirement');
+  }
+  return completed(await tombstone(run, reason, fromStatus, markerRead) ? 'retired' : 'skipped');
+}
+
 /** A retirement the registry refused: back off (decay waits RETIRE_REFUSED_BACKOFF_SECONDS) and release the claim. */
 async function refused(run: Run, status: string): Promise<MaintenanceResult> {
   const w = new Write().set('retire_refused_at', run.nowIso).remove(...CLAIM);
@@ -545,11 +560,11 @@ async function* retire(run: Run, req: RetireRequest): AsyncGenerator<StreamFrame
 
   const markerRead = item![MARKER] === req.record_name;
   const skill = await run.deps.registry.get(req.record_name);
-  if (!skill) return completed(await tombstone(run, req.retire_reason, undefined, null) ? 'retired' : 'skipped');
+  if (!skill) return retirement(run, req.retire_reason, undefined, null);
   if (skill.status === 'DEPRECATED' || skill.status === 'REJECTED') {
     // DEPRECATED with the marker: this lifecycle's own deprecation, from a run that died before its tombstone.
     const own = skill.status === 'DEPRECATED' && markerRead;
-    return completed(await tombstone(run, own ? req.retire_reason : 'operator', skill.status, own ? true : skill.status === 'DEPRECATED' ? false : null) ? 'retired' : 'skipped');
+    return retirement(run, own ? req.retire_reason : 'operator', skill.status, own ? true : skill.status === 'DEPRECATED' ? false : null);
   }
   if (BUSY_STATUSES.has(skill.status)) {
     run.log('retire', { outcome: 'pending', registry_status: skill.status, why: 'the registry record is being written; the claim is kept' });
@@ -965,9 +980,9 @@ async function* check(run: Run, req: CheckRequest): AsyncGenerator<StreamFrame, 
   if (!skill || skill.status === 'DEPRECATED') {
     // With the marker the lifecycle retired it; without it someone else did.
     const reason = markerRead ? (item!.obsolete_release !== undefined ? 'obsolete' : 'decayed') : 'operator';
-    return completed(await tombstone(run, reason, skill?.status, markerRead) ? 'retired' : 'skipped');
+    return retirement(run, reason, skill?.status, markerRead);
   }
-  if (skill.status === 'REJECTED') return completed(await tombstone(run, 'operator', skill.status, null) ? 'retired' : 'skipped');
+  if (skill.status === 'REJECTED') return retirement(run, 'operator', skill.status, null);
   if (BUSY_STATUSES.has(skill.status)) return inconclusive(run, `the registry record is ${skill.status}`);
   if (!LIVE_STATUSES.has(skill.status)) return failedForGood(run, `the registry record is ${skill.status || 'in no status'}`);
   run.liveRead = true;
