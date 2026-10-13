@@ -4,36 +4,36 @@
 #
 # Usage:
 #   scripts/concerns-dump.sh --stack ValkeyReviewAgent --stack ValkeyGlideReviewAgent
-#   scripts/concerns-dump.sh --table <concerns-table-name>
+#   scripts/concerns-dump.sh --table <concerns-table-name> [--region REGION]
 #
-#   --stack NAME   a reviewer agent stack; its ConcernsTableName output is used
-#   --table NAME   a concerns table, used as given
+#   --stack NAME     a reviewer agent stack; its ConcernsTableName output is used
+#   --table NAME     a concerns table, used as given
+#   --region REGION  the AWS region; default AWS_REGION or the CLI profile
 #
-# Both options can be repeated and mixed; at least one is required.
+# --stack and --table can be repeated and mixed; at least one is required.
 #
 # Needs the AWS CLI v2 and jq, and credentials allowed to call
 # cloudformation:DescribeStacks (for --stack) and dynamodb:Scan on the
 # tables, plus kms:Decrypt on the key the tables are encrypted with (the
-# SubstrateKeyArn output of ValkeyReviewerSubstrate). The region comes
-# from AWS_REGION or the CLI profile.
+# SubstrateKeyArn output of ValkeyReviewerSubstrate).
 set -euo pipefail
 
 . "$(dirname "$0")/lib/common.sh"
 
 usage() {
-  echo "usage: $0 [--stack REVIEWER_STACK]... [--table CONCERNS_TABLE]..." >&2
+  echo "usage: $0 [--stack REVIEWER_STACK]... [--table CONCERNS_TABLE]... [--region REGION]" >&2
   exit "${1:-0}"
 }
 
 require_cmd aws jq
 
+stacks=""
 tables=""
 while [ $# -gt 0 ]; do
   case "$1" in
     --stack)
       [ $# -ge 2 ] || die "--stack needs a stack name"
-      table=$(stack_output "$2" ConcernsTableName)
-      tables="$tables $table"
+      stacks="$stacks $2"
       shift 2
       ;;
     --table)
@@ -41,9 +41,18 @@ while [ $# -gt 0 ]; do
       tables="$tables $2"
       shift 2
       ;;
+    --region)
+      [ $# -ge 2 ] || die "--region needs a region"
+      export AWS_REGION="$2"
+      shift 2
+      ;;
     -h|--help) usage 0 ;;
     *) echo "unknown argument: $1" >&2; usage 1 ;;
   esac
+done
+# After the loop, so --region applies wherever it was given.
+for stack in $stacks; do
+  tables="$tables $(stack_output "$stack" ConcernsTableName)"
 done
 [ -n "$tables" ] || usage 1
 
