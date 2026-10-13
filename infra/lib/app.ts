@@ -107,6 +107,8 @@ export function addValkeyReviewerStacks(
     curatorRuntimeArn: curator.runtime.attrAgentRuntimeArn,
     models: config.models,
     dailyReviewBudget: config.dailyReviewBudget,
+    maxAutomaticReviewsPerPr: config.maxAutomaticReviewsPerPr,
+    pushReviewDelaySeconds: config.pushReviewDelaySeconds,
   });
 
   // Created after the webhook stack, whose curator queue it sends to.

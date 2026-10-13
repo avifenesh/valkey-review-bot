@@ -65,6 +65,10 @@ export interface WebhookStackProps extends cdk.StackProps {
   readonly models: Pick<ModelsConfig, 'safetyGate' | 'profileRegions'>;
   /** Automatic reviews per route per UTC day. Maintainer summons are not counted. */
   readonly dailyReviewBudget: number;
+  /** Automatic reviews per pull request, counting the first. */
+  readonly maxAutomaticReviewsPerPr: number;
+  /** SQS delay of a review that new commits start. */
+  readonly pushReviewDelaySeconds: number;
 }
 
 /** One entry of REVIEW_ROUTE_MAP_JSON, keyed by repository full name. */
@@ -262,6 +266,8 @@ export class WebhookStack extends cdk.Stack {
         BOT_LOGIN: github.botLogin,
         HAIKU_MODEL_ID: props.models.safetyGate,
         DAILY_REVIEW_BUDGET: String(props.dailyReviewBudget),
+        MAX_AUTOMATIC_REVIEWS_PER_PR: String(props.maxAutomaticReviewsPerPr),
+        PUSH_REVIEW_DELAY_SECONDS: String(props.pushReviewDelaySeconds),
         ...(github.installationId ? { INSTALLATION_ID: github.installationId } : {}),
         // The receiver treats any set value as the whole list, so an empty
         // list must leave the variable unset to keep the built-in logins.
@@ -272,7 +278,8 @@ export class WebhookStack extends cdk.Stack {
       bundling,
     });
 
-    // The idempotency table also holds the per-route daily review counters.
+    // The idempotency table also holds the per-route daily review
+    // counters, the per-pull-request round counters and pending markers.
     idempotency.grantReadWriteData(receiver);
     props.githubAppSecret.grantRead(receiver);
     // Safety gate on maintainer instructions in @mentions (Converse API).

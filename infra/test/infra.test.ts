@@ -443,6 +443,8 @@ describe('webhook', () => {
       BOT_LOGIN: 'example-reviewer[bot]',
       HAIKU_MODEL_ID: 'us.anthropic.claude-haiku-4-5-20251001-v1:0',
       DAILY_REVIEW_BUDGET: '40',
+      MAX_AUTOMATIC_REVIEWS_PER_PR: '3',
+      PUSH_REVIEW_DELAY_SECONDS: '300',
     });
     expect(env).not.toHaveProperty('INSTALLATION_ID');
     expect(env).not.toHaveProperty('KNOWN_BOT_LOGINS');
@@ -451,11 +453,15 @@ describe('webhook', () => {
       ...fixture(),
       github: { ...fixture().github, installationId: '42', knownBotLogins: ['one[bot]', 'two'] },
       dailyReviewBudget: 7,
+      maxAutomaticReviewsPerPr: 20,
+      pushReviewDelaySeconds: 0,
     });
     expect(functionEnv(custom.template(custom.stacks.webhook), 'ReceiverFn')).toMatchObject({
       INSTALLATION_ID: '42',
       KNOWN_BOT_LOGINS: 'one[bot],two',
       DAILY_REVIEW_BUDGET: '7',
+      MAX_AUTOMATIC_REVIEWS_PER_PR: '20',
+      PUSH_REVIEW_DELAY_SECONDS: '0',
     });
   });
 
