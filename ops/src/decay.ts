@@ -223,10 +223,12 @@ export function decayedScore(score: number, elapsedSeconds: number, halfLifeSeco
  * REMOVEs it follows only from what the run last learned about the
  * registry record:
  * - Retired: deprecateSkill succeeded, or getSkillByName read DEPRECATED,
- *   REJECTED or no record. The tombstone write REMOVEs the marker with
- *   the claim. The marker decides retired_reason, so that write is
- *   conditioned on the marker as read: = :name, = the older value, or
- *   attribute_not_exists.
+ *   REJECTED or no record. A maintenance run's tombstone write REMOVEs
+ *   the marker with the claim. submit_skill, which writes its tombstone
+ *   outside any claim, may leave it: a tombstone gets no maintenance,
+ *   and publishing the next generation clears it. The marker decides
+ *   retired_reason, so every tombstone write is conditioned on the marker
+ *   as read: = :name, = the older value, or attribute_not_exists.
  *   - The lifecycle's own retirement: this run's deprecateSkill
  *     succeeded, or DEPRECATED or no record was read with the marker
  *     present. retired_reason is the message's retire_reason, or outside
