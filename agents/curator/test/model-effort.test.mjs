@@ -1,29 +1,11 @@
 import assert from 'node:assert/strict';
-import { registerHooks } from 'node:module';
 import test from 'node:test';
+import { Model } from '@strands-agents/sdk';
+import { createCuratorModel } from '../dist/common/src/model-fallback.js';
+import { createConverseModel, createMantleModel } from '../dist/common/src/models.js';
 import { loadEnv } from '../dist/curator/src/config.js';
 
-// The build compiles agents/common into dist/common. Those modules use
-// packages only agents/common installs, and the container links
-// dist/common/node_modules to agents/common/node_modules (see the
-// Dockerfile). Resolve their package imports the same way here.
-const distCommon = new URL('../dist/common/', import.meta.url).href;
-const commonPackage = new URL('../../common/package.json', import.meta.url).href;
-registerHooks({
-  resolve(specifier, context, nextResolve) {
-    const isPackage = !specifier.startsWith('.') && !specifier.startsWith('/') && !specifier.includes(':');
-    if (isPackage && context.parentURL?.startsWith(distCommon)) {
-      return nextResolve(specifier, { ...context, parentURL: commonPackage });
-    }
-    return nextResolve(specifier, context);
-  },
-});
-
-// Imported after the hook is registered, so it applies to their imports.
-const { createCuratorModel } = await import('../dist/common/src/model-fallback.js');
-const { createConverseModel, createMantleModel } = await import('../dist/common/src/models.js');
-
-// The model classes of the SDK copy the common modules load.
+// The model classes the common modules build.
 const converseProto = Object.getPrototypeOf(createConverseModel({ region: 'us-west-2', modelId: 'm', maxTokens: 1, effort: 'low' }));
 const mantleProto = Object.getPrototypeOf(createMantleModel({ modelId: 'openai.m', maxTokens: 1, mantleRegion: 'us-east-1', effort: 'low' }));
 
@@ -66,4 +48,14 @@ test('curator efforts default to medium primary and high fallback, and are set i
     await Array.fromAsync(createCuratorModel(env).stream([]));
     assert.deepEqual(seen, expected, `${label}: the models get the efforts loadEnv read`);
   }
+});
+
+test('common modules load the SDK from the curator package, like the image does', () => {
+  // The build compiles agents/common into dist/common, and the image has
+  // only the curator's node_modules. A second SDK copy would give model
+  // errors that the curator Agent's retry strategy does not recognise.
+  const env = loadEnv(BASE);
+  assert.ok(createCuratorModel(env) instanceof Model);
+  assert.ok(createConverseModel({ region: 'us-west-2', modelId: 'm', maxTokens: 1, effort: 'low' }) instanceof Model);
+  assert.ok(createMantleModel({ modelId: 'openai.m', maxTokens: 1, mantleRegion: 'us-east-1', effort: 'low' }) instanceof Model);
 });
