@@ -98,8 +98,16 @@ done
 To check that the CDK app still synthesizes, using placeholder values only:
 
 ```sh
-cd infra && npx cdk synth --quiet -c config=deploy.config.example.json
+cd infra
+env -u AWS_PROFILE -u AWS_ACCESS_KEY_ID -u AWS_SECRET_ACCESS_KEY -u AWS_SESSION_TOKEN \
+  AWS_CONFIG_FILE=/dev/null AWS_SHARED_CREDENTIALS_FILE=/dev/null AWS_EC2_METADATA_DISABLED=true \
+  npx cdk synth --quiet -c config=deploy.config.example.json
 ```
+
+The `env` part hides any AWS credentials from the CDK CLI. Synthesis stops
+when the credentials belong to an account other than `aws.account`, which
+is `111111111111` in the example. Synthesis bundles the Lambda functions
+from `webhook/` and `ops/`, so run the loop above first.
 
 CI runs the same commands, plus [agnix](https://github.com/agent-sh/agnix) on the
 agent configuration files and a [scrump](https://github.com/avifenesh/scrump) secret

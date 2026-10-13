@@ -79,9 +79,10 @@ See [docs/architecture.md](docs/architecture.md) for the request flow in detail,
 
 The reviewer runs on AWS: Amazon Bedrock models, Bedrock AgentCore runtimes, AWS Agent
 Registry, Lambda, SQS and DynamoDB. [infra/README.md](infra/README.md) lists the
-prerequisites (a GitHub App, a Secrets Manager secret, three registries, model access),
-every configuration key, and the deploy commands. All deployment-specific values live in
-`infra/deploy.config.json`, which is not committed.
+prerequisites (Docker that can build linux/arm64 images, a GitHub App, a Secrets Manager
+secret, three registries, model access), every configuration key, and the deploy
+commands. All deployment-specific values live in `infra/deploy.config.json`, which is not
+committed.
 
 ## Contributing
 

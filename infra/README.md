@@ -32,36 +32,50 @@ permissions are granted only when an `openai.*` model is configured.
 
 ## Before the first deployment
 
-1. Bootstrap CDK in the target account and region:
+1. Install Node.js 24 or later, Docker and the AWS CLI. `cdk deploy`
+   builds the three agent images for linux/arm64. On an x86 machine
+   Docker needs arm64 emulation (buildx with QEMU; Docker Desktop
+   includes it), or deploy from an arm64 machine. The AWS CLI is used by
+   the scripts' `--stack` option.
+2. Bootstrap CDK in the target account and region:
    `npx cdk bootstrap aws://ACCOUNT/REGION`. If you use a custom qualifier,
    pass `--qualifier` and set `aws.bootstrapQualifier` to the same value.
-2. Create a GitHub App. Give it at least Pull requests (read and write) and
-   Metadata (read), because the token broker requests those. Subscribe it
-   to the `pull_request`, `pull_request_review`,
-   `pull_request_review_comment` and `issue_comment` events, and install it
-   on the repositories you route.
-3. Store the App credentials in Secrets Manager, in the target account and
+3. Create a GitHub App. Give it at least Pull requests (read and write),
+   Issues (read) and Metadata (read). The token broker requests only Pull
+   requests and Metadata; Issues (read) is what lets the App subscribe to
+   `issue_comment`. Subscribe it to the `pull_request`,
+   `pull_request_review`, `pull_request_review_comment` and
+   `issue_comment` events, and install it on the repositories you route.
+4. Store the App credentials in Secrets Manager, in the target account and
    region, under the name you set in `github.appSecretName`. The secret is a
    JSON object:
    ```json
    { "app_id": "123456", "private_key": "-----BEGIN RSA PRIVATE KEY-----\n...", "webhook_secret": "..." }
    ```
-4. Create three registries in AWS Agent Registry in the same account and
+5. Create three registries in AWS Agent Registry in the same account and
    region: one per reviewer and one for the curator. This app does not
    create them. Put their IDs or ARNs under `skillsRegistries`.
-5. Make sure the account can invoke every model in `models`.
-6. Copy `deploy.config.example.json` to `deploy.config.json` and fill it in.
+6. Make sure the account can invoke every model in `models`.
+7. Copy `deploy.config.example.json` to `deploy.config.json` and fill it in.
    `deploy.config.json` is ignored by git.
 
 ## Commands
 
+From the repository root:
+
 ```sh
+(cd webhook && npm ci) && (cd ops && npm ci)
+cd infra
 npm ci
 npm run typecheck
 npm test                            # unit tests; no AWS access needed
 npx cdk synth
 npx cdk deploy --all
 ```
+
+`cdk synth` bundles the Lambda functions from `webhook/` and `ops/` with
+esbuild, so those packages need their dependencies installed first.
+`npm test` skips the bundling and needs only `infra/`.
 
 The app reads its configuration from the first of:
 
@@ -76,13 +90,20 @@ synthesis stops.
 
 After the first deployment, set the App's webhook URL to the `ApiUrl`
 output of `ValkeyReviewWebhook` and its webhook secret to the
-`webhook_secret` value from step 3.
+`webhook_secret` value from step 4.
 
-Then publish the curator's reference skills to its registry:
-`node scripts/publish-curator-skills.mjs --stack ValkeyReviewerCurator`
-from the repository root. `--stack` reads the `CuratorSkillsRegistryId`
-output. Each reviewer stack has a `SkillsRegistryId` output, which
-`scripts/registry-skills.mjs --stack` reads.
+Then publish the curator's reference skills to its registry. From the
+repository root:
+
+```sh
+(cd agents/common && npm ci)
+node scripts/publish-curator-skills.mjs --stack ValkeyReviewerCurator
+```
+
+The script runs the registry code in `agents/common`, so that package
+needs its dependencies. `--stack` reads the `CuratorSkillsRegistryId`
+output with the AWS CLI. Each reviewer stack has a `SkillsRegistryId`
+output, which `scripts/registry-skills.mjs --stack` reads.
 
 ## Configuration reference
 
@@ -103,7 +124,7 @@ ignored. Keys with a default may be left out.
 | --- | --- | --- |
 | `appId` | required | Numeric GitHub App ID. |
 | `botLogin` | required | The App's bot login, ending in `[bot]`, for example `your-app-slug[bot]`. Used to recognize the bot's own comments and @mentions. |
-| `appSecretName` | required | Secrets Manager secret name (see step 3 above). |
+| `appSecretName` | required | Secrets Manager secret name (see step 4 above). |
 | `installationId` | none | Numeric installation ID. Only used when a webhook payload carries no installation. |
 | `knownBotLogins` | receiver's built-in list | Logins of other bots to ignore. See [Known bot logins](#known-bot-logins). |
 
