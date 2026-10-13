@@ -288,6 +288,15 @@ test('new commits pass the same gates as an opened pull request', async () => {
   assert.equal(await skipped(push('b6')), 'duplicate', 'one review per head SHA');
 });
 
+test('a push to a pull request that is not a draft reviews on a skipDrafts route', async () => {
+  const { handler, sent } = setup();
+  const resp = await handler(delivery('pull_request', push('b7', { draft: false }, GLIDE)));
+  assert.equal(body(resp).enqueued, `${GLIDE}#7#b7`);
+  assert.equal(sent.length, 1);
+  assert.equal(sent[0].queueUrl, 'q-glide');
+  assert.deepEqual(sent[0].options, { delaySeconds: 300 });
+});
+
 test('over budget, a review of new commits gives back its marker, its round and its key', async () => {
   const original = console.warn;
   console.warn = () => {};
