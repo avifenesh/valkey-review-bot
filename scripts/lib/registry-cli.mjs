@@ -2,11 +2,8 @@
 // code in agents/common/src/skills-registry.ts directly (Node strips the
 // TypeScript types), so `npm ci` must have been run in agents/common.
 
-import { createRequire } from 'node:module';
 import { parseArgs } from 'node:util';
 import { awsRunner, stackOutputs } from './aws-cli.mjs';
-
-const COMMON_PACKAGE = new URL('../../agents/common/package.json', import.meta.url);
 
 export function fail(message) {
   console.error(`error: ${message}`);
@@ -30,11 +27,6 @@ export async function loadRegistryModule() {
   } catch (err) {
     fail(`cannot load agents/common/src/skills-registry.ts (${err.message}). Run "npm ci" in agents/common and use Node 24 or later.`);
   }
-}
-
-/** The AWS SDK module the registry code uses, resolved from agents/common so both share one copy. */
-export function registrySdk() {
-  return createRequire(COMMON_PACKAGE)('@aws-sdk/client-agent-registry-control');
 }
 
 /**

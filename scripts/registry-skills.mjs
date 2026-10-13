@@ -10,13 +10,16 @@
 // --stack reads the id from the stack's SkillsRegistryId output (the
 // reviewer stacks) or CuratorSkillsRegistryId output (the curator stack).
 // A deprecated record stays in the registry, but reviewers and the
-// curator no longer load it.
+// curator no longer load it. DEPRECATED is final: the record cannot be
+// edited or restored, and a skill that comes back is published under a
+// new name.
 //
 // Needs Node 24 or later, `npm ci` in agents/common, the AWS CLI for
 // --stack, and credentials allowed to list records (and, for deprecate,
 // to update record status) in the registry.
 
-import { cliArgs, fail, loadRegistryModule, registrySdk, resolveRegistryId } from './lib/registry-cli.mjs';
+import { cliArgs, fail, loadRegistryModule, resolveRegistryId } from './lib/registry-cli.mjs';
+import { deprecateTarget } from './lib/skill-records.mjs';
 
 const USAGE = [
   'usage: node scripts/registry-skills.mjs list (--registry-id ID | --stack STACK) [--region REGION]',
@@ -43,7 +46,7 @@ if (command === 'deprecate') {
 }
 
 const registryId = resolveRegistryId(values, ['SkillsRegistryId', 'CuratorSkillsRegistryId']);
-const { createRegistryClient, listSkillSummaries } = await loadRegistryModule();
+const { createRegistryClient, deprecateSkill, isRetiredStatus, listSkillSummaries } = await loadRegistryModule();
 const client = createRegistryClient(values.region);
 
 try {
@@ -55,23 +58,14 @@ try {
       console.log([r.name, r.recordId, r.status, r.updatedAt?.toISOString() ?? '-'].join('\t'));
     }
   } else {
-    let recordId = values['record-id'];
-    if (!recordId) {
-      const live = records.filter((r) => r.name === values.name && r.status !== 'DEPRECATED');
-      if (live.length === 0) fail(`no record named ${values.name} that is not already deprecated`);
-      if (live.length > 1) fail(`${live.length} records are named ${values.name} (${live.map((r) => r.recordId).join(', ')}); pass --record-id`);
-      recordId = live[0].recordId;
-    } else if (!records.some((r) => r.recordId === recordId)) {
-      fail(`no SKILL record ${recordId} in registry ${registryId}`);
+    let recordId;
+    try {
+      recordId = deprecateTarget(records, { name: values.name, recordId: values['record-id'] }, isRetiredStatus);
+    } catch (err) {
+      fail(`${err.message} in registry ${registryId}`);
     }
-    const { UpdateRegistryRecordStatusCommand } = registrySdk();
-    const resp = await client.send(new UpdateRegistryRecordStatusCommand({
-      registryId,
-      recordId,
-      status: 'DEPRECATED',
-      statusReason: values.reason.trim(),
-    }));
-    console.log(`deprecated ${recordId} status=${resp.status ?? '?'}`);
+    const status = await deprecateSkill(client, registryId, recordId, values.reason);
+    console.log(`deprecated ${recordId} status=${status || '?'}`);
   }
 } finally {
   client.destroy();
