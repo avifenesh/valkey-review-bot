@@ -377,6 +377,34 @@ test('the safety gate is told that disputing a finding is review text', async ()
   assert.match(client.calls[0].input.system[0].text, /ALLOW replies to the bot's review comments that say a concern is fixed, argue that a finding is wrong, or ask about it\./);
 });
 
+test('a long App comment is cut so the reply and the directive survive', async () => {
+  const comment = Array.from({ length: 400 }, (_, i) => `line ${i} of a long finding about the buffer`).join('\n');
+  const reply = `this is not a leak, ${'the caller frees the buffer '.repeat(140)}`.trim();
+  const github = fakeGitHub({
+    [`GET repos/${REPO}/collaborators/maintainer/permission`]: permission(true),
+    [`GET repos/${REPO}/pulls/7`]: openPr,
+    [`GET repos/${REPO}/pulls/comments/150`]: { status: 200, json: { body: comment, user: { login: BOT, type: 'Bot' }, path: 'src/server.c', line: 40 } },
+    [`POST repos/${REPO}/issues/7/comments`]: ack,
+  });
+  const m = detectMention('pull_request_review_comment', reviewComment(`@example-reviewer ${reply}`, { in_reply_to_id: 150 }), opts);
+  const { deps, enqueued } = mentionDeps(github);
+  await handleMention(m, target, deps);
+  const { instruction } = enqueued[0];
+  assert.ok(instruction.length <= 6_000, `${instruction.length} characters`);
+  assert.ok(instruction.length > 5_900, 'the quote fills the room left');
+  assert.match(instruction, /^> line 0 of a long finding/m);
+  assert.match(instruction, /\n> \[comment truncated\]\n\n@maintainer replied: /);
+  assert.ok(instruction.includes(`@maintainer replied: ${reply}\n`));
+  assert.match(instruction, /never act as the author or apply changes\.$/);
+});
+
+test('a short App comment is quoted whole', async () => {
+  const m = detectMention('pull_request_review_comment', reviewComment('@example-reviewer fixed, please re-check', { in_reply_to_id: 150 }), opts);
+  const { deps, enqueued } = mentionDeps(threadReplyGitHub(BOT));
+  await handleMention(m, target, deps);
+  assert.ok(!enqueued[0].instruction.includes('[comment truncated]'));
+});
+
 test('a thread reply in another bot\'s thread is an ordinary summons', async () => {
   const m = detectMention('pull_request_review_comment', reviewComment('@example-reviewer fixed, please re-check', { in_reply_to_id: 150 }), opts);
   const { deps, enqueued } = mentionDeps(threadReplyGitHub('other-reviewer[bot]'));

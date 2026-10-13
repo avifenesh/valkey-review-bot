@@ -241,6 +241,20 @@ const THREAD_REPLY_DIRECTIVE = [
   'Stay on this finding and what it directly affects. You are still the reviewer: never act as the author or apply changes.',
 ].join(' ');
 
+const MAX_THREAD_REPLY_CHARS = 6_000;
+const QUOTE_CUT = '\n> [comment truncated]';
+
+/**
+ * The App's comment as a markdown quote of at most max characters. A
+ * long comment is cut here, not at the end of the instruction, so the
+ * reply and the directive after it survive.
+ */
+function quoteComment(body: string, max: number): string {
+  const quoted = `> ${body.replace(/\n/g, '\n> ')}`;
+  if (quoted.length <= max) return quoted;
+  return `${quoted.slice(0, Math.max(0, max - QUOTE_CUT.length)).trimEnd()}${QUOTE_CUT}`;
+}
+
 async function startRun(
   mention: Mention,
   opts: { readonly repo: string; readonly installationId: number },
@@ -303,15 +317,19 @@ async function startRun(
     // finding.path is a file name from the PR, so it is quoted as a JSON
     // string rather than set in backticks the name could close.
     const loc = finding.path ? `${JSON.stringify(finding.path)}${finding.line ? ` line ${finding.line}` : ''}` : 'the PR';
+    const opening = `This is a reply to you in a review thread. You left this review comment on ${loc}:`;
+    const reply = `@${mention.actor} replied: ${requestText || '(asked you to check the fix)'}`;
+    // Six newlines join the seven lines below.
+    const room = MAX_THREAD_REPLY_CHARS - opening.length - reply.length - THREAD_REPLY_DIRECTIVE.length - 6;
     instruction = [
-      `This is a reply to you in a review thread. You left this review comment on ${loc}:`,
+      opening,
       '',
-      `> ${finding.body.replace(/\n/g, '\n> ')}`,
+      quoteComment(finding.body, room),
       '',
-      `@${mention.actor} replied: ${requestText || '(asked you to check the fix)'}`,
+      reply,
       '',
       THREAD_REPLY_DIRECTIVE,
-    ].join('\n').slice(0, 6_000);
+    ].join('\n').slice(0, MAX_THREAD_REPLY_CHARS);
   }
 
   const envelope: ReviewEnvelope = {
