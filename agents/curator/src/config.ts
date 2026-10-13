@@ -26,6 +26,39 @@ export interface CuratorEnv {
   /** Tool-call rounds before the run is stopped. */
   readonly maxIterations: number;
   readonly maxTokens: number;
+
+  // Skill maintenance (maintenance.ts). Every switch that changes a
+  // skill or opens a pull request is off unless set: report mode.
+
+  /**
+   * reviewer_id -> public upstream "owner/name" whose default branch the
+   * release check reads. A reviewer without one gets no checks.
+   */
+  readonly upstreamRepos: Readonly<Record<string, string>>;
+  /** S3 key of the audit prompt, config/skill-check.md. Empty: a flagged skill ends inconclusive. */
+  readonly checkPromptKey: string;
+  /** Tool rounds of one audit. */
+  readonly checkMaxRounds: number;
+  /** Write validated edits to registry skills. Off: they are kept in pending_revision. */
+  readonly checkApplyEdits: boolean;
+  /** Deprecate a skill on a retire message. Off: the retirement is only reported. */
+  readonly retireSkills: boolean;
+  /** Propose edits to the reviewers' repo skill files by pull request. Off: report only. */
+  readonly checkOpenPullRequests: boolean;
+  /** The bot's own repository, where repo skill files live; null when not configured. */
+  readonly skillsRepo: SkillsRepoSettings | null;
+  /** Directory the per-run upstream checkouts are made in. */
+  readonly checkDir: string;
+}
+
+export interface SkillsRepoSettings {
+  /** "owner/name" of the bot's repository. */
+  readonly repo: string;
+  readonly baseBranch: string;
+  /** "Name <email>" for the commit's sign-off line; empty for the App's bot identity. */
+  readonly signOff: string;
+  /** The skills-repo token broker Lambda; empty when not configured, and then no pull request is opened. */
+  readonly tokenFunction: string;
 }
 
 type Env = Readonly<Record<string, string | undefined>>;
@@ -68,7 +101,83 @@ export function parseReviewerMap(key: string, json: string): Record<string, stri
   return out;
 }
 
+/** 'true' or 'false'; unset is false. */
+export function boolSetting(env: Env, key: string): boolean {
+  const raw = env[key]?.trim();
+  if (!raw || raw === 'false') return false;
+  if (raw === 'true') return true;
+  throw new Error(`${key} must be "true" or "false", got "${raw}"`);
+}
+
+/** A GitHub "owner/name", the shape the deployment config and ops/src/releases.ts accept. */
+const REPO_RE = /^[A-Za-z0-9](?:[A-Za-z0-9-]{0,38})\/[A-Za-z0-9._-]{1,100}$/;
+
+export function isRepoName(repo: string): boolean {
+  if (!REPO_RE.test(repo)) return false;
+  const name = repo.slice(repo.indexOf('/') + 1);
+  return name !== '.' && name !== '..';
+}
+
+/**
+ * UPSTREAM_REPOS_JSON: reviewer_id -> "owner/name". Unlike the other
+ * reviewer maps it may be unset or empty, and an empty value means the
+ * reviewer has no upstream, so its skills get no checks.
+ */
+export function parseUpstreamRepos(json: string | undefined): Record<string, string> {
+  if (!json?.trim()) return {};
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(json);
+  } catch (err) {
+    throw new Error(`UPSTREAM_REPOS_JSON is not valid JSON: ${err instanceof Error ? err.message : String(err)}`);
+  }
+  if (typeof parsed !== 'object' || parsed === null || Array.isArray(parsed)) {
+    throw new Error('UPSTREAM_REPOS_JSON must be a JSON object of reviewer id to owner/name');
+  }
+  const out: Record<string, string> = {};
+  for (const [reviewerId, value] of Object.entries(parsed)) {
+    if (typeof value !== 'string') throw new Error(`UPSTREAM_REPOS_JSON.${reviewerId} must be a string`);
+    const repo = value.trim();
+    if (!repo) continue;
+    if (!isRepoName(repo)) throw new Error(`UPSTREAM_REPOS_JSON.${reviewerId} must look like "owner/name", got "${value}"`);
+    out[reviewerId] = repo;
+  }
+  return out;
+}
+
+/** A branch name git accepts and a marker or URL can carry. */
+const BRANCH_RE = /^(?!.*\.\.)(?!.*\/\/)(?!.*\/\.)(?!.*\/$)(?!.*\.$)(?!.*\.lock$)[A-Za-z0-9][A-Za-z0-9._\/-]{0,99}$/;
+/** "Name <email>", one line. */
+const SIGN_OFF_RE = /^[^<>\r\n]{1,100} <[^<>\s@]{1,64}@[^<>\s@]{1,190}>$/;
+/** A Lambda function name or ARN. */
+const FUNCTION_RE = /^(?:arn:aws[a-z-]*:lambda:[a-z0-9-]+:\d{12}:function:)?[A-Za-z0-9_-]{1,64}(?::[A-Za-z0-9_$-]{1,128})?$/;
+
+function skillsRepoSettings(env: Env, openPullRequests: boolean): SkillsRepoSettings | null {
+  const repo = env.SKILLS_REPO?.trim() ?? '';
+  if (!repo) return null;
+  if (!isRepoName(repo)) throw new Error(`SKILLS_REPO must look like "owner/name", got "${repo}"`);
+  const baseBranch = env.SKILLS_REPO_BASE_BRANCH?.trim() || 'main';
+  if (!BRANCH_RE.test(baseBranch)) throw new Error(`SKILLS_REPO_BASE_BRANCH is not a branch name: "${baseBranch}"`);
+  const signOff = env.SKILLS_REPO_SIGN_OFF?.trim() ?? '';
+  if (signOff && !SIGN_OFF_RE.test(signOff)) throw new Error(`SKILLS_REPO_SIGN_OFF must look like "Name <email>", got "${signOff}"`);
+  const tokenFunction = env.SKILLS_REPO_TOKEN_FUNCTION?.trim() ?? '';
+  if (tokenFunction && !FUNCTION_RE.test(tokenFunction)) throw new Error(`SKILLS_REPO_TOKEN_FUNCTION is not a Lambda function name: "${tokenFunction}"`);
+  if (openPullRequests && !tokenFunction) {
+    throw new Error('SKILLS_REPO_TOKEN_FUNCTION is required when CHECK_OPEN_PULL_REQUESTS is true and SKILLS_REPO is set');
+  }
+  return { repo, baseBranch, signOff, tokenFunction };
+}
+
+function checkDir(env: Env): string {
+  const dir = env.SKILL_CHECK_DIR?.trim() || '/tmp/skill-check';
+  if (!dir.startsWith('/') || dir === '/' || dir.split('/').includes('..')) {
+    throw new Error(`SKILL_CHECK_DIR must be an absolute directory other than /, got "${dir}"`);
+  }
+  return dir.replace(/\/+$/, '');
+}
+
 export function loadEnv(env: Env = process.env): CuratorEnv {
+  const checkOpenPullRequests = boolSetting(env, 'CHECK_OPEN_PULL_REQUESTS');
   return {
     modelId: required(env, 'BEDROCK_MODEL_ID'),
     fallbackModelId: required(env, 'FALLBACK_MODEL_ID'),
@@ -86,6 +195,14 @@ export function loadEnv(env: Env = process.env): CuratorEnv {
     graduationThreshold: intSetting(env, 'GRADUATION_THRESHOLD', 4, 2, 100),
     maxIterations: intSetting(env, 'MAX_ITERATIONS', 40, 1, 500),
     maxTokens: intSetting(env, 'MAX_TOKENS', 16384, 1024, 200_000),
+    upstreamRepos: parseUpstreamRepos(env.UPSTREAM_REPOS_JSON),
+    checkPromptKey: env.CHECK_PROMPT_S3_KEY?.trim() ?? '',
+    checkMaxRounds: intSetting(env, 'CHECK_MAX_ROUNDS', 25, 5, 100),
+    checkApplyEdits: boolSetting(env, 'CHECK_APPLY_EDITS'),
+    retireSkills: boolSetting(env, 'RETIRE_SKILLS'),
+    checkOpenPullRequests,
+    skillsRepo: skillsRepoSettings(env, checkOpenPullRequests),
+    checkDir: checkDir(env),
   };
 }
 
@@ -110,15 +227,20 @@ async function fetchS3(s3: S3Client, bucket: string, key: string): Promise<strin
   return Buffer.concat(chunks).toString('utf8');
 }
 
-/** Load prompt.md and, when configured, skill.md. Both are read once per container. */
-export async function loadAssets(env: CuratorEnv): Promise<{ prompt: string; skill: string }> {
+/**
+ * Load prompt.md and, when configured, skill.md and the release check's
+ * audit prompt (skill-check.md). All are read once per container.
+ */
+export async function loadAssets(env: CuratorEnv): Promise<{ prompt: string; skill: string; checkPrompt: string }> {
   const s3 = new S3Client({ region: env.region });
+  const optional = (key: string) => (key ? fetchS3(s3, env.assetsBucket, key) : Promise.resolve(''));
   try {
-    const [prompt, skill] = await Promise.all([
+    const [prompt, skill, checkPrompt] = await Promise.all([
       fetchS3(s3, env.assetsBucket, env.promptKey),
-      env.skillKey ? fetchS3(s3, env.assetsBucket, env.skillKey) : Promise.resolve(''),
+      optional(env.skillKey),
+      optional(env.checkPromptKey),
     ]);
-    return { prompt, skill };
+    return { prompt, skill, checkPrompt };
   } finally {
     s3.destroy();
   }
