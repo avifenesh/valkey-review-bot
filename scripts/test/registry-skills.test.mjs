@@ -21,15 +21,21 @@ test('findOrphans lists live records no concern record names, by name', () => {
   assert.deepEqual(findOrphans([], referenced, isRetired), []);
 });
 
-test('graduatedNames scans only graduated_record_name, tombstones included', () => {
+test('graduatedNames scans the graduated names of concern records, tombstones included', () => {
   const aws = fakeAws({
-    'dynamodb scan': () => ({ Items: [typed({ graduated_record_name: 'a' }), typed({ graduated_record_name: 'b' }), typed({ graduated_record_name: '' })] }),
+    'dynamodb scan': () => ({ Items: [
+      typed({ area_bucket: 'src', graduated_record_name: 'a' }),
+      typed({ area_bucket: 'src', graduated_record_name: 'b', retired_at: '2026-10-01T00:00:00.000Z' }),
+      typed({ area_bucket: 'src', graduated_record_name: '' }),
+      // Not a concern record, so it names no skill: an orphan stays an orphan.
+      typed({ area_bucket: '#maintenance', graduated_record_name: 'orphan' }),
+    ] }),
   });
   assert.deepEqual([...graduatedNames(aws, 'valkey_review_concerns')], ['a', 'b']);
   const args = aws.calls[0];
-  assert.equal(flag(args, '--projection-expression'), '#grn');
+  assert.equal(flag(args, '--projection-expression'), '#b, #grn');
   assert.equal(flag(args, '--filter-expression'), 'attribute_exists(#grn)');
-  assert.deepEqual(JSON.parse(flag(args, '--expression-attribute-names')), { '#grn': 'graduated_record_name' });
+  assert.deepEqual(JSON.parse(flag(args, '--expression-attribute-names')), { '#b': 'area_bucket', '#grn': 'graduated_record_name' });
 });
 
 test('deprecateTarget takes the one live record with the name, or the given id', () => {

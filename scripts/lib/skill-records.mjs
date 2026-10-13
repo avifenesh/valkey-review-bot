@@ -22,14 +22,18 @@ export function reviewerIdOfTable(table) {
   return m ? m[1].replaceAll('_', '-') : null;
 }
 
-/** Every graduated_record_name in a concerns table, tombstones included. */
+/**
+ * Every graduated_record_name in a concerns table, tombstones included.
+ * Items in reserved buckets are not concern records, so a name there
+ * does not count.
+ */
 export function graduatedNames(aws, table) {
   const items = scanItems(aws, table, {
-    projection: '#grn',
+    projection: '#b, #grn',
     filter: 'attribute_exists(#grn)',
-    names: { '#grn': 'graduated_record_name' },
+    names: { '#b': 'area_bucket', '#grn': 'graduated_record_name' },
   });
-  return new Set(items.map((i) => i.graduated_record_name).filter((n) => typeof n === 'string' && n));
+  return new Set(items.filter((i) => !isReservedBucket(i.area_bucket)).map((i) => i.graduated_record_name).filter((n) => typeof n === 'string' && n));
 }
 
 /**

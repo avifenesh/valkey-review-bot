@@ -34,4 +34,3 @@ test('findGraduatedRecord reads the check state of the record that graduated as 
   const twice = fakeAws({ 'dynamodb scan': () => ({ Items: [record, typed({ area_bucket: 'src', record_id: 'r2', graduated_record_name: 'rdb' })] }) });
   assert.throws(() => findGraduatedRecord(twice, 'concerns', 'rdb'), /2 concern records in concerns graduated as rdb: "src"\/"r1", "src"\/"r2"/);
 });
-
