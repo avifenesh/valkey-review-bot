@@ -414,6 +414,7 @@ const checked = (id, count, extra = {}) => record(id, count, {
   maintenance_requested_at: '2026-03-01T00:00:00.000Z',
   maintenance_reason: 'check',
   maintenance_deprecating: `skill-${id}`,
+  retire_refused_at: '2026-03-02T00:00:00.000Z',
   ...extra,
 });
 
@@ -430,12 +431,12 @@ test('recordView shows a graduated record\'s skill state and hides the check\'s 
   for (const hidden of [
     'audit_names', 'ignored_names', 'verified_sha', 'verified_ref', 'pending_revision', 'previous_skill_md', 'revised_at',
     'stale_since', 'obsolete_release', 'skill_generation', 'previous_record_name',
-    'maintenance_id', 'maintenance_requested_at', 'maintenance_reason', 'maintenance_deprecating',
+    'maintenance_id', 'maintenance_requested_at', 'maintenance_reason', 'maintenance_deprecating', 'retire_refused_at',
   ]) {
     assert.ok(!(hidden in view), hidden);
   }
   const text = JSON.stringify(view);
-  assert.doesNotMatch(text, /model prose|old body|VM_Foo|maintenance/);
+  assert.doesNotMatch(text, /model prose|old body|VM_Foo|maintenance|refused|2026-03-02/);
 
   const retired = recordView(checked('r2', 5, { retired_at: '2026-04-01T00:00:00.000Z', retired_reason: 'decayed' }));
   assert.equal(retired.skill_state, 'retired');

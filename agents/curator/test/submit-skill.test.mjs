@@ -395,7 +395,8 @@ function assertUpdatesWellFormed(ddb) {
 }
 
 test('a reinforced decayed tombstone is published under the next generation name', async () => {
-  const w = world({ item: tombstone(), skills: DEPRECATED });
+  // The registry once refused to deprecate the old generation.
+  const w = world({ item: tombstone({ retire_refused_at: '2026-08-15T00:00:00.000Z' }), skills: DEPRECATED });
   const out = parse(await w.submit.invoke(INPUT));
 
   assert.equal(out.ok, true, out.error);
@@ -412,7 +413,7 @@ test('a reinforced decayed tombstone is published under the next generation name
   assert.equal(rec.graduated_record_name, name);
   assert.equal(rec.skill_generation, 2);
   assert.equal(rec.previous_record_name, OLD);
-  for (const gone of ['retired_at', 'retired_reason', 'retired_from_status']) assert.ok(!(gone in rec), gone);
+  for (const gone of ['retired_at', 'retired_reason', 'retired_from_status', 'retire_refused_at']) assert.ok(!(gone in rec), gone);
   assert.ok(rec.graduated_at > '2026-10-01', 'graduated_at moves, so the next decay pass queues a check');
   for (const [k, v] of Object.entries(BASELINE)) assert.deepEqual(rec[k], v, `${k} is kept`);
   assert.deepEqual(w.run.actions, ['submit_skill r1']);
@@ -675,6 +676,7 @@ test('publishing clears the old text\'s check and maintenance state and keeps th
     maintenance_reason: 'check',
     // Names this very record: a retire run may still be deprecating it.
     maintenance_deprecating: OLD,
+    retire_refused_at: '2026-09-15T00:00:00.000Z',
   });
   const w = world({ item, skills: { [OLD]: { status: 'DRAFT', skillMd: 'live body' } } });
   const out = parse(await w.submit.invoke(INPUT));
@@ -683,7 +685,7 @@ test('publishing clears the old text\'s check and maintenance state and keeps th
   assert.equal(out.action, 'updated');
 
   const rec = w.record();
-  for (const gone of ['stale_names', 'stale_since', 'pending_revision', 'maintenance_id', 'maintenance_requested_at', 'maintenance_reason']) {
+  for (const gone of ['stale_names', 'stale_since', 'pending_revision', 'maintenance_id', 'maintenance_requested_at', 'maintenance_reason', 'retire_refused_at']) {
     assert.ok(!(gone in rec), `${gone} is removed`);
   }
   assert.equal(rec.maintenance_deprecating, OLD, 'a marker naming the published record stays');

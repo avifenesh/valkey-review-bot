@@ -40,7 +40,8 @@ import { errorText, fail, ok, type CuratorRun } from './run.js';
  *
  * The release check and the decay job keep more attributes on a
  * record (audit_names, ignored_names, verified_sha, pending_revision,
- * previous_skill_md, maintenance_*). recordView never shows them.
+ * previous_skill_md, maintenance_*, retire_refused_at). recordView never
+ * shows them.
  */
 
 export interface ConcernsDeps {

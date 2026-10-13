@@ -212,6 +212,7 @@ const NAMES: Readonly<Record<string, string>> = {
   '#ret': 'retired_at',
   '#rr': 'retired_reason',
   '#rfs': 'retired_from_status',
+  '#rra': 'retire_refused_at',
   '#sn': 'stale_names',
   '#ss': 'stale_since',
   '#or': 'obsolete_release',
@@ -224,13 +225,14 @@ const NAMES: Readonly<Record<string, string>> = {
 };
 
 /**
- * The release check's state for the published text, the retirement and
- * any maintenance claim. A successful publish clears them: the next
- * decay pass sees graduated_at after verified_at and queues a check of
- * the new text. audit_names, ignored_names and verified_* stay, so that
- * check compares against the old baseline.
+ * The release check's state for the published text, the retirement (and
+ * a refused one, retire_refused_at) and any maintenance claim. A
+ * successful publish clears them: the next decay pass sees graduated_at
+ * after verified_at and queues a check of the new text. audit_names,
+ * ignored_names and verified_* stay, so that check compares against the
+ * old baseline.
  */
-const CLEARED_ON_PUBLISH = '#sn, #ss, #or, #pr, #ret, #rr, #rfs, #mid, #mra, #mr';
+const CLEARED_ON_PUBLISH = '#sn, #ss, #or, #pr, #ret, #rr, #rfs, #rra, #mid, #mra, #mr';
 
 /** A queued check or retirement of the old text is void once a new text is claimed. */
 const CANCEL_MAINTENANCE = 'REMOVE #mid, #mra, #mr';
