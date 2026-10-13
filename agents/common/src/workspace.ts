@@ -39,6 +39,10 @@ export interface InvocationPayload {
   readonly repo: string; // "owner/name"
   readonly pr_number: number;
   readonly installation_id: number;
+  /** "push" when the receiver started the review for new commits (pull_request synchronize). */
+  readonly trigger?: string;
+  /** The route's skipDrafts setting, sent with push reviews. */
+  readonly skip_drafts?: boolean;
 }
 
 export interface WorkspaceOptions {
@@ -106,6 +110,28 @@ export interface PrContext {
   readonly releaseLines: readonly ReleaseLine[] | null;
   readonly workspacePath: string;
   readonly diffRefSpec: string; // "<mergeBaseSha>..<headSha>"
+}
+
+/** A push review that is not run: the reason, and the head the pull request was at. */
+export interface SkippedPushReview {
+  readonly skipped: string;
+  readonly headSha: string;
+}
+
+/**
+ * Why a push review should not run, or null when it should. A push
+ * review waits in the queue for a while, so the pull request may have
+ * been closed, merged or turned back into a draft since the push. Other
+ * runs, such as a maintainer's @mention, go ahead in any state.
+ */
+export function pushReviewSkipReason(
+  payload: Pick<InvocationPayload, 'trigger' | 'skip_drafts'>,
+  pr: { readonly state: string; readonly draft?: boolean; readonly merged?: boolean },
+): string | null {
+  if (payload.trigger !== 'push') return null;
+  if (pr.state !== 'open') return `the pull request is ${pr.merged ? 'merged' : pr.state}`;
+  if (pr.draft === true && payload.skip_drafts === true) return 'the pull request is a draft and this route skips drafts';
+  return null;
 }
 
 /** Environment for one workspace git process: the runtime's own, then GIT_ENV, then `extra`. */
@@ -264,7 +290,17 @@ async function listPrFiles(octokit: Octokit, owner: string, repo: string, prNumb
   return files.slice(0, MAX_PR_FILES);
 }
 
-export async function prepareWorkspace(payload: InvocationPayload, octokit: Octokit, tokens: TokenSource, opts: WorkspaceOptions): Promise<PrContext> {
+/**
+ * Check out the pull request and gather what the review needs. A push
+ * review whose pull request no longer wants one stops after reading the
+ * pull request, before any git work, and returns why instead.
+ */
+export async function prepareWorkspace(
+  payload: InvocationPayload,
+  octokit: Octokit,
+  tokens: TokenSource,
+  opts: WorkspaceOptions,
+): Promise<PrContext | SkippedPushReview> {
   const [owner, repoName] = payload.repo.split('/');
   if (!owner || !repoName) throw new Error(`bad repo: ${payload.repo}`);
   const cwd = opts.workspaceRoot;
@@ -272,6 +308,8 @@ export async function prepareWorkspace(payload: InvocationPayload, octokit: Octo
   const upstreamRepo = opts.upstreamRepo || prRepo;
 
   const { data: pr } = await octokit.pulls.get({ owner, repo: repoName, pull_number: payload.pr_number });
+  const skipped = pushReviewSkipReason(payload, pr);
+  if (skipped !== null) return { skipped, headSha: pr.head.sha };
   const baseSha = pr.base.sha;
   const auth = async (): Promise<NodeJS.ProcessEnv> => gitAuthEnv(await tokens.get());
 

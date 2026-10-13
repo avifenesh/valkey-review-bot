@@ -48,7 +48,7 @@ export interface RunAgentConfig {
   readonly assembleTools: AssembleTools;
 }
 
-const requestSchema = z.object({
+export const requestSchema = z.object({
   repo: z.string(),
   pr_number: z.number().int().positive(),
   installation_id: z.number().int().positive(),
@@ -63,6 +63,12 @@ const requestSchema = z.object({
   run_nonce: z.string().optional(),
   trigger_path: z.string().optional(),
   trigger_line: z.number().int().positive().optional(),
+  // Push-trigger fields (receiver's synchronize path). trigger is "push"
+  // for a review of new commits; skip_drafts is the route's skipDrafts.
+  // Such a review waits in the queue first, so the run checks again that
+  // the PR still wants it (see pushReviewSkipReason in workspace.ts).
+  trigger: z.string().optional(),
+  skip_drafts: z.boolean().optional(),
 });
 
 export type Payload = z.infer<typeof requestSchema>;
@@ -243,11 +249,31 @@ export function createReviewHandler(opts: ReviewHandlerOpts): (payload: Payload)
       }
 
       yield { event: 'status', data: { phase: 'workspace' } };
-      const ctx = await deps.prepareWorkspace(payload, octokit, tokens, {
+      const prepared = await deps.prepareWorkspace(payload, octokit, tokens, {
         workspaceRoot: env.workspaceRoot,
         appId: Number(env.githubAppId),
         upstreamRepo: env.upstreamRepo,
       });
+      if ('skipped' in prepared) {
+        // Nothing to review: post nothing and leave the state comment
+        // alone. Completed, so the invoker does not run it again.
+        console.log(`[invoke] push review of ${payload.repo}#${payload.pr_number} not run: ${prepared.skipped}; nothing posted`);
+        await heartbeat.finish('completed');
+        yield {
+          event: 'done',
+          data: {
+            status: 'completed',
+            repo: payload.repo,
+            pr_number: payload.pr_number,
+            head_sha: prepared.headSha,
+            terminal_tool: null,
+            decision: 'skipped',
+            skip_reason: prepared.skipped,
+          },
+        };
+        return;
+      }
+      const ctx = prepared;
 
       // Graduated skills: patterns that crossed the reinforcement
       // threshold and were published by the curator. They go into the

@@ -7,7 +7,7 @@ import { BedrockAgentCoreApp } from 'bedrock-agentcore/runtime';
 import './support/ts-resolve.mjs';
 import { failingTurn, ScriptedModel, textOf, textTurn, toolTurn } from './support/scripted-model.mjs';
 
-const { asBusyTask, baseSystemPrompt, createReviewHandler, mentionBlock } = await import('../src/run-agent.ts');
+const { asBusyTask, baseSystemPrompt, createReviewHandler, mentionBlock, requestSchema } = await import('../src/run-agent.ts');
 const { loadEnv } = await import('../src/config.ts');
 const { buildPostReviewTool, buildSkipTool, createTerminalGate } = await import('../src/tools/gh.ts');
 
@@ -316,4 +316,64 @@ test('suppressed pieces of the baked-in skill reach the reviewer labelled', () =
   assert.doesNotMatch(prompt, /<!--|evidence:/);
   // A skill without markers goes in as written.
   assert.ok(baseSystemPrompt('P', '# Skill\n\n## Use when\nbody').endsWith('\n\n# Skill\n\n## Use when\nbody'));
+});
+
+test('the payload schema keeps the push-review fields', () => {
+  const parsed = requestSchema.parse({ ...payload, trigger: 'push', skip_drafts: true, pending_marker: 'm-1' });
+  assert.equal(parsed.trigger, 'push');
+  assert.equal(parsed.skip_drafts, true);
+  assert.equal('pending_marker' in parsed, false);
+  assert.throws(() => requestSchema.parse({ ...payload, skip_drafts: 'yes' }));
+});
+
+test('a push review of a pull request that closed while it waited ends as completed and posts nothing', async (t) => {
+  const written = recordHeartbeats(t);
+  const logs = [];
+  t.mock.method(console, 'log', (...args) => { logs.push(args.join(' ')); });
+  const model = new ScriptedModel([skipTurn]);
+  let assembled = false;
+  const pr = { state: 'closed', merged: false, draft: false, head: { sha: 'n'.repeat(40) }, base: { sha: 'b'.repeat(40), ref: 'unstable' } };
+  const handler = createReviewHandler({
+    env,
+    systemPrompt: 'You review pull requests.',
+    assembleTools: async () => { assembled = true; return [noop]; },
+    deps: {
+      createModel: () => model,
+      createTokenSource: () => ({ get: async () => 'token' }),
+      // Only pulls.get: the run must stop before git, the listings and the tools.
+      createOctokit: () => ({ pulls: { get: async () => ({ data: pr }) } }),
+      loadGraduatedSkills: async () => { throw new Error('not loaded for a skipped run'); },
+      createStatusComment: () => { throw new Error('only mention runs have a status comment'); },
+    },
+  });
+  const frames = await consume(handler(requestSchema.parse({ ...payload, trigger: 'push', skip_drafts: true })));
+  assert.deepEqual(frames.at(-1), {
+    event: 'done',
+    data: {
+      status: 'completed', repo: 'valkey-io/valkey', pr_number: 7, head_sha: 'n'.repeat(40),
+      terminal_tool: null, decision: 'skipped', skip_reason: 'the pull request is closed',
+    },
+  });
+  assert.equal(model.calls, 0);
+  assert.equal(assembled, false);
+  assert.deepEqual(written, ['running', 'completed']);
+  assert.ok(logs.some((l) => l === '[invoke] push review of valkey-io/valkey#7 not run: the pull request is closed; nothing posted'), logs.join('\n'));
+});
+
+test('a push review that is closed at the done frame stays completed', async (t) => {
+  const written = recordHeartbeats(t);
+  const pr = { state: 'open', draft: true, head: { sha: 'n'.repeat(40) }, base: { sha: 'b'.repeat(40), ref: 'unstable' } };
+  const handler = createReviewHandler({
+    env,
+    systemPrompt: 'You review pull requests.',
+    assembleTools: async () => [noop],
+    deps: {
+      createModel: () => new ScriptedModel([]),
+      createTokenSource: () => ({ get: async () => 'token' }),
+      createOctokit: () => ({ pulls: { get: async () => ({ data: pr }) } }),
+    },
+  });
+  const frames = await consume(handler({ ...payload, trigger: 'push', skip_drafts: true }), (f) => f.event === 'done');
+  assert.equal(frames.at(-1).data.skip_reason, 'the pull request is a draft and this route skips drafts');
+  assert.deepEqual(written, ['running', 'completed']);
 });
