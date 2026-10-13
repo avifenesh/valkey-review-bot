@@ -207,12 +207,42 @@ export function decayedScore(score: number, elapsedSeconds: number, halfLifeSeco
  *   renamed since the send is released too. That is part of its last
  *   state write, or a write of its own when there is none or that write
  *   lost its condition.
- * - It REMOVEs maintenance_deprecating only in the tombstone write, or
- *   after it read the registry record in the same run as DRAFT,
- *   PENDING_APPROVAL or APPROVED. A skip before any registry read keeps
- *   the marker, so a deprecation an earlier run started is still seen as
- *   the lifecycle's own.
- * - An outcome it wants retried later keeps the claim, which ages out.
+ * - An outcome it wants retried later keeps the claim, which ages out:
+ *   the run threw, the check was inconclusive, the registry record was
+ *   CREATING or UPDATING, or a deprecateSkill call failed in a way that
+ *   leaves open whether it took effect (a timeout, or any error other
+ *   than ValidationException).
+ *
+ * The marker. Just before it calls deprecateSkill, a retire run SETs
+ * maintenance_deprecating = record_name, under its claim and
+ * graduated_record_name = record_name. From then on a DEPRECATED registry
+ * record may be the lifecycle's own doing. A value other than the
+ * record's current graduated_record_name is left from an older
+ * generation and counts as absent. Whether a run keeps the marker or
+ * REMOVEs it follows only from what the run last learned about the
+ * registry record:
+ * - Retired: deprecateSkill succeeded, or getSkillByName read DEPRECATED,
+ *   REJECTED or no record. The tombstone write REMOVEs the marker with
+ *   the claim. The marker decides retired_reason, so that write is
+ *   conditioned on the marker as read: = :name, = the older value, or
+ *   attribute_not_exists.
+ *   - The lifecycle's own retirement: this run's deprecateSkill
+ *     succeeded, or DEPRECATED or no record was read with the marker
+ *     present. retired_reason is the message's retire_reason, or outside
+ *     a retire run obsolete_release ? 'obsolete' : 'decayed'.
+ *   - Otherwise 'operator', and REJECTED is always 'operator': the
+ *     lifecycle never rejects a record. A retire run that finds no record
+ *     keeps its retire_reason, marker or not.
+ * - Live and settled: DRAFT, PENDING_APPROVAL or APPROVED, read after the
+ *   run's last deprecateSkill call, if it made one. No deprecation is
+ *   under way, so the write that releases the claim REMOVEs the marker
+ *   (on a check's revise path, its first write).
+ * - Anything else keeps the marker: CREATING or UPDATING (the record is
+ *   changing, perhaps by an earlier deprecation, and the claim stays
+ *   too), CREATE_FAILED, UPDATE_FAILED or any other status, no registry
+ *   read yet (a skip, which ends in a plain release), a read that failed,
+ *   and an ambiguous deprecateSkill failure.
+ * A refused deprecation follows the same rule; see RetireMessage.
  *
  * SQS can deliver a message more than once, and two copies can run at
  * the same time. The curator's writes conditioned on maintenance_id make
@@ -245,13 +275,27 @@ export interface CheckMessage {
 }
 
 /**
- * When the registry refuses the deprecation, the curator SETs
- * retire_refused_at (ISO time) in the write that releases the claim. The
- * pass then requests no retirement of the record for
- * RETIRE_REFUSED_BACKOFF_SECONDS (30 days by default), so a skill the
- * registry will not deprecate does not take a slot of
- * MAX_RETIREMENTS_PER_DAY every day. It only reads the age of the
- * attribute: the curator may leave it or REMOVE it later.
+ * A refused retirement. When deprecateSkill throws ValidationException,
+ * the retire run reads the registry record again:
+ * - DEPRECATED, REJECTED or no record: retired, as the marker rule at
+ *   CheckMessage says.
+ * - CREATING or UPDATING: not a refusal. The claim and the marker stay,
+ *   so the retirement is requested again once the claim ages out.
+ * - DRAFT, PENDING_APPROVAL or APPROVED: refused. One write SETs
+ *   retire_refused_at (ISO time) and REMOVEs the claim and the marker.
+ * - CREATE_FAILED, UPDATE_FAILED or any other status: refused too, but
+ *   the marker stays. The write SETs retire_refused_at and REMOVEs the
+ *   claim only.
+ * Both refused writes are conditioned on maintenance_id = :id AND
+ * graduated_record_name = :name; when that fails, the run only releases
+ * the claim.
+ *
+ * For RETIRE_REFUSED_BACKOFF_SECONDS (30 days by default) after
+ * retire_refused_at the pass requests no retirement of the record, so a
+ * skill the registry will not deprecate does not take a slot of
+ * MAX_RETIREMENTS_PER_DAY every day. The pass only reads the age of the
+ * attribute: the curator may leave it, or REMOVE it in a tombstone write
+ * or when submit_skill publishes the skill again.
  */
 export interface RetireMessage {
   /** "retire#<reviewer_id>#<record_id>#<ISO time of the pass>", at most 200 characters. */
@@ -398,7 +442,7 @@ export interface Stats {
   readonly keptRetired: number;
   readonly checksRequested: number;
   readonly retireRequested: number;
-  /** Retirement candidates only logged: RETIRE_SKILLS off or a dry run. */
+  /** Retirement candidates only logged: RETIRE_SKILLS off, no curator queue, or a dry run. */
   readonly wouldRetire: number;
   /** Candidates over a per-pass cap; they are due again at the next pass. */
   readonly deferred: number;
