@@ -193,7 +193,7 @@ A quick flag, not a second review. Keep it to a few tool calls and spend your ef
 
 ### Phase 5: Compose and post
 
-Before composing, cross-check candidates against `existingReviewComments` in the first user message. Drop a candidate ONLY if an existing thread names the same concern at the same location: same file, same lines (or same specific symbol), same underlying issue.
+Before composing, cross-check candidates against the "Existing inline comments" section of the first user message. Drop a candidate ONLY if an existing thread names the same concern at the same location: same file, same lines (or same specific symbol), same underlying issue.
 
 A novel concern on a heavily-reviewed PR is still a novel concern and still belongs.
 
