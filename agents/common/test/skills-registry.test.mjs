@@ -1,9 +1,16 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import { isRetiredStatus, loadSkills, SkillRetiredError, upsertSkill, withFrontmatter } from '../src/skills-registry.ts';
+import {
+  deprecateSkill, getSkillByName, isRetiredStatus, loadSkills, SkillRetiredError, STATUS_REASON_MAX_CHARS, upsertSkill, withFrontmatter,
+} from '../src/skills-registry.ts';
 
-/** Minimal stand-in for AgentRegistryControlClient: routes by command class name. */
-function fakeClient(records, { pageSize = 2 } = {}) {
+/**
+ * Minimal stand-in for AgentRegistryControlClient: routes by command
+ * class name. `looseNameFilter` makes the name filter a substring match,
+ * since the service does not document it as exact. `statusReplies`
+ * answers successive status updates; an Error entry is thrown.
+ */
+function fakeClient(records, { pageSize = 2, looseNameFilter = false, statusReplies = [] } = {}) {
   const calls = [];
   return {
     calls,
@@ -13,7 +20,8 @@ function fakeClient(records, { pageSize = 2 } = {}) {
       calls.push({ op, input });
       if (op === 'ListRegistryRecordsCommand') {
         const byName = input.filters?.find((f) => f.name === 'name')?.values[0];
-        const matching = records.filter((r) => r.recordType === 'SKILL' && (!byName || r.name === byName));
+        const nameMatches = (name) => !byName || (looseNameFilter ? name.includes(byName) : name === byName);
+        const matching = records.filter((r) => r.recordType === 'SKILL' && nameMatches(r.name));
         const start = Number(input.nextToken ?? 0);
         const page = matching.slice(start, start + pageSize);
         const next = start + pageSize < matching.length ? String(start + pageSize) : undefined;
@@ -25,6 +33,11 @@ function fakeClient(records, { pageSize = 2 } = {}) {
       }
       if (op === 'CreateRegistryRecordCommand') return { recordArn: 'arn:new', status: 'CREATING' };
       if (op === 'UpdateRegistryRecordCommand') return { recordArn: 'arn:existing', status: 'UPDATING' };
+      if (op === 'UpdateRegistryRecordStatusCommand') {
+        const reply = statusReplies.shift() ?? { status: input.status };
+        if (reply instanceof Error) throw reply;
+        return { recordId: input.recordId, ...reply };
+      }
       throw new Error(`unexpected ${op}`);
     },
   };
@@ -33,6 +46,8 @@ function fakeClient(records, { pageSize = 2 } = {}) {
 const rec = (recordId, status, updated, md = `---\nname: ${recordId}\n---\nbody`, name = recordId) => ({
   recordId, name, recordArn: `arn:${recordId}`, recordType: 'SKILL', status, md, updatedAt: new Date(updated),
 });
+
+const serviceError = (name) => Object.assign(new Error(name), { name });
 
 const writes = (client) => client.calls.filter((c) => c.op === 'CreateRegistryRecordCommand' || c.op === 'UpdateRegistryRecordCommand');
 
@@ -149,4 +164,78 @@ test('upsertSkill with updateOnly never creates a missing record', async () => {
     /no skill record named "lock-order" to update/,
   );
   assert.deepEqual(writes(client), []);
+});
+
+test('getSkillByName returns only the record with exactly that name, with its markdown', async () => {
+  const client = fakeClient([
+    rec('a', 'DRAFT', '2026-10-01', '# lock-order-v2', 'lock-order-v2'),
+    rec('b', 'APPROVED', '2026-10-02', '# lock-order', 'lock-order'),
+    rec('c', 'DRAFT', '2026-10-03', '# x', 'old-lock-order'),
+  ], { looseNameFilter: true });
+  const skill = await getSkillByName(client, 'reg', 'lock-order');
+  assert.deepEqual(skill, { recordId: 'b', recordArn: 'arn:b', name: 'lock-order', description: '', status: 'APPROVED', skillMd: '# lock-order' });
+  assert.equal(await getSkillByName(client, 'reg', 'lock'), null);
+  assert.deepEqual(client.calls.filter((c) => c.op === 'GetRegistryRecordCommand').map((c) => c.input.recordId), ['b']);
+});
+
+test('getSkillByName returns a retired record, and prefers a live one with the same name', async () => {
+  const retired = rec('old', 'DEPRECATED', '2026-10-05', '# old body', 'lock-order');
+  assert.equal((await getSkillByName(fakeClient([retired]), 'reg', 'lock-order')).status, 'DEPRECATED');
+  assert.equal((await getSkillByName(fakeClient([retired]), 'reg', 'lock-order')).skillMd, '# old body');
+  const both = fakeClient([retired, rec('live', 'UPDATING', '2026-10-01', '# live body', 'lock-order')]);
+  assert.equal((await getSkillByName(both, 'reg', 'lock-order')).recordId, 'live');
+});
+
+test('getSkillByName passes the abort signal to every call', async () => {
+  const signals = [];
+  const client = fakeClient([rec('lock-order', 'DRAFT', '2026-10-01')]);
+  const send = client.send.bind(client);
+  client.send = (command, opts) => { signals.push(opts?.abortSignal); return send(command, opts); };
+  const abortSignal = new AbortController().signal;
+  await getSkillByName(client, 'reg', 'lock-order', abortSignal);
+  assert.deepEqual(signals, [abortSignal, abortSignal]);
+});
+
+test('deprecateSkill sets DEPRECATED with the reason trimmed to the limit', async () => {
+  const client = fakeClient([]);
+  const reason = `  valkey-reviewer: retired (decayed) 2026-10-13; ${'x'.repeat(400)}  `;
+  assert.equal(await deprecateSkill(client, 'reg', 'rec-1', reason), 'DEPRECATED');
+  const [call] = client.calls;
+  assert.equal(call.op, 'UpdateRegistryRecordStatusCommand');
+  assert.equal(call.input.registryId, 'reg');
+  assert.equal(call.input.recordId, 'rec-1');
+  assert.equal(call.input.status, 'DEPRECATED');
+  assert.equal(call.input.statusReason.length, STATUS_REASON_MAX_CHARS);
+  assert.equal(STATUS_REASON_MAX_CHARS, 256);
+  assert.ok(call.input.statusReason.startsWith('valkey-reviewer: retired (decayed) 2026-10-13; x'));
+});
+
+test('deprecateSkill keeps a short reason as written, without surrounding space', async () => {
+  const client = fakeClient([]);
+  await deprecateSkill(client, 'reg', 'rec-1', '\n valkey-reviewer: retired (obsolete) 2026-10-13 \n');
+  assert.equal(client.calls[0].input.statusReason, 'valkey-reviewer: retired (obsolete) 2026-10-13');
+});
+
+test('deprecateSkill refuses an empty reason without calling the service', async () => {
+  const client = fakeClient([]);
+  await assert.rejects(deprecateSkill(client, 'reg', 'rec-1', '   '), /needs a reason/);
+  assert.equal(client.calls.length, 0);
+});
+
+test('deprecateSkill waits out a busy record and retries', async (t) => {
+  t.mock.timers.enable({ apis: ['setTimeout'] });
+  const client = fakeClient([], { statusReplies: [serviceError('ConflictException'), serviceError('ConflictException'), { status: 'DEPRECATED' }] });
+  const done = deprecateSkill(client, 'reg', 'rec-1', 'retired');
+  for (let i = 0; i < 2; i++) {
+    await new Promise(setImmediate);
+    t.mock.timers.tick(5_000);
+  }
+  assert.equal(await done, 'DEPRECATED');
+  assert.equal(client.calls.filter((c) => c.op === 'UpdateRegistryRecordStatusCommand').length, 3);
+});
+
+test('deprecateSkill passes a refused transition to the caller without retrying', async () => {
+  const client = fakeClient([], { statusReplies: [serviceError('ValidationException')] });
+  await assert.rejects(deprecateSkill(client, 'reg', 'rec-1', 'retired'), { name: 'ValidationException' });
+  assert.equal(client.calls.length, 1);
 });

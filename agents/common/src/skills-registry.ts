@@ -4,6 +4,7 @@ import {
   GetRegistryRecordCommand,
   ListRegistryRecordsCommand,
   UpdateRegistryRecordCommand,
+  UpdateRegistryRecordStatusCommand,
   type GetRegistryRecordCommandOutput,
   type RegistryRecordFilter,
   type RegistryRecordSummary,
@@ -31,6 +32,9 @@ export const GRADUATED_SKILLS_MAX_CHARS = 80_000;
  * reviewers' budget, so every published skill can be loaded.
  */
 export const GRADUATED_SKILL_MAX_CHARS = 40_000;
+
+/** Longest status reason deprecateSkill sends; a longer one is cut. */
+export const STATUS_REASON_MAX_CHARS = 256;
 
 /**
  * Statuses of a retired record. DEPRECATED is terminal: the service
@@ -81,6 +85,17 @@ export function skillMdOf(record: GetRegistryRecordCommandOutput): string {
   return record.descriptors?.agentSkillsDefinition?.additionalData?.skillMd?.data ?? '';
 }
 
+function skillRecordOf(rec: GetRegistryRecordCommandOutput): SkillRecord {
+  return {
+    recordId: rec.recordId ?? '',
+    recordArn: rec.recordArn ?? '',
+    name: rec.name ?? '',
+    description: rec.description ?? '',
+    status: rec.status ?? '',
+    skillMd: skillMdOf(rec),
+  };
+}
+
 /** Every SKILL record summary in the registry, following pagination. */
 export async function listSkillSummaries(
   client: AgentRegistryControlClient,
@@ -120,14 +135,7 @@ export async function loadSkills(
   const full = await Promise.all(chosen.map((r) =>
     client.send(new GetRegistryRecordCommand({ registryId, recordId: r.recordId! }), { abortSignal })));
   const withMarkdown = full
-    .map((rec) => ({
-      recordId: rec.recordId ?? '',
-      recordArn: rec.recordArn ?? '',
-      name: rec.name ?? '',
-      description: rec.description ?? '',
-      status: rec.status ?? '',
-      skillMd: skillMdOf(rec),
-    }))
+    .map(skillRecordOf)
     .filter((s) => s.skillMd.length > 0);
   const skills: SkillRecord[] = [];
   let chars = 0;
@@ -137,6 +145,33 @@ export async function loadSkills(
     chars += skill.skillMd.length;
   }
   return { skills, skipped: usable.length - skills.length };
+}
+
+/**
+ * The summary of the record with exactly this name. The name filter is
+ * not documented as an exact match, so names are compared here too.
+ * When several records share the name, one that is not retired wins, so
+ * a retired duplicate never hides a live skill.
+ */
+function pickByName(summaries: readonly RegistryRecordSummary[], name: string): RegistryRecordSummary | undefined {
+  const matches = summaries.filter((r) => r.name === name && r.recordId);
+  return matches.find((r) => !isRetiredStatus(r.status)) ?? matches[0];
+}
+
+/**
+ * The record with exactly this name, in any status, with its markdown;
+ * null when there is none. A record that is not retired is preferred,
+ * the same choice upsertSkill makes.
+ */
+export async function getSkillByName(
+  client: AgentRegistryControlClient,
+  registryId: string,
+  name: string,
+  abortSignal?: AbortSignal,
+): Promise<SkillRecord | null> {
+  const summary = pickByName(await listSkillSummaries(client, registryId, [{ name: 'name', values: [name] }], abortSignal), name);
+  if (!summary) return null;
+  return skillRecordOf(await client.send(new GetRegistryRecordCommand({ registryId, recordId: summary.recordId! }), { abortSignal }));
 }
 
 export interface UpsertSkillInput {
@@ -171,17 +206,6 @@ async function retryWhileBusy<T>(call: () => Promise<T>, attempts = 6, delayMs =
       await new Promise((resolve) => setTimeout(resolve, delayMs));
     }
   }
-}
-
-/**
- * The summary of the record with exactly this name. The name filter is
- * not documented as an exact match, so names are compared here too.
- * When several records share the name, one that is not retired wins, so
- * a retired duplicate never hides a live skill.
- */
-function pickByName(summaries: readonly RegistryRecordSummary[], name: string): RegistryRecordSummary | undefined {
-  const matches = summaries.filter((r) => r.name === name && r.recordId);
-  return matches.find((r) => !isRetiredStatus(r.status)) ?? matches[0];
 }
 
 export interface UpsertSkillOptions {
@@ -240,4 +264,29 @@ export async function upsertSkill(
     descriptors: { agentSkillsDefinition: { additionalData: { skillMd: { data: skillMd } } } },
   }));
   return { action: 'created', recordArn: resp.recordArn ?? '', status: resp.status ?? '' };
+}
+
+/**
+ * Retire a skill record: set its status to DEPRECATED with a reason,
+ * trimmed and cut to STATUS_REASON_MAX_CHARS. Reviewers stop loading it
+ * at their next run. DEPRECATED is terminal, so this cannot be undone;
+ * a returning skill is published under a new name. A refused transition
+ * (for example a ValidationException) is thrown to the caller. Returns
+ * the status the service reports.
+ */
+export async function deprecateSkill(
+  client: AgentRegistryControlClient,
+  registryId: string,
+  recordId: string,
+  reason: string,
+): Promise<string> {
+  const statusReason = reason.trim().slice(0, STATUS_REASON_MAX_CHARS).trimEnd();
+  if (!statusReason) throw new Error('deprecateSkill needs a reason');
+  const resp = await retryWhileBusy(() => client.send(new UpdateRegistryRecordStatusCommand({
+    registryId,
+    recordId,
+    status: 'DEPRECATED',
+    statusReason,
+  })));
+  return resp.status ?? '';
 }
