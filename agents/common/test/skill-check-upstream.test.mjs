@@ -300,6 +300,21 @@ test('the runner kills what git started when the output passes the cap, or when 
   rmSync(dir, { recursive: true, force: true });
 });
 
+test('output that arrives after git exits is kept when the grace period kills what git left', { timeout: 20_000 }, async (t) => {
+  const dir = tempDir('skc-runner4-');
+  gitIn(dir)('init', '-q');
+  t.mock.timers.enable({ apis: ['setTimeout'] });
+  const call = createGitRunner(dir)(['-c', 'alias.late=!echo early; (sleep 0.6; echo late; sleep 5) &', 'late']);
+  // Let git print and exit while the event loop runs.
+  for (const until = Date.now() + 300; Date.now() < until;) await new Promise((r) => setImmediate(r));
+  // Block the loop while the child writes, so its line waits in the pipe, then end the grace period.
+  Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 700);
+  t.mock.timers.tick(2_000);
+  const r = await call;
+  assert.deepEqual({ code: r.code, stdout: r.stdout }, { code: 0, stdout: 'early\nlate\n' });
+  rmSync(dir, { recursive: true, force: true });
+});
+
 test('the line resolver reads cited lines at the checked commit only', async () => {
   const up = makeUpstream();
   const dir = path.join(up.root, 'checkout');

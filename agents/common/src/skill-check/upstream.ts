@@ -97,7 +97,7 @@ function subcommand(args: readonly string[]): string {
  * fetch or remote helper git started cannot keep writing into the
  * repository after the call returns. So does a git that exits while
  * something it started still holds its output, once a grace period
- * has passed.
+ * has passed; the call then returns when the output closes.
  */
 export function createGitRunner(cwd: string, env: NodeJS.ProcessEnv = upstreamGitEnv()): GitRunner {
   return (args, opts = {}) => new Promise((resolve, reject) => {
@@ -113,6 +113,7 @@ export function createGitRunner(cwd: string, env: NodeJS.ProcessEnv = upstreamGi
     let settled = false;
     let status: { code: number | null; signal: NodeJS.Signals | null } = { code: null, signal: null };
     let grace: NodeJS.Timeout | undefined;
+    let linger: NodeJS.Timeout | undefined;
 
     const killGroup = () => {
       try {
@@ -126,6 +127,7 @@ export function createGitRunner(cwd: string, env: NodeJS.ProcessEnv = upstreamGi
       settled = true;
       clearTimeout(timer);
       clearTimeout(grace);
+      clearTimeout(linger);
       child.stdout.destroy();
       child.stderr.destroy();
       const stdout = Buffer.concat(out).toString('utf8');
@@ -166,16 +168,15 @@ export function createGitRunner(cwd: string, env: NodeJS.ProcessEnv = upstreamGi
       settled = true;
       clearTimeout(timer);
       clearTimeout(grace);
+      clearTimeout(linger);
       reject(new Error(`could not run git: ${e.message}`));
     });
     child.on('exit', (code, signal) => {
       status = { code, signal };
       // 'close' waits for everything that holds git's output. Whatever
-      // git left running is stopped after the grace period.
-      grace ??= setTimeout(() => {
-        killGroup();
-        finish();
-      }, CLOSE_GRACE_MS);
+      // git left running is killed after the grace period; the output
+      // is read until it closes, so a slow reader never loses any.
+      linger = setTimeout(killGroup, CLOSE_GRACE_MS);
     });
     child.on('close', (code, signal) => {
       if (status.code === null && status.signal === null) status = { code, signal };
