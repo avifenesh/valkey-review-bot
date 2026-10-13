@@ -1,0 +1,96 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build-and-test:
+    name: Type-check and test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: 24
+      - name: Install dependencies
+        run: |
+          for pkg in agents/common agents/curator agents/valkey-review agents/valkey-glide-review webhook ops infra; do
+            echo "::group::npm ci $pkg"
+            (cd "$pkg" && npm ci --no-audit --no-fund)
+            echo "::endgroup::"
+          done
+      - name: Type-check and test each package
+        run: |
+          set -euo pipefail
+          for pkg in agents/common agents/curator agents/valkey-review agents/valkey-glide-review webhook ops infra; do
+            echo "::group::$pkg"
+            (cd "$pkg" && npm run --if-present typecheck && npm run --if-present test)
+            echo "::endgroup::"
+          done
+
+  synth:
+    name: CDK synth (example configuration)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: 24
+      - name: Install dependencies
+        run: for pkg in webhook ops infra; do (cd "$pkg" && npm ci --no-audit --no-fund); done
+      - name: Synthesize
+        working-directory: infra
+        run: npx cdk synth --quiet -c config=deploy.config.example.json
+
+  agent-configs:
+    name: Lint agent configs (agnix)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: agent-sh/agnix@2c0e4efede3181599eca37619e8067ae2d941c00 # v0.57.0
+        with:
+          version: '0.57.0'
+
+  secret-scan:
+    name: Secret scan (scrump)
+    runs-on: ubuntu-latest
+    env:
+      SCRUMP_VERSION: v0.1.8
+      SCRUMP_SHA256: 7aeb7a48c7f38a7302ea265f501d2e3109910c2c732fe1d64a57373d8b3fcea8
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - name: Install scrump
+        run: |
+          set -euo pipefail
+          archive="scrump-${SCRUMP_VERSION}-x86_64-unknown-linux-gnu.tar.gz"
+          curl -fsSL -o "$RUNNER_TEMP/$archive" "https://github.com/avifenesh/scrump/releases/download/${SCRUMP_VERSION}/$archive"
+          echo "${SCRUMP_SHA256}  $RUNNER_TEMP/$archive" | sha256sum -c -
+          tar -xzf "$RUNNER_TEMP/$archive" -C "$RUNNER_TEMP"
+          echo "$RUNNER_TEMP/scrump-${SCRUMP_VERSION}-x86_64-unknown-linux-gnu" >> "$GITHUB_PATH"
+      - name: Scan tracked files
+        # npm lockfiles are skipped: their sha512 integrity hashes match a
+        # generic high-entropy key rule and carry no credentials.
+        run: |
+          set -euo pipefail
+          hits=0
+          while IFS= read -r -d '' f; do
+            out=$(scrump scan "$f")
+            if grep -Eq '^found: [1-9]' <<<"$out"; then
+              echo "::error file=$f::scrump reported possible secrets"
+              echo "$out"
+              hits=$((hits + 1))
+            fi
+          done < <(git ls-files -z -- ':!:**/package-lock.json')
+          if [ "$hits" -gt 0 ]; then
+            echo "$hits file(s) with possible secrets"
+            exit 1
+          fi

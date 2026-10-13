@@ -1,0 +1,78 @@
+version: 2
+updates:
+  - package-ecosystem: npm
+    directory: "/agents/curator"
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 5
+    groups:
+      security-and-patches:
+        update-types: [minor, patch]
+  - package-ecosystem: npm
+    directory: "/agents/valkey-glide-review"
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 5
+    groups:
+      security-and-patches:
+        update-types: [minor, patch]
+  - package-ecosystem: npm
+    directory: "/agents/common"
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 5
+    groups:
+      security-and-patches:
+        update-types: [minor, patch]
+  - package-ecosystem: npm
+    directory: "/agents/valkey-review"
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 5
+    groups:
+      security-and-patches:
+        update-types: [minor, patch]
+  - package-ecosystem: npm
+    directory: "/infra"
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 5
+    groups:
+      security-and-patches:
+        update-types: [minor, patch]
+  - package-ecosystem: npm
+    directory: "/ops"
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 5
+    groups:
+      security-and-patches:
+        update-types: [minor, patch]
+  - package-ecosystem: npm
+    directory: "/webhook"
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 5
+    groups:
+      security-and-patches:
+        update-types: [minor, patch]
+  - package-ecosystem: docker
+    directory: "/agents/valkey-review"
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 3
+  - package-ecosystem: docker
+    directory: "/agents/valkey-glide-review"
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 3
+  - package-ecosystem: docker
+    directory: "/agents/curator"
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 3
+  - package-ecosystem: github-actions
+    directory: "/"
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 3
