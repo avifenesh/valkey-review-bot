@@ -130,6 +130,11 @@ test('headings in fenced blocks are left alone', () => {
   ].join('\n')));
 });
 
+test('fences are found in CRLF text too', () => {
+  const md = ['## A', '```sh', '# a shell comment', '```', '# a heading'].join('\r\n');
+  assert.ok(renderGraduatedSkills([skill({ skillMd: md })]).includes(['### A', '```sh', '# a shell comment', '```', '## a heading'].join('\r\n')));
+});
+
 test('markdown without a complete frontmatter block is kept whole', () => {
   const out = renderGraduatedSkills([skill({ skillMd: '---\nname: broken\n## Use when\nbody' })]);
   assert.ok(out.includes('---\nname: broken\n### Use when\nbody'));
@@ -195,6 +200,11 @@ test('suppression markers that do not pair up or do not have the exact form are 
     assert.ok(out.includes(md), md);
     assert.doesNotMatch(out, /Superseded in|End of superseded text/, md);
   }
+});
+
+test('suppressed blocks in CRLF text are labelled outside fences only, keeping the line endings', () => {
+  const md = ['```', openMarker(), 'fenced', CLOSE, '```', openMarker(), 'old', CLOSE, 'new'].join('\r\n');
+  assert.ok(bodyOf(md).includes(['```', openMarker(), 'fenced', CLOSE, '```', openLabel('9.1.2'), 'old', CLOSE_LABEL, 'new'].join('\r\n')));
 });
 
 test('suppression does not nest: a second open marker leaves the first one as written', () => {

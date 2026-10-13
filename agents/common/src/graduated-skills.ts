@@ -54,7 +54,8 @@ const INTRO = 'These rules graduated from the concerns store after repeated rein
 /** The provenance sentence submit_skill appends to a description, for operators. */
 const RECORD_ID_SENTENCE_RE = /\s*Graduated from concern record_id=\S*\s*$/;
 
-const FENCE_RE = /^ {0,3}(`{3,}|~{3,})(.*)$/;
+// `.` stops at a CR, so `\r?` lets fences of CRLF text match.
+const FENCE_RE = /^ {0,3}(`{3,}|~{3,})(.*)\r?$/;
 const HEADING_RE = /^( {0,3})(#{1,5})(?=\s|$)/;
 
 /** Whether each line belongs to a fenced code block, fence lines included. */
@@ -144,7 +145,12 @@ function rewriteLines(markdown: string, demoteHeadings: boolean): string {
   const fenced = fencedLines(lines);
   const labels = suppressedLabels(lines, fenced);
   return lines
-    .map((line, i) => labels.get(i) ?? (demoteHeadings && !fenced[i] ? line.replace(HEADING_RE, '$1#$2') : line))
+    .map((line, i) => {
+      const label = labels.get(i);
+      // A label keeps the line ending of the marker it replaces.
+      if (label !== undefined) return line.endsWith('\r') ? `${label}\r` : label;
+      return demoteHeadings && !fenced[i] ? line.replace(HEADING_RE, '$1#$2') : line;
+    })
     .join('\n');
 }
 
