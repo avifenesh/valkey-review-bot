@@ -2,7 +2,7 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 import './support/ts-resolve.mjs';
 
-const { createAppSecretSource, fetchReviewComment, githubApi, parseAppSecret } = await import('../src/github.ts');
+const { createAppSecretSource, createInstallationTokens, fetchReviewComment, githubApi, parseAppSecret, RECEIVER_TOKEN_PERMISSIONS } = await import('../src/github.ts');
 
 test('parseAppSecret reads the three fields', () => {
   assert.deepEqual(parseAppSecret(JSON.stringify({ webhook_secret: 'w', private_key: 'k', app_id: 123456 })), {
@@ -73,4 +73,19 @@ test('fetchReviewComment returns the comment author, anchor and body', async () 
   const api = async () => ({ status: 200, json: { body: 'b', user: { login: 'u' }, path: 'p.c', line: null, original_line: 3 } });
   assert.deepEqual(await fetchReviewComment(api, 'o/r', 1), { body: 'b', author: 'u', path: 'p.c', line: 3 });
   assert.equal(await fetchReviewComment(async () => ({ status: 404, json: {} }), 'o/r', 1), undefined);
+});
+
+test('receiver tokens ask for exactly the permissions the receiver uses, never contents', async () => {
+  const requests = [];
+  const secrets = { get: async () => ({ appId: '1', privateKey: 'k' }), refresh: async () => ({ appId: '1', privateKey: 'k' }) };
+  const tokens = createInstallationTokens(secrets, async (r) => {
+    requests.push(r);
+    return { token: `t${requests.length}`, expiresAt: new Date(Date.now() + 3600_000).toISOString() };
+  });
+  assert.equal(await tokens(42), 't1');
+  assert.equal(await tokens(42), 't1');
+  assert.equal(requests.length, 1);
+  assert.deepEqual(requests[0].permissions, { pull_requests: 'write', issues: 'read', metadata: 'read' });
+  assert.equal(requests[0].installationId, 42);
+  assert.equal('contents' in RECEIVER_TOKEN_PERMISSIONS, false);
 });

@@ -96,16 +96,39 @@ export function createAppSecretSource(
   };
 }
 
+/**
+ * The permissions the receiver's tokens carry: enough to check a
+ * commenter's access, read pull requests and review comments, and post or
+ * edit its own comments. Asking for them explicitly keeps anything else
+ * the App may hold (contents, if an installation grants it for the skills
+ * repository) out of these tokens.
+ */
+export const RECEIVER_TOKEN_PERMISSIONS = { pull_requests: 'write', issues: 'read', metadata: 'read' } as const;
+
+export interface InstallationTokenRequest {
+  readonly appId: string;
+  readonly privateKey: string;
+  readonly installationId: number;
+  readonly permissions: typeof RECEIVER_TOKEN_PERMISSIONS;
+}
+
+async function issueInstallationToken(r: InstallationTokenRequest): Promise<{ token: string; expiresAt: string }> {
+  const auth = createAppAuth({ appId: r.appId, privateKey: r.privateKey, installationId: r.installationId });
+  return auth({ type: 'installation', permissions: { ...r.permissions } });
+}
+
 /** Installation tokens, cached until a minute before they expire. */
-export function createInstallationTokens(secrets: AppSecretSource): (installationId: number) => Promise<string> {
+export function createInstallationTokens(
+  secrets: AppSecretSource,
+  issue: (r: InstallationTokenRequest) => Promise<{ token: string; expiresAt: string }> = issueInstallationToken,
+): (installationId: number) => Promise<string> {
   const cache = new Map<number, { token: string; expiresAt: number }>();
   return async (installationId) => {
     const hit = cache.get(installationId);
     if (hit && hit.expiresAt - Date.now() > 60_000) return hit.token;
     const { privateKey, appId } = await secrets.get();
     if (!privateKey || !appId) throw new Error('GitHub App secret has no private_key or app_id');
-    const auth = createAppAuth({ appId, privateKey, installationId });
-    const { token, expiresAt } = await auth({ type: 'installation' });
+    const { token, expiresAt } = await issue({ appId, privateKey, installationId, permissions: RECEIVER_TOKEN_PERMISSIONS });
     cache.set(installationId, { token, expiresAt: new Date(expiresAt).getTime() });
     return token;
   };
