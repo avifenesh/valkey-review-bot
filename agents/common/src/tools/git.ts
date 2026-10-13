@@ -211,7 +211,13 @@ export function checkGitArgs(args: readonly string[]): string | null {
   if (sub === 'diff') {
     // Given two paths and one of them outside the work tree, git diff
     // switches to --no-index by itself and compares any two files.
-    const outside = rest.find((a) => !a.startsWith('-') && outsideRepository(a));
+    // Everything after `--` or `--end-of-options` is an operand even when
+    // it starts with "-", as a directory named "-x" makes "-x/../../f".
+    const end = rest.findIndex((a) => a === '--' || a === '--end-of-options');
+    const operands = end === -1
+      ? rest.filter((a) => !a.startsWith('-'))
+      : [...rest.slice(0, end).filter((a) => !a.startsWith('-')), ...rest.slice(end + 1)];
+    const outside = operands.find(outsideRepository);
     if (outside) return `argument "${outside}" is not allowed: git diff reads files outside the repository given such a path. Use paths relative to the repository root.`;
   }
   if (sub === 'reflog') {

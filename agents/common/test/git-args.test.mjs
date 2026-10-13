@@ -66,6 +66,9 @@ test('git diff refuses paths outside the repository, which turn on --no-index by
   rejected(['diff', 'src/../../x', 'README.md'], /outside the repository/);
   rejected(['diff', '..', 'README.md'], /outside the repository/);
   rejected(['diff', '--', '/etc/passwd'], /outside the repository/);
+  rejected(['diff', '--', '-x/../../outside/secret.txt', 'README.md'], /outside the repository/);
+  rejected(['diff', '--', 'README.md', '--a/../../x'], /outside the repository/);
+  rejected(['diff', '--end-of-options', 'HEAD', '-x/../../x'], /outside the repository/);
   ok(['diff', 'abc..def', '--', 'src/server.c']);
   ok(['diff', '..HEAD']);
   ok(['diff', 'a...b', '--', 'src/../README.md']);

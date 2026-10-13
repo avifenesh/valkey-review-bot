@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { execFileSync } from 'node:child_process';
-import { mkdtempSync, realpathSync, writeFileSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, realpathSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import test from 'node:test';
@@ -74,4 +74,16 @@ test('git diff does not read a file outside the repository', async () => {
     assert.match(out, /^ERROR:/, args.join(' '));
     assert.doesNotMatch(out, /outside-content|secret\.txt \|/);
   }
+});
+
+test('git diff does not read outside the repository through a directory named like an option', async () => {
+  const dir = repo();
+  mkdirSync(path.join(dir, '-x'));
+  const secret = path.join(tempDir('git-tool-outside-'), 'secret.txt');
+  writeFileSync(secret, 'outside-content\n');
+  const tool = buildGitTool({ workspaceRoot: dir });
+  const sneaky = `-x/${path.relative(path.join(dir, '-x'), secret)}`;
+  const out = await tool.invoke({ args: ['diff', '--', sneaky, 'README.md'] });
+  assert.match(out, /^ERROR:/);
+  assert.doesNotMatch(out, /outside-content/);
 });
