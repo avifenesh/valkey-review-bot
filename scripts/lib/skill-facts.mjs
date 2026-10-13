@@ -1,0 +1,181 @@
+// The deterministic part of the curator's skill check, run locally for
+// one skill: which cited names exist at the upstream commit, which were
+// lost since a base commit, and which rare names the diff since then
+// touched. It loads the skill-check modules of agents/common directly
+// (Node strips the TypeScript types); they need no npm packages.
+
+import { mkdtempSync, realpathSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import path from 'node:path';
+import { areaFileCounts, checkSkill } from '../../agents/common/src/skill-check/check.ts';
+import { extractNames } from '../../agents/common/src/skill-check/names.ts';
+import { createGitRunner, prepareUpstreamCheckout, removeCheckout } from '../../agents/common/src/skill-check/upstream.ts';
+import { quoted } from './aws-cli.mjs';
+
+const SHA_RE = /^(?:[0-9a-f]{40}|[0-9a-f]{64})$/;
+
+async function mustGit(git, args) {
+  const r = await git(args);
+  if (r.code !== 0) throw new Error(`git ${args.join(' ')} exited ${r.code}: ${(r.stderr || r.stdout).trim().slice(0, 500)}`);
+  return r.stdout.trim();
+}
+
+/**
+ * The full SHA a revision names in a checkout, or null. Only a plain
+ * revision: no option-like or multi-word text reaches git.
+ */
+async function commitOf(git, rev) {
+  if (rev.startsWith('-') || !/^[^\s\x00-\x1f\x7f]{1,200}$/.test(rev)) return null;
+  const r = await git(['rev-parse', '--verify', '-q', `${rev}^{commit}`]);
+  const sha = r.stdout.trim();
+  return r.code === 0 && SHA_RE.test(sha) ? sha : null;
+}
+
+/**
+ * Check `skillMd` against an upstream commit.
+ *
+ * upstream is either { url, branch? }: a fresh anonymous checkout of the
+ * branch tip (the default branch unless given) in a temporary directory,
+ * deleted afterwards, as the curator makes it; or { checkout, rev? }: the
+ * committed tree at `rev` (default HEAD) of an existing clone, which is
+ * only read.
+ *
+ * record, when given, is the graduated concern record's check state, as
+ * the curator uses it: audit_names is the baseline, ignored_names are not
+ * reported, verified_sha is the base, and area's globs are counted.
+ * Without a record the baseline is the cited names present at `base`.
+ * `base` overrides the record's verified_sha.
+ */
+export async function skillFacts({ skillMd, upstream, record = null, base }) {
+  const names = extractNames(skillMd);
+  // A malformed verified_sha in the table is no base; a malformed --base is an error below.
+  const recordSha = typeof record?.verified_sha === 'string' && SHA_RE.test(record.verified_sha) ? record.verified_sha : undefined;
+  let baseSha = base ?? recordSha;
+  let dir;
+  try {
+    let git;
+    let commit;
+    let baseAvailable = false;
+    let where;
+    if (upstream.url) {
+      if (baseSha !== undefined && !SHA_RE.test(baseSha)) throw new Error(`the base must be a full commit SHA for a fresh checkout, got ${JSON.stringify(baseSha)}`);
+      dir = realpathSync(mkdtempSync(path.join(tmpdir(), 'skill-facts-')));
+      const co = await prepareUpstreamCheckout({ dir, url: upstream.url, branch: upstream.branch, verifiedSha: baseSha });
+      git = co.git;
+      commit = co.tipSha;
+      baseAvailable = co.baseAvailable;
+      where = { url: upstream.url, branch: co.defaultBranch, commit };
+    } else {
+      const top = await mustGit(createGitRunner(upstream.checkout), ['rev-parse', '--show-toplevel']);
+      // Check from the top of the work tree, as check.ts expects.
+      git = createGitRunner(top);
+      const rev = upstream.rev ?? 'HEAD';
+      commit = await commitOf(git, rev);
+      if (!commit) throw new Error(`${JSON.stringify(rev)} names no commit in ${top}`);
+      if (baseSha !== undefined) {
+        const resolved = await commitOf(git, baseSha);
+        if (resolved) baseSha = resolved;
+        baseAvailable = resolved !== null;
+      }
+      where = { checkout: top, rev, commit };
+    }
+
+    let baseline = [];
+    let baselineFrom = 'none';
+    let baselineError = null;
+    if (record) {
+      baseline = Array.isArray(record.audit_names) ? record.audit_names : [];
+      baselineFrom = 'record';
+    } else if (baseAvailable) {
+      try {
+        baseline = (await checkSkill(git, { names, rev: baseSha })).present;
+        baselineFrom = 'base';
+      } catch (err) {
+        // A fresh checkout holds the base's trees and changed blobs; if git still misses an object, go on without a baseline.
+        baselineError = err instanceof Error ? err.message : String(err);
+      }
+    }
+    const cited = new Set(names.map((n) => n.token));
+    const ignored = Array.isArray(record?.ignored_names) ? record.ignored_names : [];
+    const result = await checkSkill(git, { names, baseline, ignored, baseSha: baseAvailable ? baseSha : undefined, rev: commit });
+
+    const globs = Array.isArray(record?.area) ? record.area.filter((g) => typeof g === 'string' && g) : [];
+    const counts = globs.length > 0 ? await areaFileCounts(git, globs, commit) : [];
+    return {
+      names,
+      result,
+      upstream: where,
+      base: baseSha === undefined ? null : { sha: baseSha, available: baseAvailable },
+      // As checkSkill reads it: names the skill no longer cites do not count.
+      baseline: { from: baselineFrom, names: [...new Set(baseline)].filter((t) => cited.has(t)), error: baselineError },
+      ignored,
+      area: globs.map((glob, i) => ({ glob, files: counts[i] })),
+    };
+  } finally {
+    if (dir) await removeCheckout(dir);
+  }
+}
+
+const list = (tokens) => (tokens.length === 0 ? '-' : tokens.map((t) => `\`${t}\``).join(', '));
+
+/** The report as text lines. `label` names the skill; with `allNames` every cited name gets a line. */
+export function factsReport(facts, { label, allNames = false }) {
+  const { names, result, upstream, base, baseline, area } = facts;
+  const short = (sha) => sha.slice(0, 12);
+  const lines = [`skill: ${label}`];
+  lines.push(upstream.url
+    ? `upstream: ${upstream.url} ${upstream.branch}@${short(upstream.commit)}`
+    : `upstream: checkout ${upstream.checkout} at ${upstream.rev} (${short(upstream.commit)})`);
+  if (!base) lines.push('base: none, so no names are touched');
+  else if (!base.available) lines.push(`base: ${quoted(base.sha)} is not available here, so no names are touched`);
+  else lines.push(`base: ${short(base.sha)}, ${result.changedFiles} file(s) changed since`);
+  if (baseline.from === 'record') lines.push(`baseline: ${baseline.names.length} name(s), the concern record's audit_names`);
+  else if (baseline.from === 'base') lines.push(`baseline: ${baseline.names.length} name(s), the cited names present at the base`);
+  else if (baseline.error) lines.push(`baseline: none, the names at the base could not be read (${baseline.error.slice(0, 300)})`);
+  else lines.push('baseline: none (a first check): every absent name is new');
+  lines.push(`names: ${names.length} cited, ${result.present.length} present`);
+  lines.push(`lost (${result.lost.length}): ${list(result.lost)}`);
+  lines.push(`new absent (${result.newAbsent.length}): ${list(result.newAbsent)}`);
+  lines.push(`touched (${result.touched.length}): ${list(result.touched)}`);
+  for (const why of result.incomplete) lines.push(`incomplete: ${why}`);
+  lines.push(`kept fraction: ${result.keptFraction.toFixed(3)}`);
+  if (area.length > 0) lines.push(`area: ${area.map((a) => `\`${a.glob}\` ${a.files} file(s)`).join(', ')}`);
+  lines.push(`clean: ${result.clean ? 'yes' : 'no'}`);
+  if (allNames) {
+    const lost = new Set(result.lost);
+    const touched = new Set(result.touched);
+    const ignored = new Set(facts.ignored);
+    lines.push('', 'state      kind       count  name');
+    for (const n of names) {
+      const count = result.counts.get(n.token) ?? 0;
+      let state = count > 0 ? 'present' : 'absent';
+      if (lost.has(n.token)) state = 'lost';
+      else if (count === 0 && ignored.has(n.token)) state = 'ignored';
+      else if (touched.has(n.token)) state = 'touched';
+      lines.push(`${state.padEnd(10)} ${n.kind.padEnd(10)} ${String(count).padStart(5)}  ${n.token}`);
+    }
+  }
+  return lines;
+}
+
+/** The report as one JSON-ready object, diff excerpts included. */
+export function factsJson(facts, { label }) {
+  const { names, result } = facts;
+  return {
+    skill: label,
+    upstream: facts.upstream,
+    base: facts.base,
+    baseline: facts.baseline,
+    names: names.map((n) => ({ token: n.token, kind: n.kind, count: result.counts.get(n.token) ?? 0 })),
+    present: result.present,
+    lost: result.lost,
+    newAbsent: result.newAbsent,
+    touched: result.touched,
+    incomplete: result.incomplete,
+    keptFraction: result.keptFraction,
+    changedFiles: result.changedFiles,
+    excerpts: result.excerpts,
+    area: facts.area,
+    clean: result.clean,
+  };
+}

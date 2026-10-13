@@ -2,7 +2,7 @@
 // the operator scripts. Reads go through an `aws` runner (aws-cli.mjs),
 // so tests can pass a fake.
 
-import { scanItems } from './aws-cli.mjs';
+import { quoted, scanItems } from './aws-cli.mjs';
 
 /**
  * area_bucket values starting with this hold skill-lifecycle items, not
@@ -57,4 +57,29 @@ export function deprecateTarget(summaries, { name, recordId }, isRetired) {
   if (live.length === 0) throw new Error(`no record named ${name} that is not already deprecated or rejected`);
   if (live.length > 1) throw new Error(`${live.length} records are named ${name} (${live.map((r) => r.recordId).join(', ')}); pass --record-id`);
   return live[0].recordId;
+}
+
+/** The check state of a graduated concern record that skill-facts.mjs reads. */
+const FACTS_ATTRIBUTES = [
+  'area_bucket', 'record_id', 'area', 'graduated_record_name', 'retired_at', 'retired_reason',
+  'audit_names', 'ignored_names', 'verified_sha', 'verified_ref', 'verified_release', 'verified_at', 'check_outcome',
+];
+
+/**
+ * The concern record that graduated as `name`, with its check state, or
+ * null when no record names it. Throws when several do.
+ */
+export function findGraduatedRecord(aws, table, name) {
+  const names = Object.fromEntries(FACTS_ATTRIBUTES.map((a, i) => [`#a${i}`, a]));
+  const grn = `#a${FACTS_ATTRIBUTES.indexOf('graduated_record_name')}`;
+  const items = scanItems(aws, table, {
+    projection: Object.keys(names).join(', '),
+    filter: `${grn} = :name`,
+    names,
+    values: { ':name': { S: name } },
+  }).filter((i) => !isReservedBucket(i.area_bucket));
+  if (items.length > 1) {
+    throw new Error(`${items.length} concern records in ${table} graduated as ${name}: ${items.map((i) => `${quoted(i.area_bucket)}/${quoted(i.record_id)}`).join(', ')}`);
+  }
+  return items[0] ?? null;
 }
