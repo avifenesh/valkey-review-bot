@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import { buildSubmitSkillTool, slugify, suffixedName, withRecordName } from '../dist/curator/src/tools/submit-skill.js';
+import { buildSubmitSkillTool, slugify, suffixedName, suppressedBlocksProblem, withRecordName } from '../dist/curator/src/tools/submit-skill.js';
 import { buildListSkillAuthoringTool } from '../dist/curator/src/tools/skill-authoring.js';
 import { GRADUATED_SKILL_MAX_CHARS, GRADUATED_SKILLS_MAX_CHARS } from '../dist/common/src/skills-registry.js';
 import { assertPlaceholdersMatch, conditionFailed, conditionHolds, fakeDdb, memoryTable, newRun, parse } from './helpers.mjs';
@@ -14,7 +14,7 @@ const INPUT = {
 };
 
 /** `taken` lists the names other records' skills already hold in the registry. */
-function setup({ item, upsert, taken = [], exists, reinforced = { areaBucket: 'src', recordId: 'r1' }, edited = null, updates = () => ({}) }) {
+function setup({ item, upsert, taken = [], exists, get, reinforced = { areaBucket: 'src', recordId: 'r1' }, edited = null, updates = () => ({}) }) {
   const run = newRun();
   run.reinforced = reinforced;
   run.edited = edited;
@@ -24,6 +24,7 @@ function setup({ item, upsert, taken = [], exists, reinforced = { areaBucket: 's
   const registry = {
     upsert: upsert ?? (async (input) => { published.push(input); return { action: 'created', recordArn: 'arn:skill', status: 'CREATING' }; }),
     exists: exists ?? (async (name) => { lookups.push(name); return taken.includes(name); }),
+    get: get ?? (async () => null),
   };
   const submit = buildSubmitSkillTool({ ddb, table: 'concerns', run, registry });
   return { run, ddb, published, lookups, submit };
@@ -567,4 +568,160 @@ test('a first graduation loses to another run that claimed a name for the record
     assert.match(out.error, /read it again with get_concern/);
     assert.ok(!registry.calls.some((c) => c.startsWith('upsert')), 'the second run publishes nothing; a retry updates the claimed name');
   }
+});
+
+const SHA = 'a'.repeat(40);
+const BLOCK_A = [
+  `<!-- suppressed: superseded in 9.1.2, 2026-10-13; \`emptyDB\` is now \`emptyData\`; evidence: valkey-io/valkey@${SHA}:src/server.h:10 -->`,
+  'Flag callers of `emptyDB` that skip the flags.',
+  '<!-- /suppressed -->',
+];
+const BLOCK_B = [
+  `<!-- suppressed: superseded in unstable@${'b'.repeat(12)}, 2026-10-14; \`src/dict.c\` is now \`src/hashtable.c\`; evidence: valkey-io/valkey@${SHA}:src/Makefile:3, valkey-io/valkey@${SHA}:src/hashtable.c:1 -->`,
+  'Iteration over `src/dict.c` tables must use a safe iterator',
+  'when the loop body can rehash.',
+  '<!-- /suppressed -->',
+];
+/** A published skill holding two suppressed blocks and their replacements. */
+function skillWith({ a = BLOCK_A, b = BLOCK_B, live = 'when the loop body can rehash.' } = {}) {
+  return [
+    '---', `name: ${OLD}`, 'description: Use when reviewing a PR that touches src/replication.c.', '---', '',
+    '## Patterns', '',
+    ...a,
+    'Flag callers of `emptyData` that skip the flags.',
+    '',
+    ...b,
+    'Iteration over `src/hashtable.c` tables must use a safe iterator',
+    live,
+    '',
+  ].join('\n');
+}
+const PUBLISHED = skillWith();
+
+test('a re-publication that keeps every suppressed block of the published skill is accepted', async () => {
+  const w = world({ item: live(), skills: { [OLD]: { status: 'DRAFT', skillMd: PUBLISHED } } });
+  // The live text after the blocks changes; the blocks move but stay byte for byte.
+  const next = skillWith({ a: BLOCK_B, b: BLOCK_A, live: 'when the loop body can rehash or free entries.' }) + '\n## Do NOT flag\n- `hashtableScan` callers.\n';
+  const out = parse(await w.submit.invoke({ ...INPUT, skill_md: next }));
+  assert.equal(out.ok, true, out.error);
+  const body = w.registry.skills.get(OLD).skillMd;
+  assert.ok(body.includes(BLOCK_A.join('\n')) && body.includes(BLOCK_B.join('\n')));
+  assert.ok(body.includes('rehash or free entries.'));
+  assert.ok(w.registry.calls.includes(`get ${OLD}`), 'the published text is read before the update');
+});
+
+test('a re-publication that drops or changes a suppressed block is refused before any write', async () => {
+  const altered = (lines, i, text) => lines.map((l, j) => (j === i ? text : l));
+  const cases = {
+    'drops a block': PUBLISHED.replace(`${BLOCK_A.join('\n')}\n`, ''),
+    'edits the suppressed text': skillWith({ a: altered(BLOCK_A, 1, 'Flag callers of `emptyDB` that skip flags.') }),
+    'edits the marker': skillWith({ a: altered(BLOCK_A, 0, BLOCK_A[0].replace('2026-10-13', '2026-10-12')) }),
+    'unwraps the piece': PUBLISHED.replace(`${BLOCK_A[0]}\n`, '').replace(`${BLOCK_A[1]}\n${BLOCK_A[2]}\n`, `${BLOCK_A[1]}\n`),
+    'rewrites the skill from the record': INPUT.skill_md,
+  };
+  for (const [name, skill_md] of Object.entries(cases)) {
+    const w = world({ item: live(), skills: { [OLD]: { status: 'DRAFT', skillMd: PUBLISHED } } });
+    const out = parse(await w.submit.invoke({ ...INPUT, skill_md }));
+    assert.equal(out.ok, false, name);
+    assert.match(out.error, /suppress/, name);
+    assert.match(out.error, /Copy each block from get_skill unchanged/, name);
+    assert.deepEqual(w.ddb.ops(), ['GetCommand'], `${name}: nothing is claimed`);
+    assert.ok(!w.registry.calls.some((c) => c.startsWith('upsert')), `${name}: nothing is published`);
+    assert.equal(w.run.take('skill_submit', 'next'), null, `${name}: the slot is free`);
+  }
+});
+
+test('the model cannot write a suppression marker of its own', async () => {
+  const fenced = ['```', BLOCK_A[0], '```'].join('\n');
+  const cases = {
+    'a well-formed block in a first graduation': [INPUT.skill_md, ...BLOCK_A, 'Flag callers of `emptyData`.'].join('\n'),
+    'a marker inside a fenced block': `${INPUT.skill_md}\n${fenced}\n`,
+    'a marker in the middle of a line': `${INPUT.skill_md}\nSee <!-- suppressed: superseded in 9.1.2 --> here.\n`,
+    'an opening marker without a close': `${INPUT.skill_md}\n${BLOCK_A[0]}\ntext\n`,
+  };
+  for (const [name, skill_md] of Object.entries(cases)) {
+    const { submit, ddb, published } = setup({ item: { area_bucket: 'src', record_id: 'r1', reinforcement_count: 4 } });
+    const out = parse(await submit.invoke({ ...INPUT, skill_md }));
+    assert.equal(out.ok, false, name);
+    assert.match(out.error, /Never write a marker yourself/, name);
+    assert.deepEqual(ddb.ops(), ['GetCommand'], name);
+    assert.equal(published.length, 0, name);
+  }
+
+  const { submit } = setup({ item: { area_bucket: 'src', record_id: 'r1', reinforcement_count: 4 } });
+  const desc = parse(await submit.invoke({ ...INPUT, description: `${INPUT.description} <!-- suppressed: x -->` }));
+  assert.equal(desc.ok, false);
+  assert.match(desc.error, /description cannot hold a suppression marker/);
+
+  const w = world({ item: live(), skills: { [OLD]: { status: 'DRAFT', skillMd: PUBLISHED } } });
+  const twice = parse(await w.submit.invoke({ ...INPUT, skill_md: `${PUBLISHED}\n${BLOCK_A.join('\n')}\nFlag callers of \`emptyData\`.\n` }));
+  assert.equal(twice.ok, false);
+  assert.match(twice.error, /1 suppressed block\(s\) the published skill does not have/);
+});
+
+test('a new generation keeps the retired skill\'s suppressed blocks', async () => {
+  const skills = { [OLD]: { status: 'DEPRECATED', skillMd: PUBLISHED } };
+  const without = world({ item: tombstone(), skills });
+  const refused = parse(await without.submit.invoke(INPUT));
+  assert.equal(refused.ok, false);
+  assert.match(refused.error, /drops or changes 2 suppressed block\(s\)/);
+
+  const w = world({ item: tombstone(), skills });
+  const out = parse(await w.submit.invoke({ ...INPUT, skill_md: PUBLISHED }));
+  assert.equal(out.ok, true, out.error);
+  assert.equal(out.record_name, generationName(2));
+  const body = w.registry.skills.get(generationName(2)).skillMd;
+  assert.ok(body.startsWith(`---\nname: ${generationName(2)}\n`));
+  assert.ok(body.includes(BLOCK_A.join('\n')) && body.includes(BLOCK_B.join('\n')));
+});
+
+test('a generation that never reached the registry keeps the blocks of the skill it replaces', async () => {
+  const claimed = generationName(2);
+  const item = tombstone({ graduated_record_name: claimed, skill_generation: 2, previous_record_name: OLD });
+  const skills = { [OLD]: { status: 'DEPRECATED', skillMd: PUBLISHED } };
+  const refused = parse(await world({ item, skills }).submit.invoke(INPUT));
+  assert.equal(refused.ok, false);
+  assert.match(refused.error, /drops or changes 2 suppressed block\(s\)/);
+
+  const w = world({ item, skills });
+  const out = parse(await w.submit.invoke({ ...INPUT, skill_md: PUBLISHED }));
+  assert.equal(out.ok, true, out.error);
+  assert.equal(out.record_name, claimed);
+  assert.ok(w.registry.calls.includes(`get ${OLD}`));
+});
+
+test('a live skill is not updated without a registry reader', async () => {
+  const reader = fakeRegistry({ [OLD]: { status: 'DRAFT', skillMd: PUBLISHED } });
+  delete reader.get;
+  const w = world({ item: live(), registry: reader });
+  const out = parse(await w.submit.invoke({ ...INPUT, skill_md: PUBLISHED }));
+  assert.equal(out.ok, false);
+  assert.match(out.error, /cannot read the published skill "[a-z-]+" \(no registry reader is configured\)/);
+  assert.deepEqual(w.ddb.ops(), ['GetCommand']);
+  assert.deepEqual(reader.calls, []);
+});
+
+test('a skill deprecated between the read and the update is still marked retired', async () => {
+  // getSkillByName saw it live; the operator deprecated it before upsertSkill ran.
+  const registry = fakeRegistry({ [OLD]: { status: 'DRAFT', skillMd: PUBLISHED } });
+  const get = registry.get;
+  registry.get = async (name) => {
+    const seen = await get(name);
+    registry.skills.set(OLD, { ...registry.skills.get(OLD), status: 'DEPRECATED' });
+    return seen;
+  };
+  const w = world({ item: live(), registry });
+  const out = parse(await w.submit.invoke({ ...INPUT, skill_md: PUBLISHED }));
+  assert.equal(out.ok, false);
+  assert.match(out.error, /retired by an operator/);
+  assert.equal(w.record().retired_reason, 'operator');
+  assert.ok(registry.calls.includes(`upsert ${OLD}`), 'the refusal came from upsert');
+});
+
+test('suppressedBlocksProblem compares blocks byte for byte and ignores everything else', () => {
+  assert.equal(suppressedBlocksProblem(PUBLISHED, PUBLISHED), null);
+  assert.equal(suppressedBlocksProblem(null, INPUT.skill_md), null);
+  assert.equal(suppressedBlocksProblem(PUBLISHED, PUBLISHED.replace('## Patterns', '## Rules')), null);
+  assert.match(suppressedBlocksProblem(PUBLISHED, PUBLISHED.replace(BLOCK_A[1], `${BLOCK_A[1]} `)), /drops or changes 1/);
+  assert.match(suppressedBlocksProblem(PUBLISHED, PUBLISHED.replace(/\n/g, '\r\n')), /drops or changes 2/, 'line endings count');
 });
