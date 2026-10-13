@@ -400,6 +400,23 @@ export function listSuppressedBlocks(skillMd: string): SuppressedBlock[] {
   return parseSuppressed(skillMd).blocks;
 }
 
+export interface SkillLayout {
+  /** Index of the first body line, after a complete frontmatter block; 0 when there is none. */
+  readonly bodyStart: number;
+  /** Per line (split on '\n'), whether it is in a fenced code block, fence lines included. */
+  readonly fenced: readonly boolean[];
+}
+
+/**
+ * The frontmatter and fenced blocks of a skill as the check reads them.
+ * The reviewers' rendering (graduated-skills.ts) uses this rather than
+ * its own scan, so both treat the same lines as code.
+ */
+export function skillLayout(skillMd: string): SkillLayout {
+  const doc = parseDoc(skillMd);
+  return { bodyStart: doc.bodyStart, fenced: doc.fenced };
+}
+
 interface Change {
   readonly from: string;
   readonly to: string;
