@@ -11,7 +11,11 @@
 #   --stack NAME   the webhook stack; its receiver (ReceiverFn) and curator
 #                  worker (CuratorWorkerFn) functions are looked up in it
 #
-# Needs the AWS CLI v2 and credentials allowed to call
+# Log text is printed without control or format characters (see
+# printable_lines in lib/common.sh): the curator's lines can carry text a
+# model wrote.
+#
+# Needs the AWS CLI v2, jq, and credentials allowed to call
 # cloudformation:ListStackResources and lambda:GetFunctionConfiguration
 # and to read the functions' log groups. The region comes from
 # AWS_REGION or the CLI profile.
@@ -24,7 +28,7 @@ usage() {
   exit "${1:-0}"
 }
 
-require_cmd aws
+require_cmd aws jq
 
 STACK=""
 MINUTES=60
@@ -66,7 +70,7 @@ matching() {
 }
 
 echo "fetching receiver logs..."
-aws logs tail "$RECEIVER_LG" --since "${MINUTES}m" --format short > "$WORK/receiver.log"
+aws logs tail "$RECEIVER_LG" --since "${MINUTES}m" --format short | printable_lines > "$WORK/receiver.log"
 matching '\[delivery\]' "$WORK/receiver.log" > "$WORK/deliveries.txt"
 DELIVERIES=$(count_lines "$WORK/deliveries.txt")
 echo "deliveries observed: $DELIVERIES"
@@ -109,7 +113,7 @@ awk '{
 echo ""
 
 echo "fetching curator worker logs..."
-aws logs tail "$CURATOR_LG" --since "${MINUTES}m" --format short > "$WORK/curator.log"
+aws logs tail "$CURATOR_LG" --since "${MINUTES}m" --format short | printable_lines > "$WORK/curator.log"
 matching '\[invoke\]|\[done\]|\[fail\]' "$WORK/curator.log" > "$WORK/curator.txt"
 echo "curator invocations: $(matching '\[invoke\]' "$WORK/curator.txt" | wc -l | tr -d ' ')"
 echo "curator completions: $(matching '\[done\]' "$WORK/curator.txt" | wc -l | tr -d ' ')"

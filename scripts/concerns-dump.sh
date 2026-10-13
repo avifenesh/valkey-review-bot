@@ -64,12 +64,16 @@ done
 [ -n "$tables" ] || usage 1
 
 # Text from the table, some of it written by a model, is printed with
-# control and bidirectional-override characters replaced by '?', so it
-# cannot move the cursor or reorder the terminal's lines. One-line fields
-# also have their line breaks turned into spaces.
+# every control character but tab and newline (ESC and the C1 controls
+# among them), every Unicode format character (zero-width characters,
+# bidi marks, embeddings, overrides and isolates, the BOM, the soft
+# hyphen, tag characters) and the line and paragraph separators replaced
+# by '?'. So it cannot move the cursor, hide text or reorder how the
+# terminal shows it, and the operator sees that something was there.
+# One-line fields also have their line breaks and tabs turned into spaces.
 JQ_PROGRAM='
-def clean: gsub("\r"; "") | gsub("[\\x00-\\x08\\x0b-\\x1f\\x7f-\\x{9f}\\x{2028}\\x{2029}\\x{202a}-\\x{202e}\\x{2066}-\\x{2069}]"; "?");
-def line: gsub("\r?\n"; " ") | clean;
+def clean: gsub("\r\n"; "\n") | gsub("[^\\t\\n\\P{Cc}]|[\\p{Cf}\\p{Zl}\\p{Zp}]"; "?");
+def line: gsub("\r?\n|\t"; " ") | clean;
 def opt($label; $value): if ($value // "") == "" then "" else "\n    " + $label + ": " + ($value | line) end;
 
 def maintenance:
@@ -102,7 +106,7 @@ def edit($n):
   | "\n      edit " + ($n | tostring) + ", evidence: " + (
       (($e.evidence.L // []) | map(.S // "" | line)) as $ev
       | if ($ev | length) > 0 then ($ev | join(", "))
-        elif $e.path.S then ($e.path.S | line) + ":" + ($e.line.N // $e.line.S // "?")
+        elif $e.path.S then ($e.path.S | line) + ":" + (($e.line.N // $e.line.S // "?") | line)
         else "(none)" end)
     + ((($e.original.S // $e.find.S // "") | clean | rtrimstr("\n") | split("\n")) | map("\n        - " + .) | join(""))
     + ((($e.replacement.S // $e.replace.S // "") | clean | rtrimstr("\n") | split("\n")) | map("\n        + " + .) | join(""));

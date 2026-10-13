@@ -51,3 +51,15 @@ function_log_group() {
   fi
   printf '%s\n' "$value"
 }
+
+# printable_lines: copy text from stdin to stdout line by line, with tabs
+# turned into spaces and every control character (ESC and the C1 controls
+# among them), Unicode format character (zero-width characters, bidi
+# marks, embeddings, overrides and isolates, the BOM, tag characters) and
+# line or paragraph separator replaced by '?', as lib/text.mjs printable()
+# does. For log text a model or a webhook payload may have shaped, so it
+# cannot move the cursor, hide text or reorder the terminal's lines.
+# Needs jq.
+printable_lines() {
+  jq -Rr 'gsub("\t"; " ") | gsub("[\\p{Cc}\\p{Cf}\\p{Zl}\\p{Zp}]"; "?")'
+}
