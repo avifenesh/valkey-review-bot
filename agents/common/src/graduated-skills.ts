@@ -53,6 +53,8 @@ const INTRO = 'These rules graduated from the concerns store after repeated rein
 
 /** The provenance sentence submit_skill appends to a description, for operators. */
 const RECORD_ID_SENTENCE_RE = /\s*Graduated from concern record_id=\S*\s*$/;
+/** The citation the curator ends a skill body with, `_(graduated from concern record_id=<id>)_`. */
+const RECORD_ID_CITATION_RE = /\s*[_*]?\(graduated from concern record_id=[^)\s]*\)[_*]?[ \t]*(?=\r?$)/i;
 
 // `.` stops at a CR, so `\r?` lets fences of CRLF text match.
 const FENCE_RE = /^ {0,3}(`{3,}|~{3,})(.*)\r?$/;
@@ -140,16 +142,25 @@ function suppressedLabels(lines: readonly string[], fenced: readonly boolean[]):
   return labels;
 }
 
-function rewriteLines(markdown: string, demoteHeadings: boolean): string {
+/**
+ * Label the suppressed pieces. For a graduated skill (`graduated`), also
+ * demote headings and drop the record id citation, outside fenced blocks.
+ */
+function rewriteLines(markdown: string, graduated: boolean): string {
   const lines = markdown.split('\n');
   const fenced = fencedLines(lines);
   const labels = suppressedLabels(lines, fenced);
   return lines
-    .map((line, i) => {
+    .flatMap((line, i) => {
       const label = labels.get(i);
       // A label keeps the line ending of the marker it replaces.
-      if (label !== undefined) return line.endsWith('\r') ? `${label}\r` : label;
-      return demoteHeadings && !fenced[i] ? line.replace(HEADING_RE, '$1#$2') : line;
+      if (label !== undefined) return [line.endsWith('\r') ? `${label}\r` : label];
+      if (!graduated || fenced[i]) return [line];
+      // The record id means nothing to a reviewer. A line that held only
+      // the citation goes with it.
+      const uncited = line.replace(RECORD_ID_CITATION_RE, '');
+      if (uncited !== line && uncited.trim() === '') return [];
+      return [uncited.replace(HEADING_RE, '$1#$2')];
     })
     .join('\n');
 }
@@ -166,8 +177,8 @@ export function labelSuppressedPieces(markdown: string): string {
 /**
  * A skill's body as it sits under its own `##` heading: no frontmatter,
  * its headings one level down, so its `## Patterns` does not read as a
- * sibling of the skill, and its superseded pieces labelled. Lines in
- * fenced blocks are left alone.
+ * sibling of the skill, no record id citation, and its superseded pieces
+ * labelled. Lines in fenced blocks are left alone.
  */
 function renderSkillBody(skillMd: string): string {
   return rewriteLines(stripFrontmatter(skillMd), true).trim();

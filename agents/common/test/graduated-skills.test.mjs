@@ -85,6 +85,24 @@ test('the description is one plain Scope line without the record id sentence', (
   assert.doesNotMatch(idOnly, /Scope:/);
 });
 
+test('the record id citation at the end of the body is not rendered', () => {
+  const id = '3f2a9c1e-0b7d-4e55-9a51-2c6f0d8e7b10';
+  const ending = (last) => skill({ skillMd: `${skill().skillMd}\n\n${last}\n` });
+  for (const last of [`_(graduated from concern record_id=${id})_`, `*(Graduated from concern record_id=${id})*`, `(graduated from concern record_id=${id})  `]) {
+    const out = renderGraduatedSkills([ending(last)]);
+    assert.doesNotMatch(out, /record_id|graduated from concern/i, last);
+    assert.ok(out.endsWith('Skip unless: `lockClient` appears in the diff.\n'), last);
+  }
+  const inline = renderGraduatedSkills([skill({ skillMd: `Check the lock order. _(graduated from concern record_id=${id})_` })]);
+  assert.ok(inline.includes('\nCheck the lock order.\n'));
+  assert.doesNotMatch(inline, /record_id/);
+  const crlf = renderGraduatedSkills([skill({ skillMd: ['## Use when', 'body', `_(graduated from concern record_id=${id})_`, 'tail'].join('\r\n') })]);
+  assert.ok(crlf.includes(['### Use when', 'body', 'tail'].join('\r\n')));
+  // In a fenced block it is an example, so it stays.
+  const fenced = ['```', `_(graduated from concern record_id=${id})_`, '```'].join('\n');
+  assert.ok(renderGraduatedSkills([skill({ skillMd: fenced })]).includes(fenced));
+});
+
 test('the introduction says the code at the PR head wins', () => {
   const out = renderGraduatedSkills([skill()]);
   assert.doesNotMatch(out, /Treat as established conventions/);
