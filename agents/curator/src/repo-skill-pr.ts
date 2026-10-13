@@ -194,7 +194,9 @@ function evidenceItem(entry: string): string {
   const c = parseCitation(entry);
   if (!c) return `- ${codeSpan(entry)}`;
   const shown = `${c.repo}@${c.sha.slice(0, 12)}:${c.path}:${c.line}`;
-  return `- [${codeSpan(shown)}](https://github.com/${c.repo}/blob/${c.sha}/${encodePath(c.path)}#L${c.line})`;
+  // encodeURIComponent keeps '(' and ')', and a ')' would end the markdown link early.
+  const url = `https://github.com/${c.repo}/blob/${c.sha}/${encodePath(c.path).replace(/[()]/g, (ch) => `%${ch.charCodeAt(0).toString(16).toUpperCase()}`)}#L${c.line}`;
+  return `- [${codeSpan(shown)}](${url})`;
 }
 
 /** `closed`: pull requests from the branch that maintainers closed without merging, all with other content. */

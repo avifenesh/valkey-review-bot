@@ -296,6 +296,14 @@ test('evidence that is not a citation is shown as code, whatever backticks it ho
   assert.ok(gh.commits.get(gh.tip(BRANCH)).message.includes('\n- src/server.h: `emptyData(int dbnum, int flags)`\n'));
 });
 
+test('an evidence link whose path holds parentheses stays one link', async () => {
+  const gh = fakeGitHub();
+  const evidence = [`valkey-io/valkey@${UPSTREAM_SHA}:docs/a(b)/c).md:3`];
+  await proposeRepoSkillChange(proposal({ baseSha: gh.tip(), evidence }), deps(gh));
+  const line = gh.pulls[0].body.split('\n').find((l) => l.startsWith('- ['));
+  assert.equal(line, `- [\`valkey-io/valkey@a{12}:docs/a(b)/c).md:3\`](https://github.com/valkey-io/valkey/blob/${UPSTREAM_SHA}/docs/a%28b%29/c%29.md#L3)`.replace('a{12}', 'a'.repeat(12)));
+});
+
 test('a configured signOff is the DCO line, and no probe commit is made', async () => {
   const gh = fakeGitHub();
   await proposeRepoSkillChange(proposal({ baseSha: gh.tip() }), deps(gh, { signOff: 'Valkey Bot Operator <ops@example.com>' }));
