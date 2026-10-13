@@ -7,7 +7,9 @@
  * words in the frontmatter description. Fenced blocks hold placeholders
  * and are skipped. So are suppressed pieces (see edits.ts): they
  * describe code before a release on purpose, and checking their names
- * would flag the same superseded names at every check.
+ * would flag the same superseded names at every check. Only blocks
+ * that edits.ts parseSuppressed reads as well formed count; reviewers
+ * get any other piece as live text, so its names are checked.
  *
  * No runtime imports, so scripts can load this file directly under
  * Node's type stripping.
@@ -164,22 +166,64 @@ function fencedLines(lines: readonly string[]): boolean[] {
   return out;
 }
 
+// The suppression marker grammar, copied from edits.ts parseSuppressed
+// (no runtime imports); the tests keep the two in step.
 const SUPPRESSED_OPEN_RE = /^<!--\s*suppressed\b/;
 const SUPPRESSED_CLOSE_RE = /^<!--\s*\/\s*suppressed\b/;
+const SUPPRESSED_CLOSE = '<!-- /suppressed -->';
+const MARKER_HEADER_RE = /^<!-- suppressed: superseded in ([^\s,;]+), (\d{4}-\d{2}-\d{2}); (.+); evidence: (\S+(?:, \S+)*) -->$/;
+const MARKER_TAG_RE = /^v?[0-9]{1,4}\.[0-9]{1,4}\.[0-9]{1,4}$/;
+const MARKER_BRANCH_RE = /^(?!.*\.\.)(?!.*\/\/)(?!.*\/\.)(?!.*\/$)(?!.*\.$)(?!.*\.lock$)[A-Za-z0-9][A-Za-z0-9._\/-]{0,99}$/;
+const MARKER_CITATION_RE = /^[A-Za-z0-9_.-]{1,100}\/[A-Za-z0-9_.-]{1,100}@(?:[0-9a-f]{40}|[0-9a-f]{64}):(.+):[1-9][0-9]{0,6}$/;
+
+function isMarkerRelease(release: string): boolean {
+  if (MARKER_TAG_RE.test(release)) return true;
+  const at = release.lastIndexOf('@');
+  return at > 0 && MARKER_BRANCH_RE.test(release.slice(0, at)) && /^[0-9a-f]{12}$/.test(release.slice(at + 1));
+}
+
+function isMarkerDate(date: string): boolean {
+  const d = new Date(`${date}T00:00:00Z`);
+  return !Number.isNaN(d.getTime()) && d.toISOString().slice(0, 10) === date;
+}
+
+function isMarkerCitation(text: string): boolean {
+  const p = MARKER_CITATION_RE.exec(text)?.[1];
+  if (p === undefined || p.length > 400 || p.startsWith('/') || /[\s,;<>"'`\\\x00-\x1f\x7f]/.test(p)) return false;
+  return p.split('/').every((part) => part !== '' && part !== '.' && part !== '..');
+}
+
+/** Whether a trimmed line is a well-formed opening marker. */
+function isMarkerHeader(text: string): boolean {
+  const m = MARKER_HEADER_RE.exec(text);
+  if (!m || !isMarkerRelease(m[1]!) || !isMarkerDate(m[2]!)) return false;
+  const reason = m[3]!;
+  if (reason.length > 300 || reason !== reason.trim() || /[\x00-\x1f\x7f]/.test(reason) || /-->|--!>|<!--/.test(reason)) return false;
+  return m[4]!.split(', ').every(isMarkerCitation);
+}
 
 /**
- * For each line, whether it belongs to a suppressed block (markers
- * included). An opening marker with no closing one hides only itself.
+ * For each line, whether the check skips it: every marker line, and the
+ * pieces of well-formed suppressed blocks, as parseSuppressed reads them.
+ * A malformed, nested-in, unclosed or empty block hides only its marker
+ * lines, so the names it holds are still checked.
  */
 function suppressedLines(lines: readonly string[], fenced: readonly boolean[]): boolean[] {
   const out = lines.map(() => false);
+  let open: { start: number; ok: boolean } | null = null;
   for (let i = 0; i < lines.length; i++) {
-    if (fenced[i] || !SUPPRESSED_OPEN_RE.test(lines[i]!.trim())) continue;
-    out[i] = true;
-    const close = lines.findIndex((l, j) => j > i && !fenced[j] && SUPPRESSED_CLOSE_RE.test(l.trim()));
-    if (close < 0) continue;
-    for (let j = i; j <= close; j++) out[j] = true;
-    i = close;
+    if (fenced[i]) continue;
+    const text = lines[i]!.trim();
+    if (SUPPRESSED_OPEN_RE.test(text)) {
+      out[i] = true;
+      if (!open) open = { start: i, ok: isMarkerHeader(text) };
+    } else if (SUPPRESSED_CLOSE_RE.test(text)) {
+      out[i] = true;
+      if (open && open.ok && text === SUPPRESSED_CLOSE && i > open.start + 1) {
+        for (let j = open.start; j <= i; j++) out[j] = true;
+      }
+      open = null;
+    }
   }
   return out;
 }

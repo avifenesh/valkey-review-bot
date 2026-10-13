@@ -3,6 +3,7 @@ import { readFileSync } from 'node:fs';
 import test from 'node:test';
 
 const { classifyToken, extractNames, MAX_NAMES } = await import('../src/skill-check/names.ts');
+const { listSuppressedBlocks } = await import('../src/skill-check/edits.ts');
 
 const fixture = (name) => readFileSync(new URL(`./fixtures/skills/${name}`, import.meta.url), 'utf8');
 const tokens = (md) => extractNames(md).map((n) => n.token);
@@ -98,6 +99,47 @@ test('suppressed pieces and their markers are skipped', () => {
 test('an opening marker with no closing one hides only itself', () => {
   const md = skill('<!-- suppressed: superseded in 9.1.2, 2026-10-13; `markerName_x`; evidence: x -->\n`still_cited`\n');
   assert.deepEqual(tokens(md), ['still_cited']);
+});
+
+test('only the blocks parseSuppressed reads as well formed hide their names', () => {
+  const SHA = '0123456789abcdef0123456789abcdef01234567';
+  const open = (release = '9.1.2', reason = '`emptyDB` is now `emptyData`', evidence = `valkey-io/valkey@${SHA}:src/db.c:10`) =>
+    `<!-- suppressed: superseded in ${release}, 2026-10-13; ${reason}; evidence: ${evidence} -->`;
+  const close = '<!-- /suppressed -->';
+  let n = 0;
+  const name = () => `\`name_${n++}_x\``;
+  const cases = {
+    'well formed': [open(), name(), close, name()],
+    'branch label': [open('unstable@0123456789ab'), name(), close, name()],
+    'indented and CRLF': [`  ${open()}\r`, `${name()}\r`, `  ${close}\r`, name()],
+    'release not a tag or label': [open('main'), name(), close, name()],
+    'reason ends the comment': [open('9.1.2', 'a --> b'), name(), close, name()],
+    'bad citation': [open('9.1.2', 'x', `valkey-io/valkey@${SHA}:../etc/passwd:1`), name(), close, name()],
+    'bad date': [open('9.1.2', 'x').replace('2026-10-13', '2026-02-30'), name(), close, name()],
+    'unclosed': [open(), name(), name()],
+    'empty': [open(), close, name()],
+    'malformed close': [open(), name(), '<!-- /suppressed x -->', name()],
+    'nested': [open(), name(), open(), name(), close, name(), close, name()],
+    'opened inside a fence': ['```', open(), '```', name(), close, name()],
+  };
+  for (const [label, body] of Object.entries(cases)) {
+    const md = skill(body.join('\n'));
+    const found = new Set(tokens(md));
+    const hidden = listSuppressedBlocks(md);
+    const lines = md.split('\n');
+    let fenced = false;
+    lines.forEach((line, i) => {
+      if (line.startsWith('```')) fenced = !fenced;
+      const m = /`(name_\d+_x)`/.exec(line);
+      if (!m || fenced) return;
+      const inBlock = hidden.some((b) => i + 1 > b.startLine && i + 1 < b.endLine);
+      assert.equal(found.has(m[1]), !inBlock, `${label}: ${m[1]} at line ${i + 1}`);
+    });
+    assert.equal(found.has('emptyDB') || found.has('emptyData'), false, `${label}: marker lines are never read`);
+  }
+  // The well-formed cases do hide their piece.
+  assert.equal(listSuppressedBlocks(skill(cases['well formed'].join('\n'))).length, 1);
+  assert.equal(listSuppressedBlocks(skill(cases.nested.join('\n'))).length, 1);
 });
 
 test('names are deduped in first-seen order and capped', () => {
