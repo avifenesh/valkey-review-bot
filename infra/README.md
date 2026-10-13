@@ -398,18 +398,294 @@ events while it waits join it, so a burst gets one review of the newest
 head. Passed to the receiver as `PUSH_REVIEW_DELAY_SECONDS`. The delay comes
 out of the review's 90-minute run budget.
 
+## Skill lifecycle operations
+
+The daily decay job schedules skill checks and retirements, and the
+curator runs them (see
+[docs/architecture.md](../docs/architecture.md#skill-maintenance)). The
+commands below run from the repository root. The scripts need Node.js 24
+or later and, except `skill-facts.mjs --file`, the AWS CLI. Those that call
+the registry (`registry-skills.mjs`, `publish-curator-skills.mjs` and
+`skill-facts.mjs --name`) also need `npm ci` in `agents/common`.
+
+### Rollout in report mode
+
+The defaults are report mode: `applyEdits`, `retireSkills` and
+`openPullRequests` are `false`. In report mode the scheduled passes still
+run real checks: the curator records each outcome on the record
+(`check_outcome`, `check_note`, `stale_names`, `verified_*`), lowers the
+standing of skills whose names are missing, and keeps proposed edits in
+`pending_revision`. It changes no skill text, retires nothing and opens no
+pull request. A dry run (below) records even less.
+
+1. Deploy with the defaults: `npx cdk deploy --all`. From the first pass,
+   graduated records are no longer deleted. Up to `checksPerDay` (10)
+   skills per reviewer get their first check each day, and the model runs
+   only for skills with flagged names.
+2. Publish the curator's reference skills again, since
+   `agents/curator/skills/` changed:
+   `node scripts/publish-curator-skills.mjs --stack ValkeyReviewerCurator --region REGION`.
+3. List the skills the old decay job left without a concern record, which
+   the lifecycle never reaches, and retire the ones you do not want:
+   ```sh
+   node scripts/registry-skills.mjs orphans --stack ValkeyReviewAgent --region REGION
+   node scripts/registry-skills.mjs deprecate --stack ValkeyReviewAgent --record-id ID --reason "orphaned by the old decay job"
+   ```
+4. Run a report-only pass and review it (the next two sections).
+5. Turn the switches on one at a time
+   ([Turning on edits, retirements and pull requests](#turning-on-edits-retirements-and-pull-requests)).
+
+### A report-only pass on demand
+
+Two ways, both with `dry_run: true`. A dry run makes no registry change
+and opens no pull request, whatever the settings say. It records only an
+audit's proposed edits in `pending_revision`, logs what a real run would
+do (`would-revise`, `would-retire` and so on), and releases each claim,
+so the next real pass checks the same skills again.
+
+- The decay Lambda, with a manual event. Its function name is the
+  `DecayFnName` output of `ValkeyReviewerDecay`:
+  ```sh
+  aws lambda invoke --function-name DECAY_FN_NAME \
+    --cli-binary-format raw-in-base64-out --cli-read-timeout 360 \
+    --payload '{"recheck_all":true,"dry_run":true}' decay-result.json
+  ```
+  `recheck_all` makes every live graduated skill due, still within
+  `checksPerDay` and `maxRetirementsPerDay` per reviewer, and it also
+  queues the repo skill check of each reviewer. The pass otherwise does
+  what the next scheduled pass would do: it writes the decayed scores and
+  deletes ungraduated records below the floor. Retirement candidates are
+  only logged. The read timeout covers the function's 5-minute limit, so
+  the CLI does not retry, and invoke again, while the pass runs.
+- `scripts/skill-check.mjs`, which queues checks of registry skills only,
+  claimed the way the decay job claims them, taken in its order, 60 seconds
+  apart:
+  ```sh
+  node scripts/skill-check.mjs --stack ValkeyReviewAgent --webhook-stack ValkeyReviewWebhook --release 9.1.2 --plan
+  node scripts/skill-check.mjs --stack ValkeyReviewAgent --webhook-stack ValkeyReviewWebhook --release 9.1.2
+  node scripts/skill-check.mjs --stack ValkeyReviewAgent --webhook-stack ValkeyReviewWebhook --name SKILL_NAME
+  ```
+  `--plan` only prints what it would queue. `--limit N` (default 10, the
+  decay job's code default, not your `checksPerDay`) caps the run; checks
+  come on top of that day's decay checks and share the curator queue with
+  maintainer feedback. `--release` names the GA release the check is for
+  (the decay job's `[release]` line shows it); without it, edits are
+  labelled with the checked commit. `--apply` sends `dry_run: false`, so
+  the settings decide again. A record with a request younger than 7 days
+  is skipped. It needs `cloudformation:DescribeStacks`, `dynamodb:Scan` and
+  `dynamodb:UpdateItem` on the concerns table, use of the
+  `SubstrateKeyArn` key and `sqs:SendMessage` on the curator queue.
+
+### Reviewing the reports
+
+- The curator's log group: one `[maintenance] check|retire|repo_check`
+  line per run with its `outcome` (or `would-...` in a dry run), counts of
+  lost, new-and-absent and touched names, and the note; one
+  `[maintenance] edit` line per proposed edit with its `evidence`,
+  `original` and `replacement`; and the run's end,
+  `[curator] maintenance <status> reason=... decision=...`.
+- The decay job's log group: `[release] <repo> tag=<tag>`, one
+  `check-requested`, `repo-check-requested` or `retire-requested` line per
+  message, `would-retire` and `deferred` for retirements that were not
+  requested, and the summary line per table:
+  `[decay] <table> scanned= decayed= deleted= skipped= errors= kept_retired= checks_requested= retire_requested= would_retire= deferred= retire_backoff= reserved=`.
+- The records themselves:
+  ```sh
+  scripts/concerns-dump.sh --stack ValkeyReviewAgent --stack ValkeyGlideReviewAgent --region REGION
+  ```
+  For each graduated record it prints the skill state, the last check, the
+  stale names, a maintenance request in flight, and the pending edit: its
+  verdict, reason and summary, then each edit's evidence, the suppressed
+  piece (`-`) and its replacement (`+`). The repo skill check of each
+  reviewer is printed first, as `repo skill.md check (#maintenance repo-skill)`.
+  It needs `jq`, `dynamodb:Scan` and `kms:Decrypt` on the key.
+
+Review the pending edits of at least one release before you turn on
+`applyEdits`, and the `would-retire` lines before `retireSkills`.
+
+### Turning on edits, retirements and pull requests
+
+Each is one key in `skillLifecycle`. After a change, deploy the stacks that
+read it: `npx cdk deploy ValkeyReviewerCurator ValkeyReviewerDecay`.
+
+- `applyEdits: true`: validated edits are written to the registry skill in
+  suppress-and-add form. The text before each edit is kept in
+  `previous_skill_md`, and the table has point-in-time recovery.
+- `retireSkills: true`: skills below the floor, and skills a check found
+  obsolete, are deprecated, at most `maxRetirementsPerDay` per reviewer a
+  day. A record created in the registry settles in `DRAFT`, `DRAFT` to
+  `DEPRECATED` works, and `DEPRECATED` is final: the record cannot be edited
+  or brought back. A retired skill returns only under a new name, when a
+  maintainer reinforces its concern again.
+- `openPullRequests: true`: needs `skillsRepo` and
+  [the skills-repo App](#the-skills-repo-app). Pull requests open on
+  `skill-check/<reviewer>/<release>` branches of `skillsRepo.repo`. Close one
+  to reject it; nothing more is proposed for that release.
+
+### The skills-repo App
+
+The pull requests that propose edits to `agents/<reviewer>/config/skill.md`
+are opened by a GitHub App through the skills-repo broker. Use a small App
+of its own, installed only on the bot repository:
+
+1. Create a GitHub App with the repository permissions Contents (read and
+   write), Pull requests (read and write) and Metadata (read). It needs no
+   webhook and no events.
+2. Install it on the bot repository only, from the account that owns it
+   (for example `valkey-io` for `valkey-io/valkey-review-bot`). The broker
+   refuses a token unless the installation's account owns the repository.
+   The repository must be public, because the curator reads the skill
+   files without credentials.
+3. Store `{ "app_id": "...", "private_key": "..." }` in Secrets Manager in
+   the deployment's account and region, and set `skillsRepo.appSecretName`
+   to its name.
+4. Set `skillsRepo.repo` (and `baseBranch` if it is not `main`), and
+   optionally `signOff`. Deploy.
+
+The broker asks GitHub for a token limited to that one repository, with
+`contents: write`, `pull_requests: write` and `metadata: read`, whatever
+else the App may do. Without `appSecretName` the main App is used, which
+works but widens what the main App holds:
+
+- the main App needs Contents (read and write), and each account it is
+  installed on, such as `valkey-io` for `valkey-io/valkey`, must approve
+  that new permission;
+- the receiver's installation tokens request no specific permissions, so
+  they would carry `contents: write` on every repository the App is
+  installed on.
+
+The reviewer brokers request only `pull_requests: write` and
+`metadata: read` either way, so the reviewer runtimes never get Contents
+permission.
+
+The commits are made with the broker's token, so GitHub authors them as
+the App's bot user. Their `Signed-off-by` line is `skillsRepo.signOff`, or
+that bot identity when `signOff` is not set.
+
+To remove `skillsRepo` later, deploy in two steps. The curator stack
+imports the broker's name and ARN from the substrate stack, so
+`cdk deploy --all`, which deploys the substrate stack first, would fail to
+delete the broker's exports:
+
+```sh
+npx cdk deploy ValkeyReviewerCurator --exclusively
+npx cdk deploy --all
+```
+
+### Checking a skill file against the upstream
+
+The repo skill files ship by pull request, and the curator checks them once
+per release. To check one yourself, for example before a pull request that
+changes it:
+
+```sh
+node scripts/skill-facts.mjs --file agents/valkey-review/config/skill.md --repo valkey-io/valkey
+node scripts/skill-facts.mjs --file agents/valkey-glide-review/config/skill.md --repo valkey-io/valkey-glide
+```
+
+It makes an anonymous checkout of the default branch tip in a temporary
+directory and prints the cited names and the ones that are absent. Exit
+status: 0 when clean, 2 when not, 1 on error. `--ref BRANCH` checks another
+branch, `--checkout DIR --rev REV` a clone you already have (not a partial
+clone), `--names` lists every name with its kind and count, and `--json`
+prints the whole result. `--name SKILL --stack ValkeyReviewAgent` instead
+reproduces the curator's deterministic check of a registry skill, with the
+record's baseline, ignored names and last checked commit.
+
+### Restoring a retired skill
+
+A skill an operator deprecated (with `registry-skills.mjs deprecate`, or in
+the console) is recorded with `retired_reason` `operator`, and the curator
+never publishes it again. To allow it, remove that reason from its record;
+`concerns-dump.sh` shows the bucket and record id:
+
+```sh
+aws dynamodb update-item --table-name CONCERNS_TABLE \
+  --key '{"area_bucket":{"S":"BUCKET"},"record_id":{"S":"RECORD_ID"}}' \
+  --update-expression 'REMOVE retired_reason' \
+  --condition-expression 'retired_reason = :operator' \
+  --expression-attribute-values '{":operator":{"S":"operator"}}'
+```
+
+The next reinforcement that reaches the threshold publishes it under a new
+generation name. A skill the lifecycle retired (`decayed` or `obsolete`)
+needs nothing: a reinforcement brings it back the same way.
+
+### A check that stays incomplete
+
+A check whose base commit cannot be fetched, other than because the
+upstream no longer has it, never confirms the skill, so the same check
+comes back. If a skill keeps ending `inconclusive` for that reason, remove
+`verified_sha` from its record (same command as above, with
+`--update-expression 'REMOVE verified_sha'` and no condition). The next
+check is then a first check, by presence only:
+
+```sh
+aws dynamodb update-item --table-name CONCERNS_TABLE \
+  --key '{"area_bucket":{"S":"BUCKET"},"record_id":{"S":"RECORD_ID"}}' \
+  --update-expression 'REMOVE verified_sha'
+```
+
+The same works for the repo skill item, with the key
+`{"area_bucket":{"S":"#maintenance"},"record_id":{"S":"repo-skill"}}`.
+
+### Settings as the functions see them
+
+The CDK app turns the configuration into environment variables. The
+curator logs its maintenance settings when it starts:
+`[boot] skill maintenance upstreams={...} audit_prompt=loaded apply_edits=false retire_skills=false open_pull_requests=false skills_repo=...`.
+
+Decay Lambda (`ops/src/decay.ts`):
+
+| Variable | From | Meaning |
+| --- | --- | --- |
+| `CONCERNS_TABLES_JSON` | the reviewer stacks | Reviewer id to concerns table. |
+| `DECAY_HALF_LIFE_SECONDS`, `DECAY_FLOOR`, `DECAY_GRADUATED_HALF_LIFE_SECONDS` | `decay` | Unset: 30 days, 0.05 and 180 days. |
+| `UPSTREAM_REPOS_JSON` | `upstreamRepos` | Only the reviewers with an upstream; the others get no checks. |
+| `CURATOR_QUEUE_URL` | the webhook stack | Without it the pass decays as usual, queues nothing and logs a warning. |
+| `SKILL_CHECKS_PER_DAY`, `SKILL_RECHECK_SECONDS`, `RETIRE_SKILLS`, `MAX_RETIREMENTS_PER_DAY`, `RETIRE_REFUSED_BACKOFF_SECONDS` | `skillLifecycle` | Unset: 10, 90 days, `false`, 3 and 30 days. |
+
+Curator runtime (`agents/curator/src/config.ts`), besides its feedback
+settings:
+
+| Variable | From | Meaning |
+| --- | --- | --- |
+| `UPSTREAM_REPOS_JSON` | `upstreamRepos` | As for the decay Lambda. |
+| `CHECK_PROMPT_S3_KEY` | the stack | `curator/skill-check.md`, which the stack uploads. A missing object stops the runtime at boot; an unset key makes every flagged skill end inconclusive. |
+| `CHECK_MAX_ROUNDS`, `CHECK_APPLY_EDITS`, `RETIRE_SKILLS`, `CHECK_OPEN_PULL_REQUESTS` | `skillLifecycle` | Unset: 25 and `false`. |
+| `SKILLS_REPO`, `SKILLS_REPO_BASE_BRANCH`, `SKILLS_REPO_SIGN_OFF`, `SKILLS_REPO_TOKEN_FUNCTION` | `skillsRepo` and the broker | Set only with `skillsRepo` (`SKILLS_REPO_SIGN_OFF` only with `signOff`). With `CHECK_OPEN_PULL_REQUESTS=true` and `SKILLS_REPO` set, a missing token function stops the runtime at boot. |
+| `SKILL_CHECK_DIR` | not set | Where checkouts are made; default `/tmp/skill-check`. |
+
+### Log lines to watch
+
+| Line | Meaning |
+| --- | --- |
+| `[release] <repo>: GET releases returned 403` (or `failed`) | No release trigger that day, usually the anonymous rate limit on shared Lambda addresses. Checks catch up on a later day. |
+| `[decay] CURATOR_QUEUE_URL is not set` | The decay Lambda queues nothing. |
+| `[decay] reserved-bucket ...` | An item in a `#` bucket that is not the repo skill item; left alone. |
+| `[maintenance] retire-refused <name> status=<s>` | The registry refused a deprecation. The record is not asked again for `retireRefusedBackoffDays`. |
+| `[maintenance] base-unavailable` | The last check's commit could not be fetched; the check cannot confirm. |
+| `[maintenance] partial-advance` | A check confirmed after 2 checks in a row whose diff was read only in part. |
+| `[submit_skill] ... is still marked retired while its skill ... is live` | A re-publication was not recorded. The next reinforcement finishes it. |
+| `[auto-review] ... cap=<n> reached; skipped` | A pull request used its automatic reviews (`maxAutomaticReviewsPerPr`). |
+| `[pending] ... could not clear` | A pending marker stays until it expires, and automatic reviews of that pull request are skipped until then. |
+
 ## Operational limits
 
 These are constants in `lib/webhook-stack.ts`, except the session limits,
-which are in `lib/valkey-review-agent-stack.ts`:
+which are in `lib/valkey-review-agent-stack.ts`, and the skill lifecycle
+limits, which are in the code named below:
 
-- Review workers: at most 5 concurrent per route. Curator worker: at most 2.
+- Review workers: at most 5 concurrent per route. Curator worker: at most 2,
+  shared by maintainer feedback and skill maintenance. The decay job spaces
+  each reviewer's check messages 60 seconds apart (at most 900 seconds,
+  the SQS limit) so they do not crowd out feedback.
 - Reviewer runtime sessions: 15-minute idle timeout and 2-hour maximum
   lifetime. While a review runs, the runtime reports `HealthyBusy` on
   `/ping`, so the idle timeout does not stop it after the worker has
   gone. The 2-hour limit is above the 90-minute run budget and ends a
-  session that hangs. The curator runtime keeps AgentCore's defaults and
-  does not report `HealthyBusy`.
+  session that hangs. The curator runtime keeps AgentCore's defaults, and
+  reports `HealthyBusy` only while a skill maintenance run is in progress.
 - Receiver: 10 reserved concurrent executions. Reserving concurrency needs
   enough unreserved account concurrency; a new account with a low Lambda
   quota may need an increase first.
@@ -434,6 +710,39 @@ which are in `lib/valkey-review-agent-stack.ts`:
     receive, so the run budget ends the message instead of the
     dead-letter queue.
   - The curator has no watchdog. Each receive invokes it again. Three
-    receives give a feedback event two retries for a passing failure,
-    such as throttling, and then stop an event that keeps failing from
-    spending more model calls.
+    receives give a feedback event or a maintenance message two retries
+    for a passing failure, such as throttling, and then stop one that
+    keeps failing from spending more model calls. A maintenance message
+    that dead-letters keeps its claim on the record, so the decay job asks
+    again after 7 days.
+- Automatic reviews (`webhook/src/store.ts`): a pending marker expires an
+  hour after its review's queue delay or the worker's latest extension, and
+  a pull request's round counter 180 days after its latest automatic
+  review.
+- Skill maintenance requests (`ops/src/decay.ts`): a record with a request
+  younger than 7 days gets no new one, so a check that keeps its claim
+  (inconclusive) runs again after 7 days. The decay Lambda has 5 minutes.
+- One skill check (`agents/curator/src/maintenance.ts` and
+  `agents/common/src/skill-check/`):
+  - the audit ends after `skillLifecycle.maxCheckRounds` tool rounds or 12
+    minutes from the start of the run, below the worker's 15;
+  - each git call has 10 minutes, the base fetch and its blob batch 3
+    minutes each, and git output is capped at 64 MiB per call;
+  - at most 300 cited names per skill, looked up 10 `git grep` patterns per
+    call, 4 calls at a time;
+  - a touched name has at most 40 occurrences at the tip; diffs are read
+    200 files per call, at most 4 MiB per call and 64 MiB per check; the
+    audit sees at most 3 hunks per name and 24,000 characters of excerpts;
+  - at most 6 edits, each 1 to 5 whole lines and 800 characters with 1 to
+    5 cited lines, at most 4,000 characters of growth, and 40,000
+    characters for the edited registry skill; the audit's report is
+    refused at most 2 times;
+  - the record keeps at most 300 `audit_names`, 100 `ignored_names` and 50
+    `stale_names`, a 500-character `check_note` and a 400-character
+    summary in `pending_revision`;
+  - 2 checks in a row whose diff was read only in part let the third
+    confirm.
+- The GitHub releases API is read without credentials, once per distinct
+  upstream per pass, with a 10 second timeout. Unauthenticated requests
+  are limited per source address, and Lambda addresses are shared, so a
+  lookup can fail on some days; checks then catch up later.
