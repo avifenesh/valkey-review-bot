@@ -32,10 +32,37 @@ export const GRADUATED_SKILLS_MAX_CHARS = 80_000;
  */
 export const GRADUATED_SKILL_MAX_CHARS = 40_000;
 
+/**
+ * Statuses of a retired record. DEPRECATED is terminal: the service
+ * refuses content updates and every status change out of it. Whether an
+ * update would revive a REJECTED record is unverified, so it is treated
+ * the same way.
+ */
+const RETIRED_STATUSES: ReadonlySet<string> = new Set(['DEPRECATED', 'REJECTED']);
+
 /** Statuses whose content must not reach a reviewer: still writing, failed, or retired. */
 const UNUSABLE_STATUSES: ReadonlySet<string> = new Set([
-  'CREATING', 'CREATE_FAILED', 'UPDATE_FAILED', 'DEPRECATED', 'REJECTED',
+  'CREATING', 'CREATE_FAILED', 'UPDATE_FAILED', ...RETIRED_STATUSES,
 ]);
+
+export function isRetiredStatus(status: string | undefined): boolean {
+  return RETIRED_STATUSES.has(status ?? '');
+}
+
+/** upsertSkill found the named record retired and changed nothing. */
+export class SkillRetiredError extends Error {
+  override readonly name = 'SkillRetiredError';
+  readonly skillName: string;
+  readonly recordId: string;
+  readonly status: string;
+
+  constructor(skillName: string, recordId: string, status: string) {
+    super(`skill "${skillName}" (record ${recordId}) is ${status}; a retired record is never updated`);
+    this.skillName = skillName;
+    this.recordId = recordId;
+    this.status = status;
+  }
+}
 
 export interface SkillRecord {
   readonly recordId: string;
@@ -147,21 +174,44 @@ async function retryWhileBusy<T>(call: () => Promise<T>, attempts = 6, delayMs =
 }
 
 /**
+ * The summary of the record with exactly this name. The name filter is
+ * not documented as an exact match, so names are compared here too.
+ * When several records share the name, one that is not retired wins, so
+ * a retired duplicate never hides a live skill.
+ */
+function pickByName(summaries: readonly RegistryRecordSummary[], name: string): RegistryRecordSummary | undefined {
+  const matches = summaries.filter((r) => r.name === name && r.recordId);
+  return matches.find((r) => !isRetiredStatus(r.status)) ?? matches[0];
+}
+
+export interface UpsertSkillOptions {
+  /** Only update an existing record: a missing one is an error, never a create. */
+  readonly updateOnly?: boolean;
+}
+
+/**
  * Create the skill record, or update it in place when a record with the
  * same name exists. The registry does not enforce unique names, so this
  * lookup is what keeps a re-graduation from adding a duplicate.
+ *
+ * A DEPRECATED or REJECTED record is never touched: this throws
+ * SkillRetiredError instead, and does not create a second record under
+ * the name either. Re-publication takes a new name.
  */
 export async function upsertSkill(
   client: AgentRegistryControlClient,
   registryId: string,
   input: UpsertSkillInput,
+  opts: UpsertSkillOptions = {},
 ): Promise<{ action: 'created' | 'updated'; recordArn: string; status: string }> {
   const skillMd = withFrontmatter(input.name, input.description, input.skillMd);
   if (skillMd.length > SKILL_MD_MAX_CHARS) {
     throw new Error(`skill markdown is ${skillMd.length} chars; the registry limit is ${SKILL_MD_MAX_CHARS}`);
   }
-  const existing = (await listSkillSummaries(client, registryId, [{ name: 'name', values: [input.name] }]))
-    .find((r) => r.name === input.name && r.recordId);
+  const existing = pickByName(await listSkillSummaries(client, registryId, [{ name: 'name', values: [input.name] }]), input.name);
+  if (existing && isRetiredStatus(existing.status)) {
+    throw new SkillRetiredError(input.name, existing.recordId!, existing.status!);
+  }
 
   if (existing) {
     const resp = await retryWhileBusy(() => client.send(new UpdateRegistryRecordCommand({
@@ -180,6 +230,7 @@ export async function upsertSkill(
     })));
     return { action: 'updated', recordArn: resp.recordArn ?? existing.recordArn ?? '', status: resp.status ?? '' };
   }
+  if (opts.updateOnly) throw new Error(`no skill record named "${input.name}" to update`);
 
   const resp = await client.send(new CreateRegistryRecordCommand({
     registryId,

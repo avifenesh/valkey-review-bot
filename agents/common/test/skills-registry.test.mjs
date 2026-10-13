@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import { loadSkills, upsertSkill, withFrontmatter } from '../src/skills-registry.ts';
+import { isRetiredStatus, loadSkills, SkillRetiredError, upsertSkill, withFrontmatter } from '../src/skills-registry.ts';
 
 /** Minimal stand-in for AgentRegistryControlClient: routes by command class name. */
 function fakeClient(records, { pageSize = 2 } = {}) {
@@ -30,9 +30,11 @@ function fakeClient(records, { pageSize = 2 } = {}) {
   };
 }
 
-const rec = (recordId, status, updated, md = `---\nname: ${recordId}\n---\nbody`) => ({
-  recordId, name: recordId, recordArn: `arn:${recordId}`, recordType: 'SKILL', status, md, updatedAt: new Date(updated),
+const rec = (recordId, status, updated, md = `---\nname: ${recordId}\n---\nbody`, name = recordId) => ({
+  recordId, name, recordArn: `arn:${recordId}`, recordType: 'SKILL', status, md, updatedAt: new Date(updated),
 });
+
+const writes = (client) => client.calls.filter((c) => c.op === 'CreateRegistryRecordCommand' || c.op === 'UpdateRegistryRecordCommand');
 
 test('withFrontmatter keeps existing frontmatter and adds one otherwise', () => {
   const md = '---\nname: x\n---\nbody';
@@ -91,4 +93,60 @@ test('loadSkills stops at the character budget and reports what it left out', as
   const { skills, skipped } = await loadSkills(client, 'reg', 10, undefined, 2100);
   assert.deepEqual(skills.map((s) => s.name), ['new', 'mid']);
   assert.equal(skipped, 1);
+});
+
+test('only DEPRECATED and REJECTED count as retired', () => {
+  assert.deepEqual(
+    ['DRAFT', 'PENDING_APPROVAL', 'APPROVED', 'UPDATING', 'CREATING', 'UPDATE_FAILED', 'DEPRECATED', 'REJECTED', undefined].filter(isRetiredStatus),
+    ['DEPRECATED', 'REJECTED'],
+  );
+});
+
+for (const status of ['DEPRECATED', 'REJECTED']) {
+  test(`upsertSkill refuses a ${status} record and writes nothing`, async () => {
+    const client = fakeClient([rec('lock-order', status, '2026-10-01')]);
+    const err = await upsertSkill(client, 'reg', { name: 'lock-order', description: 'd', skillMd: '# body' }).then(
+      () => assert.fail('expected SkillRetiredError'),
+      (e) => e,
+    );
+    assert.ok(err instanceof SkillRetiredError);
+    assert.equal(err.name, 'SkillRetiredError');
+    assert.deepEqual([err.skillName, err.recordId, err.status], ['lock-order', 'lock-order', status]);
+    assert.deepEqual(writes(client), []);
+  });
+
+  test(`upsertSkill with updateOnly also refuses a ${status} record`, async () => {
+    const client = fakeClient([rec('lock-order', status, '2026-10-01')]);
+    await assert.rejects(
+      upsertSkill(client, 'reg', { name: 'lock-order', description: 'd', skillMd: '# body' }, { updateOnly: true }),
+      { name: 'SkillRetiredError' },
+    );
+    assert.deepEqual(writes(client), []);
+  });
+}
+
+test('upsertSkill updates the live record when a retired one shares its name', async () => {
+  for (const order of [['old', 'live'], ['live', 'old']]) {
+    const byId = { old: rec('old', 'DEPRECATED', '2026-10-05', undefined, 'lock-order'), live: rec('live', 'DRAFT', '2026-10-01', undefined, 'lock-order') };
+    const client = fakeClient(order.map((id) => byId[id]));
+    const out = await upsertSkill(client, 'reg', { name: 'lock-order', description: 'd', skillMd: '# body' });
+    assert.equal(out.action, 'updated');
+    assert.deepEqual(writes(client).map((c) => [c.op, c.input.recordId]), [['UpdateRegistryRecordCommand', 'live']]);
+  }
+});
+
+test('upsertSkill with updateOnly updates an existing record', async () => {
+  const client = fakeClient([rec('lock-order', 'DRAFT', '2026-10-01')]);
+  const out = await upsertSkill(client, 'reg', { name: 'lock-order', description: 'd', skillMd: '# body' }, { updateOnly: true });
+  assert.equal(out.action, 'updated');
+  assert.deepEqual(writes(client).map((c) => c.op), ['UpdateRegistryRecordCommand']);
+});
+
+test('upsertSkill with updateOnly never creates a missing record', async () => {
+  const client = fakeClient([rec('other', 'DRAFT', '2026-10-01')]);
+  await assert.rejects(
+    upsertSkill(client, 'reg', { name: 'lock-order', description: 'd', skillMd: '# body' }, { updateOnly: true }),
+    /no skill record named "lock-order" to update/,
+  );
+  assert.deepEqual(writes(client), []);
 });
