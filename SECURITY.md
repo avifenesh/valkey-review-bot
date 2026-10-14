@@ -14,8 +14,9 @@ away from it:
 - The GitHub App private key and webhook secret are stored in AWS Secrets
   Manager. Only the webhook receiver and the token brokers can read them. The
   receiver verifies deliveries and acts as the App for permission checks,
-  acknowledgement comments and reading pull requests. It never runs code from a
-  pull request.
+  acknowledgement comments and reading pull requests. Its installation tokens
+  ask for `pull_requests: write`, `issues: read` and `metadata: read` only, so
+  they never carry `contents`. It never runs code from a pull request.
 - Each reviewer has its own token broker. A review runtime asks its broker for a
   short-lived installation token limited to one of that reviewer's routed
   repositories, with `pull_requests: write` and `metadata: read`. The broker asks
@@ -36,10 +37,12 @@ away from it:
   branch and require reviews on it. The curator runs no code from a pull
   request or from upstream, has no shell, and its model never sees the token.
   Use a small App of its own for this, installed only on the bot repository.
-  With the reviewer App instead, every account it is installed on has to grant
-  Contents write, and the receiver's installation tokens, which ask for no
-  particular permissions, would carry `contents: write` on every repository the
-  App is installed on.
+  The receiver and the reviewer brokers ask for explicit permissions without
+  `contents`, so with the reviewer App here none of their tokens carries it.
+  But every account the reviewer App is installed on would have to grant it
+  Contents write, and its private key, which the receiver and the reviewer
+  brokers can read, could then mint `contents: write` tokens for every
+  repository the App is installed on.
 - Git authenticates each fetch with a per-process header. No token is written to
   the repository's `.git/config`.
 - Build and test processes the reviewer starts get an environment with AWS,

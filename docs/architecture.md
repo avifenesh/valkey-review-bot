@@ -645,8 +645,10 @@ Secrets Manager. Only the receiver and the token brokers can read it (the
 skills-repo broker only when `skillsRepo.appSecretName` names this secret,
 which is the default). The
 receiver uses the webhook secret to verify deliveries and acts as the
-installation for @mention handling and thread lookups. The reviewer runtimes
-never see the secret. Each reviewer has its own broker (one instance of
+installation for @mention handling and thread lookups, with tokens that ask
+for `pull_requests: write`, `issues: read` and `metadata: read` only
+(`RECEIVER_TOKEN_PERMISSIONS` in `webhook/src/github.ts`). The reviewer
+runtimes never see the secret. Each reviewer has its own broker (one instance of
 `webhook/src/token-broker.ts` per reviewer, created in
 `infra/lib/substrate-stack.ts`), and each runtime role may invoke only its
 own. The runtime calls it with `{ installation_id, repo }`.

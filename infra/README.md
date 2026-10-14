@@ -549,18 +549,18 @@ of its own, installed only on the bot repository:
 The broker asks GitHub for a token limited to that one repository, with
 `contents: write`, `pull_requests: write` and `metadata: read`, whatever
 else the App may do. Without `appSecretName` the main App is used, which
-works but widens what the main App holds:
+works but widens what the main App holds. It needs Contents (read and
+write), and each account it is installed on, such as `valkey-io` for
+`valkey-io/valkey`, must approve that new permission. Its private key,
+which the receiver and the reviewer brokers can read, could then mint
+`contents: write` tokens for every repository the App is installed on.
 
-- the main App needs Contents (read and write), and each account it is
-  installed on, such as `valkey-io` for `valkey-io/valkey`, must approve
-  that new permission;
-- the receiver's installation tokens request no specific permissions, so
-  they would carry `contents: write` on every repository the App is
-  installed on.
-
-The reviewer brokers request only `pull_requests: write` and
-`metadata: read` either way, so the reviewer runtimes never get Contents
-permission.
+The receiver and the reviewer brokers ask for explicit permissions without
+Contents either way: the receiver for `pull_requests: write`,
+`issues: read` and `metadata: read` (`RECEIVER_TOKEN_PERMISSIONS` in
+`webhook/src/github.ts`), and the reviewer brokers for
+`pull_requests: write` and `metadata: read`. So their tokens, and the
+reviewer runtimes, never get Contents permission.
 
 The commits are made with the broker's token, so GitHub authors them as
 the App's bot user. Their `Signed-off-by` line is `skillsRepo.signOff`, or
