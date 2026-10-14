@@ -837,7 +837,11 @@ repository or URL: the curator maps `reviewer_id` to its upstream from
   so no tool call is acted on before it completes.
 - Loop (`curate` in `agents/curator/src/curate.ts`): tools run one at a time.
   The loop ends after the tool round that calls `curator_done`, or after
-  `MAX_ITERATIONS` rounds (default 40).
+  `MAX_ITERATIONS` rounds (default 40). The SDK's printer is off: the
+  model's output reaches the log only as quoted lines, one per block
+  (`[model] text "..."`, `[model] reasoning "..."`, `[model] tool "<name>"`,
+  from `ModelEcho`), and the run's end line quotes its decision, summary
+  and actions (`feedbackDoneLine`).
 - Stream: the curator runtime has none of the reviewers' closed-stream
   handling and keeps AgentCore's default session lifecycle. A maintenance
   run is registered as an async task, so `/ping` reports `HealthyBusy`
@@ -903,9 +907,13 @@ Each run logs one report line per outcome, `[maintenance] <check|retire|repo_che
 reviewer=... outcome=... dry_run=... maintenance=...`, one
 `[maintenance] edit` line per proposed edit with its evidence, original and
 replacement, and `[maintenance] audit <status> rounds=... refusals=...`
-after an audit. Strings in these lines are JSON-quoted and stripped of
-invisible format and separator characters, so text from a table or a model
-cannot break a line. The entrypoint ends with
+after an audit. A check or repo check line carries an `advisory` field
+when the skill's description cites names that are absent (see
+[Skill checks](#skill-checks)). Strings in these lines, and in the
+`[model]` lines of the audit, are JSON-quoted and stripped of invisible
+format and separator characters (`quoted` in
+`agents/curator/src/log-text.ts`), so text from a table or a model cannot
+break a line or pass for a report line. The entrypoint ends with
 `[curator] maintenance <status> reason=... decision=...`.
 
 ### Concern records
@@ -931,8 +939,8 @@ A graduated record also carries its skill's lifecycle:
 | `verified_release`, `verified_at`, `verified_sha`, `verified_ref` | The release and time of the last completed check, and the default-branch commit it confirmed (`<branch>@<sha12>` in `verified_ref`) | Check runs |
 | `audit_names`, `lost_names`, `ignored_names` | The baseline: cited names present at `verified_sha` (at most 300); baseline names found missing since; absent names an audit judged accurate (at most 100) | Check runs |
 | `stale_names`, `stale_since` | Names still lost or new and absent, unresolved (at most 50), and since when | Check runs |
-| `check_outcome`, `check_note` | `clean`, `accurate`, `revised`, `suspect`, `obsolete`, `inconclusive` or `error`, and a note of at most 500 characters built by code from counts and the skill's own names | Check runs |
-| `obsolete_release` | The release at which the subject was found gone; `decay_score` is set to 0 with it | Check runs |
+| `check_outcome`, `check_note` | `clean`, `accurate`, `revised`, `suspect`, `obsolete`, `inconclusive` or `error`, and a note of at most 500 characters built by code from counts and the skill's own names, ending with an advisory while names only the description cites are absent | Check runs |
+| `obsolete_release` | The release at which the subject was found gone; `decay_score` is set to 0 with it. A publish that removes it sets `decay_score` back to 1.0 and `decayed_at` to now | Check runs; `submit_skill` removes it |
 | `pending_revision` | An audit's result that was not applied: `at`, `verdict`, `reason`, `summary` (at most 400 characters), `edits` (`original`, `replacement`, `evidence` citations) and `problems` | Check runs |
 | `previous_skill_md`, `revised_at` | The text before the last applied edit, for rollback | Check runs |
 | `partial_checks`, `partial_check_id` | Checks in a row whose diff was read only in part | Check runs |
@@ -990,7 +998,13 @@ minimal frontmatter if it has none; `upsertSkill` refuses markdown over the
 registry's limit of 102,400 characters. The description notes the source
 `record_id`. Finally `graduated_at` is set, and the lifecycle attributes of a
 retirement or a pending check (`retired_*`, `stale_*`, `obsolete_release`,
-`pending_revision`, `retire_refused_at`) are removed.
+`pending_revision`, `retire_refused_at`) are removed. When the record had
+`obsolete_release`, that write also sets `decay_score` back to 1.0 and
+`decayed_at` to now, the standing the obsolete finding took. Without it the
+next decay pass would see a score below the floor and retire the corrected
+skill as decayed before any check of the new text. The name claim is
+conditioned on `obsolete_release` as read, so a finding recorded in between
+makes the submission fail instead of being cleared with its score at 0.
 
 For a record that published before, the model first reads the published
 text with `get_skill`, which returns the registry record in any status. The
@@ -1166,7 +1180,14 @@ upstream default branch (`check` in `agents/curator/src/maintenance.ts`).
    qualified name (`a::b`, `a.b`, `a->b`), symbol (at least 4 characters with
    an underscore or an inner capital, or all capitals of at least 5) or
    config name (`kebab-case`). Anything else is dropped. At most 300 names
-   per skill.
+   per skill. A check never edits the frontmatter, so a name only the
+   description cites (`descriptionOnlyNames`) cannot be corrected by one.
+   It counts for presence, for the obsolete evidence and for the standing
+   penalty, but is never flagged, lost or new and absent: it never refuses
+   `accurate`, never starts an audit, and never goes into `lost_names`,
+   `stale_names` or `ignored_names`. While one is absent and no earlier
+   audit judged it accurate, every `check_note` ends with an advisory that
+   names it, for the operator and for a later re-publication.
 4. Run the deterministic check (`checkSkill` in `skill-check/check.ts`),
    with git plumbing only:
    - presence at the tip: `git ls-tree` for paths, directories and globs (a
@@ -1239,7 +1260,7 @@ Outcomes:
 | `accurate` | The audit judged every flagged name fine, and no name is lost | Verification moves; the new absent names join `ignored_names` |
 | `revised` | Valid `revise` edits and `CHECK_APPLY_EDITS` on | First a claim write saves `previous_skill_md` and `revised_at` and removes `maintenance_id`, so only one copy of the message reaches the registry; then `UpdateRegistryRecord` (update only) with the edited text; then the new text's names are checked in the same checkout and the verification moves |
 | `suspect` | Valid edits with `CHECK_APPLY_EDITS` off, `unsure`, `obsolete` without evidence, or a report accepted after refusals | `pending_revision`, `stale_names`, `lost_names`; `verified_release` and `verified_at` move, `verified_sha` does not, and the baseline only loses the lost names |
-| `obsolete` | `obsolete`, and deterministic evidence: at least 3 baseline names with fewer than half kept, or no file left in the record's `area` globs | `obsolete_release` and `decay_score` 0; the next decay pass asks for the retirement. A reinforcement since the read makes it `suspect` instead |
+| `obsolete` | `obsolete`, and deterministic evidence: at least 3 baseline names with fewer than half kept, or no file left in the record's `area`. Each area entry is tested as a file and as a directory (`<e>/**`, or `**/<e>/**` for a name without `/`), with a leading `/` or `./` and a trailing `/` dropped. The area counts only when every entry is a path glob that can be tested: an entry with any other character (a space, braces, brackets) or an empty, `.` or `..` component means the area cannot back an obsolete verdict | `obsolete_release` and `decay_score` 0; the next decay pass asks for the retirement. A reinforcement since the read makes it `suspect` instead |
 | `inconclusive` | No report by the round cap or the deadline, a model or git failure, a registry record being written, or nothing flagged but part of the diff unread | `check_outcome` and `check_note`; the claim stays, so the check runs again after 7 days |
 | `error` | A failure retrying cannot fix, such as a registry record that was never published | Recorded with the release, so the check is due only at the next trigger |
 
@@ -1285,6 +1306,14 @@ status=<s>`, sets `retire_refused_at` and releases the claim; the decay job
 then waits 30 days before it asks again. A deprecation that fails in any
 other way leaves the claim and the marker, and the redelivered message
 finds out what happened.
+
+Any run removes a leftover `maintenance_deprecating` when it releases the
+claim after it read the registry record as `DRAFT`, `PENDING_APPROVAL` or
+`APPROVED` (after its last `deprecateSkill` call, if it made one): no
+deprecation is under way then. That covers a skip, a report-mode or
+dry-run end, a refused retirement read back live, and on the revise path
+its first write, the one that removes `maintenance_id`. Every other
+release keeps the marker.
 
 ### Repo skill pull requests
 

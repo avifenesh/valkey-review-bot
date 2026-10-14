@@ -567,10 +567,14 @@ so the next real pass checks the same skills again.
 
 - The curator's log group: one `[maintenance] check|retire|repo_check`
   line per run with its `outcome` (or `would-...` in a dry run), counts of
-  lost, new-and-absent and touched names, and the note; one
-  `[maintenance] edit` line per proposed edit with its `evidence`,
-  `original` and `replacement`; and the run's end,
-  `[curator] maintenance <status> reason=... decision=...`.
+  lost, new-and-absent and touched names, the note, and an `advisory`
+  field when the skill's description cites names that are absent (which
+  only a re-publication can change); one `[maintenance] edit` line per
+  proposed edit with its `evidence`, `original` and `replacement`; and
+  the run's end, `[curator] maintenance <status> reason=... decision=...`.
+  Between them, `[model] text "..."`, `[model] reasoning "..."` and
+  `[model] tool "<name>"` lines show what the audit model wrote, quoted.
+  They are not report lines.
 - The decay job's log group: `[release] <repo> tag=<tag>`, one
   `check-requested`, `repo-check-requested` or `retire-requested` line per
   message, `would-retire` and `deferred` for retirements that were not

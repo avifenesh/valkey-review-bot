@@ -106,10 +106,15 @@ away from it:
   reads it with read-only file and git tools, and runs none of its code. Its
   audit model reads code that upstream contributors wrote, so the skill text
   and the code excerpts reach it in blocks fenced by a random marker, as data.
-  It can only end with a structured report, which code validates. Its free
-  text, the summary, goes only to the operator's `pending_revision` and to
-  the logs; the note on the record, the marker text and a pull request's
-  summary and evidence are built by code. The decay job reads only the
+  It can only end with a structured report, which code validates. Its
+  summary goes only to the operator's `pending_revision` and to the logs;
+  the note on the record, the marker text and a pull request's summary and
+  evidence are built by code. Every piece of model text the curator logs
+  (its replies and reasoning, the names of the tools it calls, an audit's
+  or a feedback run's summary, ids it passed to tools) is one JSON-quoted
+  string with invisible characters removed, on a `[model]` line or as a
+  field of the curator's own lines, so it can neither start a line nor
+  pass for a `[maintenance]` report line. The decay job reads only the
   public releases list, and a release tag must be a GA tag (`X.Y.Z` or
   `vX.Y.Z`) before it reaches a record or a message.
 - Of the deployed functions, only the receiver and the decay job can send to
