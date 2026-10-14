@@ -821,6 +821,23 @@ test('a tagged thread reply on a threadReplyReview route starts a re-review and 
   assert.match(logs[0], /^\[mention\] repo=example-org\/valkey-glide pr=7 decision=enqueued:mention#review_comment-202$/);
 });
 
+test('a one-word fix claim in the App\'s thread on a threadReplyReview route starts the run, and the noise filter still keeps it from the curator', async () => {
+  const github = {
+    [`GET repos/${GLIDE}/collaborators/maintainer/permission`]: { status: 200, json: { permission: 'write' } },
+    [`GET repos/${GLIDE}/pulls/7`]: { status: 200, json: { state: 'open', head: { sha: 'def456' } } },
+    [`GET repos/${GLIDE}/pulls/comments/150`]: { status: 200, json: { body: 'Leak.', user: { login: BOT }, path: 'src/lib.rs', line: 9 } },
+    [`POST repos/${GLIDE}/issues/7/comments`]: { status: 201, json: { id: 77 } },
+  };
+  for (const word of ['fixed', 'done', 'updated']) {
+    const { handler, sent, logs } = setup({ github });
+    const resp = await handler(delivery('pull_request_review_comment', reviewReply({ body: `@example-reviewer ${word}` }, GLIDE)));
+    assert.equal(body(resp).skipped, 'noise:mention-short', word);
+    assert.deepEqual(sent.map((s) => s.queueUrl), ['q-glide']);
+    assert.match(sent[0].body.instruction, new RegExp(`\n@maintainer replied: ${word}\n`));
+    assert.match(logs[0], /^\[mention\] repo=example-org\/valkey-glide pr=7 decision=enqueued:mention#review_comment-202$/);
+  }
+});
+
 test('a tagged thread reply on other routes only teaches the curator', async () => {
   const { handler, sent } = setup({ github: parentBy(BOT) });
   await handler(delivery('pull_request_review_comment', reviewReply({ body: '@example-reviewer this is wrong, the caller holds the lock' })));

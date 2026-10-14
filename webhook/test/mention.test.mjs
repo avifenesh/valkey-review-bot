@@ -110,6 +110,25 @@ test('an acknowledgement to the bot does not start a run', () => {
   assert.equal(tagged('@example-reviewer done, please re-check the error path'), true);
 });
 
+test('in a review thread, a reply that only says the concern is fixed asks for the fix to be checked', () => {
+  const reply = (body) => detectMention('pull_request_review_comment', reviewComment(body, { in_reply_to_id: 150 }), opts);
+  for (const body of ['@example-reviewer fixed', '@example-reviewer done', '@example-reviewer updated', '@example-reviewer Fixed.', 'Done! @example-reviewer', '> This leaks the buffer.\n@example-reviewer fixed']) {
+    const m = reply(body);
+    assert.equal(m?.kind, 'thread_reply', body);
+    assert.equal(m.fixClaim, true, body);
+    assert.equal(m.parentCommentId, 150);
+  }
+  // A longer reply is an ordinary request, and other acknowledgements still start nothing.
+  assert.equal(reply('@example-reviewer fixed in the last push, please re-check').fixClaim, undefined);
+  assert.equal(reply('@example-reviewer').fixClaim, undefined);
+  for (const body of ['@example-reviewer thanks!', '@example-reviewer LGTM', '@example-reviewer ok', '@example-reviewer \u{1F44D}']) {
+    assert.equal(reply(body), null, body);
+  }
+  // Outside a review thread "done" is still an acknowledgement.
+  assert.equal(detectMention('pull_request_review_comment', reviewComment('@example-reviewer done'), opts), null);
+  assert.equal(detectMention('issue_comment', issueComment('@example-reviewer fixed'), opts), null);
+});
+
 test('withoutMention removes every tag and keeps the text around it', () => {
   assert.equal(withoutMention('@example-reviewer check (@example-reviewer) this', BOT), 'check () this');
   assert.equal(mentionPattern('weird.name+[bot]').test('@weird.name+ hi'), true, 'the handle is escaped');
@@ -374,6 +393,44 @@ test('a bare tag in a thread this App started asks for the fix to be checked', a
   await handleMention(m, target, deps);
   assert.match(enqueued[0].instruction, /\n@maintainer replied: \(asked you to check the fix\)\n/);
   assert.equal(screened, false, 'no requester text to screen');
+});
+
+test('a one-word fix claim in a thread this App started asks for the fix to be checked', async () => {
+  for (const word of ['fixed', 'done', 'updated']) {
+    const m = detectMention('pull_request_review_comment', reviewComment(`@example-reviewer ${word}`, { in_reply_to_id: 150 }), opts);
+    const { deps, enqueued } = mentionDeps(threadReplyGitHub(BOT));
+    const result = await handleMention(m, target, deps);
+    assert.deepEqual(result, { status: 200, body: { ok: true, enqueued: 'mention#review_comment-202' } }, word);
+    const { instruction } = enqueued[0];
+    assert.match(instruction, /^This is a reply to you in a review thread\./);
+    assert.match(instruction, /> This leaks the buffer on the error path\./);
+    assert.ok(instruction.includes(`\n@maintainer replied: ${word}\n`), instruction);
+    assert.ok(instruction.includes('If it says the concern is fixed, verify the fix'));
+  }
+});
+
+test('a one-word fix claim anywhere else starts nothing', async () => {
+  const m = detectMention('pull_request_review_comment', reviewComment('@example-reviewer fixed', { in_reply_to_id: 150 }), opts);
+  for (const author of ['maintainer', 'other-reviewer[bot]']) {
+    const github = threadReplyGitHub(author);
+    const { deps, enqueued, released } = mentionDeps(github);
+    const result = await handleMention(m, target, deps);
+    assert.deepEqual(result, { status: 200, body: { ok: true, skipped: 'mention:fix-claim-outside-app-thread' } }, author);
+    assert.equal(enqueued.length, 0);
+    assert.deepEqual(released, [], 'the decision stands for a redelivery');
+    assert.equal(github.calls.some((c) => c.method === 'POST'), false, 'no acknowledgement');
+  }
+
+  // Without the thread's first comment it cannot tell: nothing is posted,
+  // and the key is released for a redelivery.
+  for (const parent of [{ status: 404, json: {} }, () => { throw new Error('timeout'); }]) {
+    const github = threadReplyGitHub(BOT, { [`GET repos/${REPO}/pulls/comments/150`]: parent });
+    const { deps, enqueued, released } = mentionDeps(github);
+    assert.deepEqual(await handleMention(m, target, deps), { status: 500, body: { error: 'mention:parent-fetch-failed' } });
+    assert.equal(enqueued.length, 0);
+    assert.deepEqual(released, ['mention#review_comment-202']);
+    assert.equal(github.calls.some((c) => c.method === 'POST'), false);
+  }
 });
 
 test('the safety gate passes a dispute of a finding and still denies a hostile one', async () => {

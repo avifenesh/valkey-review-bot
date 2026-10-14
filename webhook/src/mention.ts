@@ -22,7 +22,11 @@ import { releaseQuietly } from './store.js';
  *
  * Gates, in order:
  *   1. the comment tags the bot outside quotes and code, is not just an
- *      acknowledgement, and its author is not a bot (detectMention)
+ *      acknowledgement, and its author is not a bot (detectMention). In
+ *      a review thread, a reply that only says "done", "fixed" or
+ *      "updated" is not taken for an acknowledgement: in a thread the App
+ *      started it asks for the fix to be checked, and anywhere else it
+ *      starts nothing (startRun)
  *   2. the repository has a review route (receiver)
  *   3. the author has push permission
  *   4. idempotency key mention#<surface>-<comment id>
@@ -43,6 +47,11 @@ export interface Mention {
   readonly line?: number;
   /** thread_reply only: the thread's first comment. */
   readonly parentCommentId?: number;
+  /**
+   * thread_reply only: the reply just says the concern is fixed ("done",
+   * "fixed", "updated"). It starts a run only in a thread the App started.
+   */
+  readonly fixClaim?: true;
 }
 
 function escapeRegExp(s: string): string {
@@ -69,15 +78,26 @@ export function withoutMention(body: string, botLogin: string): string {
 }
 
 /**
- * True when the comment asks the bot for something: it tags the bot in
- * its own prose, not in a quote or code, and is more than an
- * acknowledgement such as "@bot thanks" or "@bot done".
+ * A reply that only says the concern is fixed. The noise filter
+ * (src/heuristics.ts) takes these words for an acknowledgement, and
+ * still drops them as feedback.
  */
-function isRequest(body: string, botLogin: string): boolean {
+const FIX_CLAIM_RE = /^\s*(done|fixed|updated?)[\s!.,]*$/i;
+
+/**
+ * What the comment asks the bot for, if it tags the bot in its own prose,
+ * not in a quote or code: 'fix-claim' for a reply in a review thread that
+ * only says the concern is fixed ("@bot done"); 'request' when it is more
+ * than an acknowledgement such as "@bot thanks", or "@bot done" outside a
+ * review thread; null otherwise.
+ */
+function requestKind(body: string, botLogin: string, threadReply: boolean): 'request' | 'fix-claim' | null {
   const prose = stripQuotesAndCode(body);
-  if (!mentionPattern(botLogin).test(prose)) return false;
-  const { reason } = classifyCommentBody(withoutMention(prose, botLogin));
-  return reason !== 'ack' && reason !== 'emoji-only';
+  if (!mentionPattern(botLogin).test(prose)) return null;
+  const text = withoutMention(prose, botLogin);
+  if (threadReply && FIX_CLAIM_RE.test(text)) return 'fix-claim';
+  const { reason } = classifyCommentBody(text);
+  return reason !== 'ack' && reason !== 'emoji-only' ? 'request' : null;
 }
 
 /** The mention in this delivery, or null when it does not ask the bot for a review. */
@@ -91,7 +111,9 @@ export function detectMention(
   const c = payload.comment;
   if (typeof c?.id !== 'number' || !c.user?.login || opts.isBotAuthor(c.user)) return null;
   const body = c.body ?? '';
-  if (!isRequest(body, opts.botLogin)) return null;
+  const threadReply = eventType === 'pull_request_review_comment' && typeof c.in_reply_to_id === 'number';
+  const kind = requestKind(body, opts.botLogin, threadReply);
+  if (!kind) return null;
   const common = { commentId: c.id, body, actor: c.user.login };
 
   if (eventType === 'issue_comment') {
@@ -111,7 +133,7 @@ export function detectMention(
     ...(typeof line === 'number' ? { line } : {}),
   };
   return typeof c.in_reply_to_id === 'number'
-    ? { ...anchored, kind: 'thread_reply', parentCommentId: c.in_reply_to_id }
+    ? { ...anchored, kind: 'thread_reply', parentCommentId: c.in_reply_to_id, ...(kind === 'fix-claim' ? { fixClaim: true as const } : {}) }
     : { ...anchored, kind: 'summon' };
 }
 
@@ -309,6 +331,15 @@ async function startRun(
   if (mention.kind === 'thread_reply' && mention.parentCommentId) {
     const parent = await fetchReviewComment(api, repo, mention.parentCommentId).catch(() => undefined);
     if (parent && isAppLogin(parent.author, deps.botLogin)) finding = parent;
+    // A bare "done" or "fixed" answers the thread's first comment: as an
+    // ordinary summons it would start a full review on one word. Without
+    // the App's comment it starts nothing, and a failed lookup releases
+    // the key for a redelivery.
+    if (mention.fixClaim && !finding) {
+      return parent
+        ? { status: 200, body: { ok: true, skipped: 'mention:fix-claim-outside-app-thread' } }
+        : { status: 500, body: { error: 'mention:parent-fetch-failed' } };
+    }
   }
 
   // Posted before the safety verdict so the requester sees at once that
