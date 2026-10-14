@@ -235,10 +235,15 @@ a skill.
 Do not seed the registry by hand. A record that no concern record names
 (`graduated_record_name`) is outside the skill lifecycle: it never decays, is never
 checked and is never retired. `node scripts/registry-skills.mjs orphans --stack ValkeySearchReviewAgent`
-lists such records. Seeded records would also count against what a review loads: the
-30 most recently updated skills, at most 80,000 characters in all. Put hand-written
-knowledge in `config/skill.md` instead. `scripts/publish-curator-skills.mjs` only
-publishes the curator's own skills (`agents/curator/skills/`).
+lists such records. To bring records that were seeded already into the lifecycle, run
+`node scripts/registry-skills.mjs adopt --stack ValkeySearchReviewAgent`, which prints the
+concern record it would write for each, then run it again with `--apply`
+([infra/README.md](../infra/README.md#rollout-in-report-mode), step 3). Do not deprecate
+them to clean up: `DEPRECATED` is final. Seeded records also count against what a review
+loads: the 30 most recently updated skills, at most 80,000 characters in all. Put
+hand-written knowledge in `config/skill.md` instead.
+`scripts/publish-curator-skills.mjs` only publishes the curator's own skills
+(`agents/curator/skills/`).
 
 What the lifecycle does with the reviewer's graduated skills, with no setting of its
 own:

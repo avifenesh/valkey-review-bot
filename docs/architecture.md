@@ -990,8 +990,11 @@ well-formed blocks, as `parseSuppressed` in
 `agents/common/src/skill-check/edits.ts` reads them, are labelled. The
 baked-in `skill.md` gets the same labels. Concerns below the threshold never
 reach a reviewer. `scripts/registry-skills.mjs` lists skills, deprecates one
-to retire it, and lists orphans: live skills that no concern record names,
-which the lifecycle never reaches.
+to retire it, lists orphans (live skills that no concern record names, which
+the lifecycle never reaches), and adopts them: `adopt --apply` writes for
+each orphan the concern record the curator would hold had it graduated the
+skill, at the graduation threshold and with `graduated_record_name` set, so
+the decay job decays it and queues its first check.
 
 ### Decay
 
@@ -1284,7 +1287,7 @@ a registry check. The item records the checked file's commit in
 | --- | --- | --- | --- |
 | Idempotency table (DynamoDB, webhook stack) | Delivery keys (24 hour TTL), daily budget counters `budget#<route>#<date>` (3 day TTL), round counters `autoreviews#owner/name#<pr>` (180 days from the latest automatic review) and pending markers `pending#owner/name#<pr>` (an hour after the queue delay) | Receiver; review workers extend and delete pending markers | Receiver, review workers (pending markers) |
 | `valkey_reviewer_run_heartbeat` (DynamoDB, substrate stack) | One item per run key: `last_activity`, `status`, `model`, `message_id`, 24 hour TTL | Reviewer runtimes; review workers write each run's start record | Review workers |
-| `valkey_review_concerns`, `valkey_glide_review_concerns` (DynamoDB, reviewer stacks) | Concern records with their skill lifecycle attributes (tombstones included), and the `#maintenance` / `repo-skill` item. Customer-managed KMS key, point-in-time recovery, retained on stack deletion | Curator, decay job, `scripts/skill-check.mjs` (claims) | Curator, decay job, `scripts/concerns-dump.sh`, `scripts/skill-check.mjs`, `scripts/registry-skills.mjs orphans` |
+| `valkey_review_concerns`, `valkey_glide_review_concerns` (DynamoDB, reviewer stacks) | Concern records with their skill lifecycle attributes (tombstones included), and the `#maintenance` / `repo-skill` item. Customer-managed KMS key, point-in-time recovery, retained on stack deletion | Curator, decay job, `scripts/skill-check.mjs` (claims), `scripts/registry-skills.mjs adopt --apply` (records for orphaned skills) | Curator, decay job, `scripts/concerns-dump.sh`, `scripts/skill-check.mjs`, `scripts/registry-skills.mjs orphans` and `adopt` |
 | Assets bucket (S3, substrate stack) | `<agent>/prompt.md` and `<agent>/skill.md` for each reviewer, and `curator/prompt.md`, `curator/skill.md` and `curator/skill-check.md`. KMS encrypted and versioned | CDK deploy | Each runtime reads its own prefix at container start |
 | Reviewer skills registries (AWS Agent Registry, one per reviewer) | Graduated `SKILL` records, retired ones `DEPRECATED` | Curator (`submit_skill`, check edits, retirement) | That reviewer, the curator |
 | Curator registry (AWS Agent Registry) | Skill-writing guidance | `scripts/publish-curator-skills.mjs` | Curator (`list_skill_authoring`) |

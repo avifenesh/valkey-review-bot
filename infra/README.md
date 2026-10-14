@@ -475,18 +475,41 @@ standing of skills whose names are missing, and keeps proposed edits in
 pull request. A dry run (below) records even less.
 
 1. Deploy with the defaults: `npx cdk deploy --all`. From the first pass,
-   graduated records are no longer deleted. Up to `checksPerDay` (10)
-   skills per reviewer get their first check each day, and the model runs
-   only for skills with flagged names.
+   graduated records are no longer deleted. Only skills whose concern
+   record names them (`graduated_record_name`) get checks: up to
+   `checksPerDay` (10) of them per reviewer get their first check each
+   day, and the model runs only for skills with flagged names. Skills
+   published by hand, outside the curator, get none until step 3 adopts
+   them.
 2. Publish the curator's reference skills again, since
    `agents/curator/skills/` changed:
    `node scripts/publish-curator-skills.mjs --stack ValkeyReviewerCurator --region REGION`.
-3. List the skills the old decay job left without a concern record, which
-   the lifecycle never reaches, and retire the ones you do not want:
+3. Bring the skills the lifecycle does not reach into it. `orphans` lists
+   the live skills that no concern record names: skills published by
+   hand, and skills whose concern record the old decay job deleted.
+   Reviewers load them, but nothing decays, checks or retires them.
+   `adopt` writes for each one the concern record the curator would hold
+   had it graduated the skill. Without `--apply` it only prints what it
+   would write:
    ```sh
    node scripts/registry-skills.mjs orphans --stack ValkeyReviewAgent --region REGION
-   node scripts/registry-skills.mjs deprecate --stack ValkeyReviewAgent --record-id ID --reason "orphaned by the old decay job"
+   node scripts/registry-skills.mjs adopt --stack ValkeyReviewAgent --curator-stack ValkeyReviewerCurator --region REGION
+   node scripts/registry-skills.mjs adopt --stack ValkeyReviewAgent --curator-stack ValkeyReviewerCurator --region REGION --apply
    ```
+   Do the same for `ValkeyGlideReviewAgent`. Read the `would-adopt` lines
+   before `--apply`: each shows the record's `area`, and if no upstream
+   file matches it, a check can confirm an `obsolete` verdict and retire
+   the skill. Do not deprecate orphans instead: `DEPRECATED` is final, and
+   the skill can never be edited or brought back. An adopted skill is
+   retired by the lifecycle only when it decays or its subject is gone,
+   and only with `retireSkills` on. Adopt needs
+   `cloudformation:DescribeStacks`, `agent-registry:ListRegistryRecords`
+   and `agent-registry:GetRegistryRecord` on the registry,
+   `dynamodb:Scan` on the concerns table and use of its key,
+   `dynamodb:PutItem` on the table for `--apply`, and
+   `bedrock-agentcore:GetAgentRuntime` on the curator runtime for
+   `--curator-stack`, which reads its graduation threshold
+   (`--threshold N` instead needs none).
 4. Run a report-only pass and review it (the next two sections).
 5. Turn the switches on one at a time
    ([Turning on edits, retirements and pull requests](#turning-on-edits-retirements-and-pull-requests)).

@@ -77,4 +77,7 @@ restores the record (see
 [infra/README.md](../../../infra/README.md#restoring-a-retired-skill)).
 `orphans --stack <reviewer-stack-name>` lists the live skills in a
 reviewer's registry that no concern record names, which the lifecycle
-never checks or retires.
+never checks or retires. `adopt --stack <reviewer-stack-name>` prints the
+concern record it would write for each, so the lifecycle reaches it, and
+writes them with `--apply`. Adopt such skills rather than deprecate them
+if you want to keep them, because deprecation cannot be undone.
