@@ -9,7 +9,7 @@ import { createRegistryClient, loadSkills } from '../../common/src/skills-regist
 import { renderCheckPrompt } from './check-run.js';
 import { loadAssets, loadEnv, renderTemplate } from './config.js';
 import { curate } from './curate.js';
-import { normalizeFeedback, reinforcerKey, renderFeedbackMessage, untrustedReason, type CuratorRequest } from './feedback.js';
+import { feedbackDoneLine, normalizeFeedback, reinforcerKey, renderFeedbackMessage, untrustedReason, type CuratorRequest } from './feedback.js';
 import {
   curatorRequestSchema,
   handleMaintenance,
@@ -201,7 +201,7 @@ const app = new BedrockAgentCoreApp({
         }),
       });
 
-      console.log(`[curator] ${result.status} feedback=${feedback.feedbackId} decision=${run.done?.decision ?? 'none'} actions=${run.actions.join(';') || 'none'} rounds=${result.rounds} summary=${run.done?.summary ?? ''}`);
+      console.log(feedbackDoneLine(feedback.feedbackId, result, run.done, run.actions));
 
       yield {
         event: 'done',

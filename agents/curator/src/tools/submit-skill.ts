@@ -5,6 +5,7 @@ import { UpdateCommand } from '@aws-sdk/lib-dynamodb';
 import { GRADUATED_SKILL_MAX_CHARS, isRetiredStatus, type UpsertSkillInput } from '../../../common/src/skills-registry.js';
 import { parseSuppressed } from '../../../common/src/skill-check/edits.js';
 import { getRecord, reservedBucketError, type ConcernsDeps } from './concerns-ddb.js';
+import { quoted } from '../log-text.js';
 import { errorText, fail, ok, type TouchedRecord } from './run.js';
 
 /**
@@ -367,7 +368,7 @@ async function markRetired(deps: SubmitSkillDeps, key: Key, name: string, status
     }
     await deps.ddb.send(updateCommand(deps.table, key, 'SET #ret = :now, #rr = :reason', conditions, values));
   } catch (err) {
-    console.warn(`[submit_skill] retirement of "${name}" not recorded on ${key.record_id}: ${errorText(err)}`);
+    console.warn(`[submit_skill] retirement of ${quoted(name)} not recorded on ${quoted(key.record_id)}: ${errorText(err)}`);
   }
   if (!lifecycle) return `skill "${name}" was retired by an operator; it is not published again`;
   return reinforced
@@ -393,7 +394,7 @@ async function markGenerationRetired(deps: SubmitSkillDeps, key: Key, name: stri
   try {
     await deps.ddb.send(updateCommand(deps.table, key, 'SET #ret = :now, #rr = :reason', conditions, values));
   } catch (err) {
-    console.warn(`[submit_skill] retirement of "${name}" not recorded on ${key.record_id}: ${errorText(err)}`);
+    console.warn(`[submit_skill] retirement of ${quoted(name)} not recorded on ${quoted(key.record_id)}: ${errorText(err)}`);
   }
   return `skill "${name}" was retired by an operator; it is not published again`;
 }
@@ -594,11 +595,12 @@ Do not delete the source record afterwards; it stays as the skill's provenance.`
             ':name': target.name,
           }));
         } catch (err) {
-          const where = `record ${JSON.stringify(input.source_record_id)} in ${JSON.stringify(input.area_bucket)}`;
+          // The ids are the model's input: quoted, as every model-written string in the log is.
+          const where = `record ${quoted(input.source_record_id)} in ${quoted(input.area_bucket)}`;
           if (isConditionFailure(err)) {
-            console.warn(`[submit_skill] ${where} no longer names skill ${JSON.stringify(target.name)}; the publish is not recorded on it`);
+            console.warn(`[submit_skill] ${where} no longer names skill ${quoted(target.name)}; the publish is not recorded on it`);
           } else if (target.tombstone) {
-            console.error(`[submit_skill] ${where} is still marked retired while its skill ${JSON.stringify(target.name)} is live: ${errorText(err)}`);
+            console.error(`[submit_skill] ${where} is still marked retired while its skill ${quoted(target.name)} is live: ${errorText(err)}`);
           } else {
             // The skill is live; a missing timestamp is not worth failing the graduation over.
             console.warn(`[submit_skill] graduated_at not recorded on ${where}: ${errorText(err)}`);

@@ -597,7 +597,7 @@ test('a rejection is not recorded when the marker changes before the write', asy
     assert.equal(out.ok, false, name);
     assert.match(out.error, /retired by an operator/, name);
     assert.ok(!('retired_at' in w.record()), `${name}: no retirement is recorded`);
-    assert.match(logged.warn.join('\n'), /retirement of "replication-handshake-cancel-paths" not recorded on r1: ConditionalCheckFailedException/, name);
+    assert.match(logged.warn.join('\n'), /retirement of "replication-handshake-cancel-paths" not recorded on "r1": ConditionalCheckFailedException/, name);
   }
 });
 
@@ -619,7 +619,7 @@ test('a retirement is not recorded when the retire run\'s marker changes before 
     assert.equal(out.ok, false, name);
     assert.ok(w.ddb.calls.some((c) => isRetirement({ constructor: { name: c.op }, input: c.input })), `${name}: the write was tried`);
     assert.ok(!('retired_at' in w.record()), `${name}: no retirement is recorded`);
-    assert.match(logged.warn.join('\n'), /retirement of "replication-handshake-cancel-paths" not recorded on r1: ConditionalCheckFailedException/, name);
+    assert.match(logged.warn.join('\n'), /retirement of "replication-handshake-cancel-paths" not recorded on "r1": ConditionalCheckFailedException/, name);
   }
 });
 

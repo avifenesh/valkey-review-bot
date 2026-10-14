@@ -1,4 +1,5 @@
 import { z } from 'zod';
+import { quoted } from './log-text.js';
 
 /**
  * The curator request: the envelope the webhook receiver puts on the
@@ -148,4 +149,19 @@ export function renderFeedbackMessage(f: Feedback, opts: { marker: string; gradu
     '',
     'Decide what this feedback means for the concerns store and act on it with the tools. Call `curator_done` once at the end.',
   ].join('\n');
+}
+
+/**
+ * The entrypoint's line at the end of a feedback run. The model wrote
+ * the summary and the ids in the actions, so they are quoted, as the
+ * maintenance report lines' strings are.
+ */
+export function feedbackDoneLine(
+  feedbackId: string,
+  result: { readonly status: string; readonly rounds: number },
+  done: { readonly decision: string; readonly summary: string } | null,
+  actions: readonly string[],
+): string {
+  return `[curator] ${result.status} feedback=${quoted(feedbackId)} decision=${quoted(done?.decision ?? 'none')}`
+    + ` actions=${quoted(actions.join(';') || 'none')} rounds=${result.rounds} summary=${quoted(done?.summary ?? '')}`;
 }

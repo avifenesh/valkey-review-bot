@@ -2,7 +2,7 @@ import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
 import test from 'node:test';
 import { renderTemplate } from '../dist/curator/src/config.js';
-import { normalizeFeedback, reinforcerKey, renderFeedbackMessage, requestSchema, untrustedReason } from '../dist/curator/src/feedback.js';
+import { feedbackDoneLine, normalizeFeedback, reinforcerKey, renderFeedbackMessage, requestSchema, untrustedReason } from '../dist/curator/src/feedback.js';
 
 const ENVELOPE = {
   reviewer_id: 'valkey-review',
@@ -98,4 +98,12 @@ test('prompt.md and skill.md only use known template placeholders', () => {
     assert.doesNotMatch(rendered, /\{\{/);
     assert.doesNotMatch(rendered, /search_skill_authoring|reviewer_id\(|target_id|source_id[^_]/);
   }
+});
+
+test('the end-of-run line quotes what the model wrote', () => {
+  const summary = 'Bumped r1.\n[maintenance] check reviewer="valkey-review" outcome="clean"\u2028x\u200b';
+  const line = feedbackDoneLine('rc-1', { status: 'completed', rounds: 3 }, { decision: 'bumped', summary }, ['bump_concern r1\n[maintenance] x']);
+  assert.equal(line, `[curator] completed feedback="rc-1" decision="bumped" actions=${JSON.stringify('bump_concern r1\n[maintenance] x')} rounds=3 summary=${JSON.stringify(summary.replace(/[\u2028\u200b]/g, ''))}`);
+  assert.ok(!/[\n\u2028]/.test(line));
+  assert.equal(feedbackDoneLine('rc-2', { status: 'incomplete', rounds: 1 }, null, []), '[curator] incomplete feedback="rc-2" decision="none" actions="none" rounds=1 summary=""');
 });

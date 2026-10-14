@@ -126,3 +126,25 @@ export function assertPlaceholdersMatch(input) {
 export function parse(text) {
   return JSON.parse(text);
 }
+
+/**
+ * Run `fn` with the strings written to process.stdout captured; returns
+ * fn's value and the text. Anything else passes through: the test
+ * runner reports to its parent process over stdout in buffers.
+ */
+export async function capturingStdout(fn) {
+  const write = process.stdout.write;
+  let text = '';
+  process.stdout.write = function (chunk, ...rest) {
+    if (typeof chunk !== 'string') return write.call(this, chunk, ...rest);
+    text += chunk;
+    rest.find((r) => typeof r === 'function')?.();
+    return true;
+  };
+  try {
+    const value = await fn();
+    return { value, text };
+  } finally {
+    process.stdout.write = write;
+  }
+}

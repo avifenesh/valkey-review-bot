@@ -35,6 +35,7 @@ import {
 import { assembleCheckTools, CheckRun, renderCheckMessage, type CheckReport } from './check-run.js';
 import { curate, type StreamFrame } from './curate.js';
 import { requestSchema as feedbackRequestSchema } from './feedback.js';
+import { quoted } from './log-text.js';
 import type { SkillPublisher } from './tools/submit-skill.js';
 
 /**
@@ -255,7 +256,7 @@ export interface MaintenanceDeps {
   readonly now?: () => Date;
   /** Wall clock of an audit from the start of the run; default CHECK_DEADLINE_MS. */
   readonly auditDeadlineMs?: number;
-  /** Echo model output to stdout. */
+  /** Log the audit model's output, quoted (curate.ts); default true. */
   readonly printer?: boolean;
 }
 
@@ -290,10 +291,6 @@ type Item = Record<string, unknown>;
 type Key = { readonly area_bucket: string; readonly record_id: string };
 
 // --- Log lines -------------------------------------------------------------
-
-/** Characters a log line never shows, as in ops/src/decay.ts. */
-const INVISIBLE_RE = /[\p{Cf}\p{Zl}\p{Zp}\u007f-\u009f]/gu;
-const quoted = (value: string): string => JSON.stringify(value.replace(INVISIBLE_RE, ''));
 
 /** One report line: key=value pairs, every string JSON-quoted so text from a table or a model cannot break it. */
 function reportLine(kind: string, fields: Readonly<Record<string, string | number | boolean | undefined>>): string {
@@ -1103,7 +1100,8 @@ async function* audit(
         : 'the audit ended without a report';
     return { report: null, why };
   } catch (err) {
-    console.warn(`[maintenance] audit model failed: ${errorText(err)}`);
+    // The error can quote the model's own output, such as a tool input it could not parse.
+    console.warn(`[maintenance] audit model failed: ${quoted(errorText(err))}`);
     return { report: null, why: 'the audit model failed' };
   }
 }
