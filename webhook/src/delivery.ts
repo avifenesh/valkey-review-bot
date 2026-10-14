@@ -23,7 +23,8 @@ import { releaseQuietly, type DeliveryStore } from './store.js';
  *      commits first waits in the queue for pushReviewDelaySeconds.
  *      closed, and converted_to_draft on a skipDrafts route, never
  *      review; while a review waits, they release the key of a reopen,
- *      or ready_for_review, at that head (pullRequestLeft).
+ *      or ready_for_review, at that head, and give back the waiting
+ *      review's round (pullRequestLeft).
  *   3. issue_comment, pull_request_review_comment, pull_request_review:
  *      an @mention of the bot is a review request (src/mention.ts).
  *      Everything else, and a thread reply even when it also starts a
@@ -142,6 +143,42 @@ export function createDeliveryHandler(
     }
   }
 
+  /**
+   * pullRequestLeft: gives back the round of the review that waits as the
+   * pull request leaves, which the runtime is going to skip. True when
+   * this call gave it back.
+   */
+  async function giveBackWaitingRoundQuietly(repo: string, prNumber: number, action: string): Promise<boolean> {
+    try {
+      if (!(await deps.store.markRoundGivenBack(repo, prNumber))) return false;
+      await deps.store.returnAutoReview(repo, prNumber);
+      return true;
+    } catch (err) {
+      console.error(`[store] could not give back the round of the review of ${repo}#${prNumber} that waits after ${action}; if that review is skipped, it still uses its round`, err);
+      return false;
+    }
+  }
+
+  /**
+   * An event that joins a waiting review whose round pullRequestLeft gave
+   * back: the pull request is back, so the review runs, and takes its
+   * round again.
+   */
+  async function retakeWaitingRoundQuietly(routeId: string, repo: string, prNumber: number): Promise<void> {
+    const cap = config.maxAutomaticReviewsPerPr;
+    try {
+      if (!(await deps.store.clearRoundGivenBack(repo, prNumber))) return;
+      const round = await deps.store.takeAutoReview(repo, prNumber, cap);
+      if (round === 0) {
+        console.warn(`[auto-review] route=${routeId} repo=${repo} pr=${prNumber} cap=${cap} reached; the waiting review runs without a round`);
+      } else {
+        log(`[auto-review] route=${routeId} repo=${repo} pr=${prNumber} round=${round}/${cap} taken again by the waiting review`);
+      }
+    } catch (err) {
+      console.error(`[store] could not take the round of the waiting review of ${repo}#${prNumber} again; the pull request has one more`, err);
+    }
+  }
+
   async function clearPendingQuietly(repo: string, prNumber: number, marker: string): Promise<void> {
     try {
       await deps.store.clearReviewPending(repo, prNumber, marker);
@@ -180,10 +217,14 @@ export function createDeliveryHandler(
    * records its run completed. The reopen or ready_for_review that then
    * asks for the review again at this head must not be dropped as the
    * duplicate of an earlier one, so while a review waits, that event's
-   * key is released. If the pull request comes back before the review
-   * starts, the event joins it as usual and uses no round. The head is
-   * then reviewed, but the key is free, so one more close and reopen (or
-   * draft and ready) at that head reviews it again and uses a round.
+   * key is released. The waiting review's round is given back too, once
+   * per marker, so a skipped review does not use up one of the pull
+   * request's automatic reviews. Its budget slot is not: the day may
+   * have changed since. If the pull request comes back before the review
+   * starts, the event joins it, and the review takes its round again
+   * (pullRequest). The head is then reviewed, but the key is free, so one
+   * more close and reopen (or draft and ready) at that head reviews it
+   * again and uses a round.
    *
    * With no review waiting the key stays, so closing and reopening a
    * pull request (to run CI again, say), or a draft marked ready again,
@@ -192,7 +233,10 @@ export function createDeliveryHandler(
    * review and the runtime reading the pull request finds no review
    * waiting, yet the runtime skips that review. A reopen or
    * ready_for_review at this head whose key is already taken is then
-   * dropped.
+   * dropped, and the skipped review keeps its round. In the same seconds
+   * the other way round, a pull request that comes back after the worker
+   * started a review whose round was given back, but before the runtime
+   * reads it, gets that review without a round.
    *
    * The event itself never reviews: it is acknowledged as skipped, and a
    * store error is logged instead of failing the delivery.
@@ -219,7 +263,8 @@ export function createDeliveryHandler(
       console.error(`[store] could not release ${key} after ${action}; if the waiting review is skipped, a ${back} event at this head is dropped as a duplicate`, err);
       return outcome;
     }
-    log(`[auto-review] route=${route.routeId} repo=${repo} pr=${prNumber} head=${headSha} ${action} while a review waits; released ${key} in case that review is skipped`);
+    const gaveBack = await giveBackWaitingRoundQuietly(repo, prNumber, action);
+    log(`[auto-review] route=${route.routeId} repo=${repo} pr=${prNumber} head=${headSha} ${action} while a review waits; released ${key}${gaveBack ? ' and gave back its round' : ''} in case that review is skipped`);
     return outcome;
   }
 
@@ -303,6 +348,7 @@ export function createDeliveryHandler(
     // runs it then (src/watchdog.ts).
     const joinWaitingReview = async (): Promise<Outcome> => {
       await giveBack();
+      await retakeWaitingRoundQuietly(route.routeId, repo, prNumber);
       log(`[auto-review] route=${route.routeId} repo=${repo} pr=${prNumber} head=${headSha} joins the waiting review; skipped`);
       return skip('auto-review-pending');
     };

@@ -254,7 +254,8 @@ test('a draft marked ready again reviews when its waiting ready review was skipp
   assert.equal(converted.statusCode, 200);
   assert.equal(body(converted).skipped, 'action=converted_to_draft');
   assert.deepEqual(store.released, [`${GLIDE}#7#abc123#ready`]);
-  assert.equal(logs.at(-2), `[auto-review] route=valkey-glide-review repo=${GLIDE} pr=7 head=abc123 converted_to_draft while a review waits; released ${GLIDE}#7#abc123#ready in case that review is skipped`);
+  assert.equal(logs.at(-2), `[auto-review] route=valkey-glide-review repo=${GLIDE} pr=7 head=abc123 converted_to_draft while a review waits; released ${GLIDE}#7#abc123#ready and gave back its round in case that review is skipped`);
+  assert.equal(store.autoReviews.get(`${GLIDE}#7`), 0, 'the review that is skipped gives back its round');
 
   await store.clearReviewPending(GLIDE, 7, 'pending-1');
   const again = await handler(delivery('pull_request', prEvent('ready_for_review', {}, GLIDE)));
@@ -262,7 +263,7 @@ test('a draft marked ready again reviews when its waiting ready review was skipp
   assert.equal(sent.length, 2);
   assert.equal(sent[1].body.run_nonce, 'ready');
   assert.equal(sent[1].body.pending_marker, 'pending-2');
-  assert.equal(store.autoReviews.get(`${GLIDE}#7`), 2, 'it uses a round');
+  assert.equal(store.autoReviews.get(`${GLIDE}#7`), 1, 'it uses a round');
   assert.equal(body(await handler(delivery('pull_request', prEvent('ready_for_review', {}, GLIDE)))).skipped, 'duplicate', 'a redelivery is still a duplicate');
 });
 
@@ -273,13 +274,79 @@ test('a reopen reviews when the review of the reopen before it was skipped', asy
   await handler(delivery('pull_request', prEvent('reopened')));
   assert.equal(body(await handler(delivery('pull_request', prEvent('closed')))).skipped, 'action=closed');
   assert.deepEqual(store.released, [`${REPO}#7#abc123#reopened`]);
-  assert.equal(logs.at(-2), `[auto-review] route=valkey-review repo=${REPO} pr=7 head=abc123 closed while a review waits; released ${REPO}#7#abc123#reopened in case that review is skipped`);
+  assert.equal(logs.at(-2), `[auto-review] route=valkey-review repo=${REPO} pr=7 head=abc123 closed while a review waits; released ${REPO}#7#abc123#reopened and gave back its round in case that review is skipped`);
 
   await store.clearReviewPending(REPO, 7, 'pending-1');
   const resp = await handler(delivery('pull_request', prEvent('reopened')));
   assert.equal(body(resp).enqueued, `${REPO}#7#abc123#reopened`, 'not a duplicate of the skipped review');
   assert.equal(sent.length, 2);
-  assert.equal(store.autoReviews.get(`${REPO}#7`), 2);
+  assert.equal(store.autoReviews.get(`${REPO}#7`), 1, 'only the review that runs uses a round');
+});
+
+test('a review the runtime skips because the pull request left does not use up the cap', async () => {
+  // Cap 3. The review of new commits waits, the pull request goes back to
+  // draft, and the review then starts and is skipped. Marked ready, the
+  // pull request still has the rounds for its later heads.
+  const { handler, sent, store } = setup({ env: { MAX_AUTOMATIC_REVIEWS_PER_PR: '3' } });
+  const event = (action, sha, pr = {}) => delivery('pull_request', prEvent(action, { head: { sha }, ...pr }, GLIDE));
+  await handler(event('opened', 'a1'));
+  await store.clearReviewPending(GLIDE, 7, 'pending-1');
+  await handler(event('synchronize', 'a2'));
+  await handler(event('converted_to_draft', 'a2', { draft: true }));
+  assert.equal(store.autoReviews.get(`${GLIDE}#7`), 1);
+  await store.clearReviewPending(GLIDE, 7, 'pending-2');
+
+  await handler(event('ready_for_review', 'a2'));
+  await store.clearReviewPending(GLIDE, 7, 'pending-3');
+  assert.equal(body(await handler(event('synchronize', 'a3'))).enqueued, `${GLIDE}#7#a3#push`, 'the final head is reviewed');
+  assert.equal(store.autoReviews.get(`${GLIDE}#7`), 3);
+  await store.clearReviewPending(GLIDE, 7, 'pending-4');
+  assert.equal(body(await handler(event('synchronize', 'a4'))).skipped, 'auto-review-cap');
+  assert.equal(sent.length, 4);
+});
+
+test('a waiting review gives back its round once, however often the pull request leaves, and takes it again when it comes back', async () => {
+  const { handler, store, logs } = setup();
+  await handler(delivery('pull_request', prEvent('opened')));
+  await handler(delivery('pull_request', prEvent('closed')));
+  await handler(delivery('pull_request', prEvent('closed')));
+  assert.equal(store.autoReviews.get(`${REPO}#7`), 0, 'a redelivered close gives nothing more back');
+  assert.match(logs.at(-2), /closed while a review waits; released \S+ in case that review is skipped$/);
+
+  assert.equal(body(await handler(delivery('pull_request', prEvent('reopened')))).skipped, 'auto-review-pending');
+  assert.equal(store.autoReviews.get(`${REPO}#7`), 1, 'the review runs after all');
+  assert.ok(logs.includes(`[auto-review] route=valkey-review repo=${REPO} pr=7 round=1/3 taken again by the waiting review`), logs.join('\n'));
+  assert.equal(body(await handler(delivery('pull_request', prEvent('synchronize', { head: { sha: 'abc124' } })))).skipped, 'auto-review-pending');
+  assert.equal(store.autoReviews.get(`${REPO}#7`), 1, 'only once');
+
+  await handler(delivery('pull_request', prEvent('closed', { head: { sha: 'abc124' } })));
+  assert.equal(store.autoReviews.get(`${REPO}#7`), 0, 'left again');
+  assert.equal(store.returned.length, 2);
+});
+
+test('a store error while giving back or taking again a waiting review\'s round is logged and the delivery still succeeds', async () => {
+  const errors = [];
+  const original = console.error;
+  console.error = (line) => errors.push(line);
+  try {
+    const store = fakeStore();
+    const failing = async () => { throw Object.assign(new Error('slow down'), { name: 'ThrottlingException' }); };
+    const { handler, logs } = setup({ store });
+    await handler(delivery('pull_request', prEvent('opened')));
+    store.markRoundGivenBack = failing;
+    const closed = await handler(delivery('pull_request', prEvent('closed')));
+    assert.equal(body(closed).skipped, 'action=closed');
+    assert.equal(errors[0], `[store] could not give back the round of the review of ${REPO}#7 that waits after closed; if that review is skipped, it still uses its round`);
+    assert.match(logs.at(-2), /released \S+ in case that review is skipped$/);
+    assert.equal(store.autoReviews.get(`${REPO}#7`), 1);
+
+    store.clearRoundGivenBack = failing;
+    const reopened = await handler(delivery('pull_request', prEvent('reopened')));
+    assert.equal(body(reopened).skipped, 'auto-review-pending');
+    assert.equal(errors[1], `[store] could not take the round of the waiting review of ${REPO}#7 again; the pull request has one more`);
+  } finally {
+    console.error = original;
+  }
 });
 
 test('back before the waiting review starts, a reopen or ready_for_review joins it and uses no round', async () => {

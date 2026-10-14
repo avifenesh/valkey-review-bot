@@ -54,6 +54,20 @@ export function fakeDdb() {
         item.ttl = input.ExpressionAttributeValues[':ttl'];
         return {};
       }
+      if (op === 'UpdateCommand' && input.ConditionExpression === 'attribute_exists(#m) AND #ttl >= :now AND attribute_not_exists(#r)') {
+        const item = items.get(input.Key.key);
+        if (!item?.marker || !(item.ttl >= input.ExpressionAttributeValues[':now']) || item.roundGivenBack !== undefined) throw conditionFailed();
+        if (input.UpdateExpression !== 'SET #r = :true' || input.ExpressionAttributeNames['#r'] !== 'roundGivenBack') throw new Error(`unexpected update ${input.UpdateExpression}`);
+        item.roundGivenBack = input.ExpressionAttributeValues[':true'];
+        return {};
+      }
+      if (op === 'UpdateCommand' && input.ConditionExpression === 'attribute_exists(#r)') {
+        const item = items.get(input.Key.key);
+        if (item?.roundGivenBack === undefined) throw conditionFailed();
+        if (input.UpdateExpression !== 'REMOVE #r' || input.ExpressionAttributeNames['#r'] !== 'roundGivenBack') throw new Error(`unexpected update ${input.UpdateExpression}`);
+        delete item.roundGivenBack;
+        return {};
+      }
       if (op === 'UpdateCommand') {
         const item = items.get(input.Key.key) ?? { key: input.Key.key };
         const values = input.ExpressionAttributeValues;
@@ -81,7 +95,9 @@ export function fakeDdb() {
  * autoReviews counts automatic reviews and pending holds the pending
  * marker ids ("pending-1", "pending-2", ...), both per "owner/name#pr",
  * lowercased. pendingDelays has the delay of every marker taken, in
- * order. Pending markers never expire here.
+ * order. givenBack holds the pull requests whose marker notes that its
+ * round was given back; the note goes with the marker. Pending markers
+ * never expire here.
  */
 export function fakeStore({ budget = Infinity } = {}) {
   const keys = new Map();
@@ -90,6 +106,7 @@ export function fakeStore({ budget = Infinity } = {}) {
   const returned = [];
   const pending = new Map();
   const pendingDelays = [];
+  const givenBack = new Set();
   let slots = 0;
   let markers = 0;
   const prKey = (repo, prNumber) => `${repo.toLowerCase()}#${prNumber}`;
@@ -100,6 +117,7 @@ export function fakeStore({ budget = Infinity } = {}) {
     returned,
     pending,
     pendingDelays,
+    givenBack,
     get slotsTaken() { return slots; },
     async claim(key, attributes = {}) {
       if (keys.has(key)) return false;
@@ -137,7 +155,16 @@ export function fakeStore({ budget = Infinity } = {}) {
     async clearReviewPending(repo, prNumber, markerId) {
       if (pending.get(prKey(repo, prNumber)) !== markerId) return false;
       pending.delete(prKey(repo, prNumber));
+      givenBack.delete(prKey(repo, prNumber));
       return true;
+    },
+    async markRoundGivenBack(repo, prNumber) {
+      if (!pending.has(prKey(repo, prNumber)) || givenBack.has(prKey(repo, prNumber))) return false;
+      givenBack.add(prKey(repo, prNumber));
+      return true;
+    },
+    async clearRoundGivenBack(repo, prNumber) {
+      return givenBack.delete(prKey(repo, prNumber));
     },
     async hasPendingReview(repo, prNumber) {
       return pending.has(prKey(repo, prNumber));

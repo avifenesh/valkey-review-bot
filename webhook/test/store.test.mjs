@@ -257,6 +257,49 @@ test('a review waits while the pull request\'s marker is there and has not expir
   await assert.rejects(createDeliveryStore(throttled, TABLE).hasPendingReview('o/r', 7), /slow down/);
 });
 
+test('a waiting review\'s round is noted as given back once per marker, until an event joins it', async () => {
+  const ddb = fakeDdb();
+  let now = new Date('2026-10-13T08:00:00Z');
+  const store = createDeliveryStore(ddb, TABLE, () => now);
+  assert.equal(await store.markRoundGivenBack('o/r', 7), false, 'no review waits');
+  assert.equal(ddb.items.has('pending#o/r#7'), false, 'no marker is created');
+  assert.equal(await store.clearRoundGivenBack('o/r', 7), false);
+  assert.equal(ddb.items.has('pending#o/r#7'), false);
+
+  const marker = await store.markReviewPending('o/r', 7, 300);
+  assert.equal(await store.markRoundGivenBack('O/R', 7), true);
+  assert.equal(await store.markRoundGivenBack('o/r', 7), false, 'once per marker');
+  const update = ddb.calls.findLast((c) => c.op === 'UpdateCommand' && c.input.UpdateExpression === 'SET #r = :true').input;
+  assert.deepEqual(update, {
+    TableName: TABLE,
+    Key: { key: 'pending#o/r#7' },
+    UpdateExpression: 'SET #r = :true',
+    ConditionExpression: 'attribute_exists(#m) AND #ttl >= :now AND attribute_not_exists(#r)',
+    ExpressionAttributeNames: { '#m': 'marker', '#ttl': 'ttl', '#r': 'roundGivenBack' },
+    ExpressionAttributeValues: { ':true': true, ':now': Date.parse('2026-10-13T08:00:00Z') / 1000 },
+  });
+  // The worker keeps its marker while it waits; the note stays with it.
+  assert.equal(await extendPendingReview(ddb, TABLE, 'o/r', 7, marker), true);
+  assert.equal(ddb.items.get('pending#o/r#7').roundGivenBack, true);
+
+  assert.equal(await store.clearRoundGivenBack('O/R', 7), true, 'the pull request is back');
+  assert.equal(await store.clearRoundGivenBack('o/r', 7), false, 'only once');
+  assert.equal(ddb.items.get('pending#o/r#7').marker, marker, 'the marker stays');
+  assert.equal(await store.markRoundGivenBack('o/r', 7), true, 'it can leave again');
+
+  // The note goes with its marker.
+  await store.clearReviewPending('o/r', 7, marker);
+  assert.equal(await store.clearRoundGivenBack('o/r', 7), false);
+  await store.markReviewPending('o/r', 7, 0);
+  assert.equal(await store.clearRoundGivenBack('o/r', 7), false, 'a new marker has no note');
+  now = new Date('2026-10-13T09:00:01Z');
+  assert.equal(await store.markRoundGivenBack('o/r', 7), false, 'an expired marker has no review waiting');
+
+  const throttled = { send: async () => { throw Object.assign(new Error('slow down'), { name: 'ThrottlingException' }); } };
+  await assert.rejects(createDeliveryStore(throttled, TABLE).markRoundGivenBack('o/r', 7), /slow down/);
+  await assert.rejects(createDeliveryStore(throttled, TABLE).clearRoundGivenBack('o/r', 7), /slow down/);
+});
+
 test('releaseQuietly logs a failed release instead of throwing', async () => {
   const errors = [];
   const original = console.error;

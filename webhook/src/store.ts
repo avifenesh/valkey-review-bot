@@ -14,7 +14,9 @@ import { DeleteCommand, GetCommand, PutCommand, UpdateCommand, type DynamoDBDocu
  *   - pending markers, "pending#OWNER/NAME#PR" (lowercased), held by an
  *     automatic review while it waits in the queue, and while it waits
  *     for another review of the pull request to finish. The worker
- *     removes the marker when it starts the review.
+ *     removes the marker when it starts the review. A marker also notes
+ *     when the receiver gave back the waiting review's round because the
+ *     pull request left (closed, or back to draft) while it waited.
  */
 
 export type DocumentClient = Pick<DynamoDBDocumentClient, 'send'>;
@@ -52,8 +54,25 @@ export interface DeliveryStore {
    * 1 for the first, or 0 when `cap` have been taken.
    */
   takeAutoReview(repo: string, prNumber: number, cap: number): Promise<number>;
-  /** Gives back an automatic review taken for a review that was not queued. */
+  /**
+   * Gives back an automatic review taken for a review that was not
+   * queued, or for a waiting review that the runtime is going to skip.
+   */
   returnAutoReview(repo: string, prNumber: number): Promise<void>;
+  /**
+   * Notes on the pull request's pending marker that the waiting review's
+   * round is given back. True when this call made the note, and the
+   * caller gives the round back; false when no review waits, or its
+   * round was already given back. So a marker's round is given back at
+   * most once, however often the pull request leaves.
+   */
+  markRoundGivenBack(repo: string, prNumber: number): Promise<boolean>;
+  /**
+   * Removes that note when an event joins the waiting review: the pull
+   * request is back, so the review runs after all. True when there was a
+   * note, and the caller takes the round again.
+   */
+  clearRoundGivenBack(repo: string, prNumber: number): Promise<boolean>;
   /**
    * Marks an automatic review as waiting in the queue for the pull
    * request. Returns the marker's id, or null while another review holds
@@ -279,6 +298,40 @@ export function createDeliveryStore(ddb: DocumentClient, tableName: string, now:
     },
 
     clearReviewPending: (repo, prNumber, markerId) => clearPendingReview(ddb, tableName, repo, prNumber, markerId),
+
+    async markRoundGivenBack(repo, prNumber) {
+      try {
+        await ddb.send(new UpdateCommand({
+          TableName: tableName,
+          Key: { key: pendingReviewKey(repo, prNumber) },
+          UpdateExpression: 'SET #r = :true',
+          // A marker that is there and has not expired, as hasPendingReview counts it.
+          ConditionExpression: 'attribute_exists(#m) AND #ttl >= :now AND attribute_not_exists(#r)',
+          ExpressionAttributeNames: { '#m': 'marker', '#ttl': 'ttl', '#r': 'roundGivenBack' },
+          ExpressionAttributeValues: { ':true': true, ':now': epochSeconds() },
+        }));
+        return true;
+      } catch (err) {
+        if (isConditionFailure(err)) return false;
+        throw err;
+      }
+    },
+
+    async clearRoundGivenBack(repo, prNumber) {
+      try {
+        await ddb.send(new UpdateCommand({
+          TableName: tableName,
+          Key: { key: pendingReviewKey(repo, prNumber) },
+          UpdateExpression: 'REMOVE #r',
+          ConditionExpression: 'attribute_exists(#r)',
+          ExpressionAttributeNames: { '#r': 'roundGivenBack' },
+        }));
+        return true;
+      } catch (err) {
+        if (isConditionFailure(err)) return false;
+        throw err;
+      }
+    },
 
     async hasPendingReview(repo, prNumber) {
       const resp = await ddb.send(new GetCommand({
