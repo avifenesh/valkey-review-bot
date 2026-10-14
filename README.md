@@ -26,7 +26,10 @@ The reviewer runs as a GitHub App. On the Valkey repositories it appears as
 
 - **Automatic reviews** run when a pull request is opened or reopened and when new
   commits are pushed to it, within a daily budget per repository. A pull request gets at
-  most 3 automatic reviews, counting the first (the deployment can set 1 to 20).
+  most 3 automatic reviews, counting the first (the deployment can set 1 to 20). A
+  review still waiting to start when the pull request is closed, or turned back into a
+  draft on a repository that skips drafts, gives its round back; it takes the round
+  again if the pull request comes back before it starts.
   - A review of new commits starts 5 minutes after the push (by default). Pushes in
     those minutes join it, so a burst of pushes gets one review, of the newest head.
   - A push while a review runs queues the next review, which waits for the running one
@@ -40,8 +43,10 @@ The reviewer runs as a GitHub App. On the Valkey repositories it appears as
 - **Reply in a review thread**, on repositories where it is enabled (`threadReplyReview`,
   which the example configuration turns on for both Valkey and GLIDE). Reply to one of
   the bot's review comments, mention the bot, and do one of these:
-  - say the concern is fixed, for example "fixed in the last push". The bot checks the
-    fix at the current head and confirms it, or says exactly what remains.
+  - say the concern is fixed, for example "fixed in the last push", or just
+    "@valkey-review-bot fixed" (or "done", "updated"). The bot checks the fix at the
+    current head and confirms it, or says exactly what remains. A one-word "fixed" in a
+    thread the bot did not start does nothing.
   - dispute the finding. The bot checks its claim against the code again. It withdraws
     the finding if the reply is right, and shows its evidence if not.
   - ask a question about the finding. The bot answers from the code.

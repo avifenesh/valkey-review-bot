@@ -380,14 +380,20 @@ the files from it without credentials, so it must be public.
 Default `40`. Automatic reviews allowed per route per UTC day, reviews of
 new commits included. Reviews beyond it are skipped and logged. Reviews
 summoned by a maintainer are not counted, and neither are events that join
-a waiting review. `0` pauses automatic reviews.
+a waiting review. A queued review keeps its slot even if it is skipped
+later, for example because the pull request was closed. `0` pauses
+automatic reviews.
 
 ### `maxAutomaticReviewsPerPr`
 
 Default `3`, from 1 to 20. Automatic reviews one pull request can get,
 counting the first: on open, reopen, `ready_for_review` and new commits.
 Further events are skipped as `auto-review-cap`. @mentions and thread
-replies are not counted. Passed to the receiver as
+replies are not counted. A review still waiting when the pull request is
+closed, or turned back into a draft on a `skipDrafts` route, gives its
+round back, and takes it again if the pull request comes back before the
+review starts. A review the worker gives up on, past the run budget or in
+the dead-letter queue, keeps its round. Passed to the receiver as
 `MAX_AUTOMATIC_REVIEWS_PER_PR`. The count lives in the idempotency table and
 expires 180 days after the pull request's latest automatic review.
 
@@ -750,6 +756,11 @@ settings:
 | `[maintenance] partial-advance` | A check confirmed after 2 checks in a row whose diff was read only in part. |
 | `[submit_skill] ... is still marked retired while its skill ... is live` | A re-publication was not recorded. The next reinforcement finishes it. |
 | `[auto-review] ... cap=<n> reached; skipped` | A pull request used its automatic reviews (`maxAutomaticReviewsPerPr`). |
+| `[auto-review] ... released <key> and gave back its round in case that review is skipped` | The pull request was closed, or turned back into a draft, while a review waited. |
+| `[auto-review] ... round=<n>/<cap> taken again by the waiting review` | It came back before that review started, so the review runs and counts. |
+| `[watchdog] ... waited for <run key> ... past the run budget ...; running it anyway` | A review waited for another review of its pull request until its run budget was used up. A run key that keeps showing up here is a run that does not end or a forged heartbeat record ([SECURITY.md](../SECURITY.md#what-a-deployment-holds)). |
+| `decision=skipped:mention:fix-claim-outside-app-thread` | A reply of only "done", "fixed" or "updated" in a review thread the App did not start. Nothing runs. |
+| `decision=err:mention:parent-fetch-failed` | The thread's first comment could not be read for such a reply. The delivery got 500 and can be redelivered. |
 | `[pending] ... could not clear` | A pending marker stays until it expires, and automatic reviews of that pull request are skipped until then. |
 
 ## Operational limits
@@ -786,11 +797,12 @@ limits, which are in the code named below:
     the run heartbeat. It acks a finished run, waits again for a live
     one, and retries a dead one on the fallback model. A message older
     than the run budget (`RUN_BUDGET_MINUTES`, default 90, in
-    `webhook/src/config.ts`) is acked
-    and dropped. A healthy long review is therefore received at most
-    `ceil(90 / 16) + 1 = 7` times. The limit of 8 leaves one spare
-    receive, so the run budget ends the message instead of the
-    dead-letter queue.
+    `webhook/src/config.ts`) is acked and dropped. A healthy long review
+    is therefore received at most `ceil(90 / 16) + 1 = 7` times. The
+    limit of 8 leaves one spare receive, so the run budget ends the
+    message instead of the dead-letter queue. A review that waited for
+    another review of its pull request until the budget was used up runs
+    at that receive, the seventh at most, and the next receive acks it.
   - The curator has no watchdog. Each receive invokes it again. Three
     receives give a feedback event or a maintenance message two retries
     for a passing failure, such as throttling, and then stop one that

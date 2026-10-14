@@ -48,9 +48,10 @@ HTTP API -> receiver -+-> route queue -> route worker -> reviewer runtime -> Git
    (`webhook/src/review-envelope.ts`) to the route's queue, with an SQS
    delay when new commits started it.
 3. The route's worker waits while another review of the same pull request
-   runs. Then it writes the run's start record, removes the pending marker,
-   calls `InvokeAgentRuntime` on the route's reviewer runtime with the
-   envelope as the payload and reads the event stream (`handleOne` in
+   runs, at most until the review's run budget is used up. Then it writes
+   the run's start record, removes the pending marker, calls
+   `InvokeAgentRuntime` on the route's reviewer runtime with the envelope
+   as the payload and reads the event stream (`handleOne` in
    `webhook/src/invoker.ts`).
 4. The runtime (`bootstrap` in `agents/common/src/run-agent.ts`) starts a
    heartbeat record, gets a token from its token broker and reads the pull
@@ -91,7 +92,9 @@ HTTP API -> receiver -+-> route queue -> route worker -> reviewer runtime -> Git
    the current head: verify a claimed fix (confirm it, or say what remains),
    re-check a disputed finding (withdraw it if the reply is right, or show
    the evidence), or answer a question. In a thread someone else started the
-   reply is an ordinary summons. The reply is handled as feedback either way.
+   reply is an ordinary summons, except a reply that only says "done",
+   "fixed" or "updated", which starts nothing there. The reply is handled as
+   feedback either way.
 
 ### Curator feedback
 
@@ -160,7 +163,8 @@ which `scripts/dump-hour.sh` summarizes.
   `closed`, and `converted_to_draft` on a `skipDrafts` route, never review;
   while a review waits they release the key of a later reopen or
   `ready_for_review` at that head (`pullRequestLeft`), so that event is not
-  dropped as a duplicate if the waiting review is skipped.
+  dropped as a duplicate if the waiting review is skipped, and give back
+  the waiting review's round.
 - `issue_comment` and `pull_request_review_comment`: @mention detection,
   then the feedback path.
 - `pull_request_review`: the feedback path only (action `submitted`). A tag
@@ -220,6 +224,22 @@ idempotency key. A send that errors after SQS accepted the message gives them ba
 a review that still runs, so the pull request can get one review more than
 the cap.
 
+A queued review that the runtime is going to skip gives back its round,
+but not its budget slot. When `closed`, or `converted_to_draft` on a
+`skipDrafts` route, finds a review waiting, `pullRequestLeft` sets
+`roundGivenBack` on the pending marker (`markRoundGivenBack`, conditional,
+so once per marker) and returns the round. An event that later joins the
+waiting review clears the mark and takes the round again
+(`clearRoundGivenBack`), since the pull request is back and the review
+runs. The worker gives nothing back: a review it gives up on, past the run
+budget or in the dead-letter queue, keeps its round and slot, because the
+worker's grant on the idempotency table covers `pending#` keys only. In
+the seconds between the worker starting a review and the runtime reading
+the pull request, a leaving event finds no review waiting, so a review the
+runtime then skips keeps its round; and a pull request that left while the
+review waited and comes back in those seconds gets that review without a
+round.
+
 ### Gates for @mentions
 
 `detectMention` accepts a created comment whose author is not a bot and that
@@ -227,7 +247,11 @@ tags the bot outside quotes and code (`mentionPattern` matches `@` plus the
 login without `[bot]`, at a word boundary). After the tag is removed the
 comment must be more than an acknowledgement or emoji. An `issue_comment`
 must be on a pull request. A review comment with `in_reply_to_id` is a thread
-reply; anything else is a summons.
+reply; anything else is a summons. A thread reply that only says "done",
+"fixed" or "updated" (`FIX_CLAIM_RE`) is not taken for an acknowledgement but
+marked as a fix claim (`fixClaim`): it starts a run only in a thread the App
+started, and is skipped as `mention:fix-claim-outside-app-thread` in any
+other, before any acknowledgement is posted.
 
 `handleMention` and `startRun` then check, in order: a review route exists
 (summons on other repositories are dropped; thread replies run only on
@@ -243,9 +267,9 @@ verdict, an error or a timeout all deny. The gate allows a reply that says one
 of the bot's findings is fixed, argues that it is wrong or asks about it,
 unless part of the reply attempts something it denies. A bare tag has no
 instruction, skips the gate, and gets a standard full review. Failures a redelivery could fix
-(reading the pull request, posting the acknowledgement, queuing) release the
-claim and return 500; a failed queue send also edits the acknowledgement to
-say so.
+(reading the pull request, reading the thread's first comment for a fix
+claim, posting the acknowledgement, queuing) release the claim and return
+500; a failed queue send also edits the acknowledgement to say so.
 
 ### Daily review budget
 
@@ -337,9 +361,10 @@ automatic review from making the watchdog drop a later run on the same head.
 The worker writes the first record of a run itself, just before it invokes
 the runtime: status `running`, `last_activity` and the SQS message id, with
 a conditional `UpdateItem` that is refused while the key holds a fresh
-running record or a completed one this message wrote (`claimRunStart` in
-`webhook/src/invoker.ts`). So another review of the pull request sees the
-run at once, not only after the runtime's first heartbeat, and only one
+running record (fresh as defined below) or a completed one this message
+wrote (`claimRunStart` in `webhook/src/invoker.ts`). So another review of
+the pull request sees the run at once, not only after the runtime's first
+heartbeat, and only one
 receive of a message starts the run. A receive that loses is left on the
 queue and decides from the heartbeat at its next receive. The runtime's own
 writes keep the message id.
@@ -350,44 +375,69 @@ it runs, on any attempt, the worker scans the heartbeat table for the
 running records whose key starts with `owner/name#<pr>#`. While one is fresh,
 the message waits like a live run of its own, and the worker moves its
 pending marker's expiry to an hour from then, so later events keep joining
-it. @mention runs, thread replies included, never wait: a maintainer is
-watching their status comment.
+it. Once the message is older than the run budget it stops waiting and
+runs, with the warning `[watchdog] ... waited for <run key> ... past the
+run budget ...; running it anyway`, so a run that never ends cannot hold
+the pull request's automatic reviews back for good. @mention runs, thread
+replies included, never wait: a maintainer is watching their status
+comment.
+
+Any reviewer runtime can write any heartbeat record, and code from a pull
+request can use a reviewer runtime's role ([SECURITY.md](../SECURITY.md)).
+So a record is fresh only when a run could have written it (`isFresh` in
+`webhook/src/watchdog.ts`): its `last_activity` is no older than
+`HEARTBEAT_STALE_MINUTES` and at most 60 seconds (`CLOCK_SKEW_MS`) ahead
+of the worker's clock, and its `ttl` is set and at most 24 hours plus 60
+seconds ahead. The scan, the check of the review's own record and
+`claimRunStart`'s condition all apply this test, so a forged record counts
+as live only while something keeps rewriting it.
 
 A worker stops reading when its 15 minute limit ends, and the message comes
 back after the visibility timeout. For a review message, `decide` in
 `webhook/src/watchdog.ts` returns:
 
-- first receive, or a later receive that still holds its pending marker
-  (the review never ran): invoke on the primary model;
+- first receive, a later receive that still holds its pending marker, a
+  run key with no record, or a start record with another message's
+  `message_id` (the review never ran): invoke on the primary model, at any
+  age. Another message's record can be an earlier run of a reopen or ready
+  key that was released and used again;
 - heartbeat `completed`: delete, at any age;
 - message older than the run budget (from `SentTimestamp`): delete it and log
   `[abandoned]`;
-- no heartbeat, status `failed`, or last activity older than
-  `HEARTBEAT_STALE_MINUTES` (default 12): invoke again on the fallback model;
+- no `last_activity`, status `failed`, last activity older than
+  `HEARTBEAT_STALE_MINUTES` (default 12), or a record that is not fresh:
+  invoke again on the fallback model;
 - otherwise the run is alive: report the message as failed without invoking,
   and check again after the next visibility timeout.
+
+A record without `message_id`, from before start records or from a worker
+that may not write them, is judged by its heartbeat alone. An invoke of an
+automatic review then still waits for another live run of the pull
+request, as above.
 
 A review worker without `HEARTBEAT_TABLE` refuses every message, because
 every redelivery would otherwise look like a dead run.
 
 ### Primary and fallback model
 
-The first attempt runs on `BEDROCK_MODEL_ID`. Every attempt the watchdog
-starts later sets `use_fallback_model`, and the runtime switches to
-`FALLBACK_MODEL_ID`. Slowness alone never triggers this, only a missing,
-failed or stale heartbeat. Within one attempt the reviewer retries transient
-model errors on the same model (section 4). The curator works differently: it
+The first attempt runs on `BEDROCK_MODEL_ID`, and so does a later receive
+of a review that never ran. Every attempt the watchdog starts after a dead
+run sets `use_fallback_model`, and the runtime switches to
+`FALLBACK_MODEL_ID`. Slowness alone never triggers this, only a failed or
+stale heartbeat, a record with no `last_activity`, or one that is not
+fresh. Within one attempt the reviewer retries transient model errors on
+the same model (section 4). The curator works differently: it
 falls back per model call inside one invocation (section 6).
 
 ### Run budget and dead-letter queues
 
 `RUN_BUDGET_MINUTES` defaults to 90 and is not overridden by the CDK app. It
 counts from the message's `SentTimestamp`, so the push delay and any wait for
-another review come out of it: a review still waiting at the end of the
-budget is dropped with an `[abandoned]` error, and one that starts late is
-watched only until the budget ends. With
-a 16 minute visibility timeout a healthy long review is received at most
-seven times, so review queues dead-letter after eight receives. Curator
+another review come out of it: a review still waiting for another run at
+the end of the budget runs then, with a warning, and one that starts late
+is watched only until the budget ends. With a 16 minute visibility timeout
+a healthy long review is received at most seven times, so review queues
+dead-letter after eight receives. Curator
 messages have no heartbeat: every receive invokes the curator, the curator
 queue dead-letters after three receives, and the worker deletes a curator
 message seen more than three times (which only happens without a redrive

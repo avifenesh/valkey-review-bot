@@ -54,9 +54,20 @@ What happens to a delivery:
 - `closed`, and `converted_to_draft` on a `skipDrafts` route, never start a
   review. While a review waits, they release the key of a reopen, or a
   `ready_for_review`, at that head, so that event is reviewed if the waiting
-  review is skipped. A reopen has its own key, so closing and reopening a
-  pull request at a head that was already reviewed reviews it again and uses
-  a round; only the first reopen at a head does.
+  review is skipped. They also give back the waiting review's round, once
+  per marker, but not its budget slot (`[auto-review] ... released <key>
+  and gave back its round in case that review is skipped`). If the pull
+  request comes back before the review starts, the event that joins it
+  takes the round again (`[auto-review] ... round=<n>/<cap> taken again by
+  the waiting review`). A review the worker gives up on, past the run
+  budget or in the dead-letter queue, keeps its round and slot. Two races
+  remain, in the seconds between the worker starting a review and the
+  runtime reading the pull request: a close or draft then finds no review
+  waiting, so the review the runtime skips keeps its round; and a pull
+  request that left while the review waited and comes back then gets that
+  review without a round. A reopen has its own key, so closing and
+  reopening a pull request at a head that was already reviewed reviews it
+  again and uses a round; only the first reopen at a head does.
 - A comment that tags the bot (`@your-app-slug`) from a user with push
   access starts a review with the rest of the comment as its instruction,
   after a safety check by a Bedrock model. Tags inside quotes or code and
@@ -68,7 +79,14 @@ What happens to a delivery:
   the run to answer the reply from the code at the current head: verify a
   claimed fix, re-check a disputed finding and withdraw it if the reply is
   right, or answer a question. In any other thread the reply is an ordinary
-  summons. These reviews are not counted against the budget or the rounds.
+  summons. A reply that only says "done", "fixed" or "updated" is a fix
+  claim: in a thread the App started it starts the fix check, and in any
+  other thread it starts nothing and gets no acknowledgement
+  (`skipped:mention:fix-claim-outside-app-thread`). When the thread's first
+  comment cannot be read, the receiver answers 500
+  (`mention:parent-fetch-failed`) and releases the key, so the delivery can
+  be redelivered. These reviews are not counted against the budget or the
+  rounds.
 - Other comments and submitted reviews go to the curator when they are new
   (`created` or `submitted`), on a pull request, by an `OWNER`, `MEMBER` or
   `COLLABORATOR` who is not a bot, and not filtered as noise by
@@ -99,9 +117,18 @@ On the first receive of a review message the invoker runs the review. A
 review can outlive the worker's 15-minute limit, so on each later receive
 it reads the run's heartbeat record and either deletes the message (the
 run completed), leaves it for the next visibility timeout (the run is
-alive), or runs it again on the fallback model (the run is dead). After the
-run budget it deletes the message and logs an `[abandoned]` error, unless
-the run completed.
+alive), or runs it again on the fallback model (the run is dead). A later
+receive whose run key has no record, or a start record another message
+wrote, has never run, and is a first attempt on the primary model. After
+the run budget it deletes the message and logs an `[abandoned]` error,
+unless the run completed or never ran.
+
+A running record counts as alive only while it looks like one a run
+wrote: `last_activity` no older than `HEARTBEAT_STALE_MINUTES` and at most
+60 seconds ahead of the worker's clock, and a `ttl` at most 24 hours and
+60 seconds ahead. Any reviewer runtime can write the table, so a record
+that fails this test counts as a dead run (see
+[SECURITY.md](../SECURITY.md#what-a-deployment-holds)).
 
 Automatic reviews take two more steps:
 
@@ -113,9 +140,11 @@ Automatic reviews take two more steps:
   and fresh, the message goes back to the queue and the worker moves the
   marker's expiry to an hour from then, so later events keep joining it
   (`[watchdog] ... waits for <run key>`). A review still waiting when the
-  run budget is used up is dropped with an `[abandoned]` error and lets go
-  of its marker. @mention runs, thread replies included, have no marker and
-  never wait.
+  run budget is used up runs then, with the warning `[watchdog] ... waited
+  for <run key> (heartbeat <n>s ago) past the run budget: <x> min > <y> min;
+  running it anyway`, so another run that never ends cannot stop the pull
+  request's automatic reviews. @mention runs, thread replies included, have
+  no marker and never wait.
 
 Just before it invokes a review, the worker writes the run's start record
 in the heartbeat table (status `running`, the SQS message id) under the run

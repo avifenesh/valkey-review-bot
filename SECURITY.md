@@ -62,8 +62,15 @@ away from it:
   - read access to its own skills registry;
   - `GetItem`, `PutItem` and `UpdateItem` on any item of the shared run
     heartbeat table. A forged record can make the watchdog drop or retry
-    another run, or hold back the automatic reviews of another pull request
-    until their run budget ends;
+    another run. The workers count a running record as live only if it
+    looks like one a run wrote (`last_activity` at most 60 seconds ahead of
+    the worker's clock, and a `ttl` at most 24 hours and 60 seconds ahead)
+    and something rewrote it within `HEARTBEAT_STALE_MINUTES`. While PR code
+    keeps rewriting such a record: under another run key of a pull request,
+    it holds back that pull request's automatic reviews, each until its run
+    budget is used up, after which the review runs anyway; under a review's
+    own run key, it keeps that review from starting, and the review can end
+    without running, in the dead-letter queue or as `[abandoned]`;
   - invoke on its own token broker;
   - log writes to its own runtime log groups
     (`/aws/bedrock-agentcore/runtimes/<runtime name>-*`);
