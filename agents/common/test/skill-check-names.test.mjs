@@ -2,7 +2,7 @@ import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
 import test from 'node:test';
 
-const { classifyToken, extractNames, MAX_NAMES } = await import('../src/skill-check/names.ts');
+const { classifyToken, descriptionOnlyNames, extractNames, MAX_NAMES } = await import('../src/skill-check/names.ts');
 const { listSuppressedBlocks } = await import('../src/skill-check/edits.ts');
 
 const fixture = (name) => readFileSync(new URL(`./fixtures/skills/${name}`, import.meta.url), 'utf8');
@@ -81,6 +81,21 @@ test('the frontmatter description contributes paths and A::b names, but not its 
     { token: 'ConnectionManager::reconnect', kind: 'qualified' },
     { token: 'bodyOnly_name', kind: 'symbol' },
   ]);
+});
+
+test('descriptionOnlyNames lists the description\'s names that the body does not cite', () => {
+  const md = skill('Flag `emptyDB` callers, and `src/db.c` changes.\n\n```c\nfencedName_x();\n```\n', 'Use when `src/db.c`, `fencedName_x` or src/server.c changes `emptyDB` users of `Cluster::reset`.');
+  assert.deepEqual([...descriptionOnlyNames(md)].sort(), ['Cluster::reset', 'fencedName_x', 'src/server.c']);
+  assert.ok([...descriptionOnlyNames(md)].every((t) => tokens(md).includes(t)), 'each is one of extractNames');
+  // A suppressed piece is no body occurrence either.
+  const suppressed = skill([
+    '<!-- suppressed: superseded in 9.0.0, 2026-01-01; `emptyDB` is now `emptyData`; evidence: valkey-io/valkey@0123456789abcdef0123456789abcdef01234567:src/db.c:1 -->',
+    '- Flag callers of `emptyDB`.',
+    '<!-- /suppressed -->',
+    '- Flag callers of `emptyData`.',
+  ].join('\n'), 'Use when `emptyDB` callers change.');
+  assert.deepEqual([...descriptionOnlyNames(suppressed)], ['emptyDB']);
+  assert.deepEqual([...descriptionOnlyNames('no frontmatter, `emptyDB`')], []);
 });
 
 test('frontmatter lines other than the description are not read', () => {

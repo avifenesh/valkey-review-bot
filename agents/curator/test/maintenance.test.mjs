@@ -1002,6 +1002,108 @@ test('an applied revision that suppresses the piece citing a lost name stops it 
   assert.equal(item.stale_names, undefined);
 });
 
+// --- Check: names only the description cites ------------------------------
+
+/** A skill whose description cites `emptyDB`, which the tip renamed; the body cites only names still there, plus `body`. */
+const describedMd = (body = []) => [
+  '---',
+  `name: ${NAME}`,
+  'description: Use when a PR changes how `emptyDB` flushes keyspaces.',
+  '---',
+  '',
+  '# Flushing',
+  '',
+  '- Flag callers that never call `signalFlushedDb`.',
+  '- `serverCron` runs the expire cycle.',
+  ...body,
+  '',
+].join('\n');
+const ADVISORY = `advisory: the description cites names absent at unstable@${TIP_SHA.slice(0, 12)}, which only a re-publication changes: \`emptyDB\``;
+/** A check message of its own, as each decay pass sends. */
+const nextCheck = (table, n) => {
+  const id = `check#valkey-review#rec-1#2026-10-2${n}T00:00:00.000Z`;
+  table.put({ ...table.item(KEY), maintenance_id: id, maintenance_requested_at: '2026-10-13T00:00:00.000Z', maintenance_reason: 'check' });
+  return checkMessage({ maintenance_id: id, release_tag: `9.1.${2 + n}`, seen_updated_at: table.item(KEY).updated_at });
+};
+
+test('a name only the description cites is reported as advisory, and never keeps the skill flagged', async () => {
+  const s = setup({
+    item: record({ audit_names: new Set(['emptyDB', 'signalFlushedDb', 'serverCron']) }),
+    skill: { name: NAME, skillMd: describedMd() },
+  });
+  const { result, lines } = await run(checkMessage(), s.deps);
+  assert.deepEqual(result, { status: 'completed', decision: 'clean' });
+  assert.equal(s.modelBuilds(), 0, 'nothing for an audit to fix');
+  let item = s.table.item(KEY);
+  assert.equal(item.check_outcome, 'clean');
+  assert.equal(item.verified_sha, TIP_SHA);
+  assert.ok(item.check_note.endsWith(`; ${ADVISORY}`), item.check_note);
+  assert.ok(item.check_note.length <= 500);
+  for (const attr of ['lost_names', 'stale_names', 'ignored_names', 'pending_revision']) assert.equal(item[attr], undefined, attr);
+  assert.deepEqual(set(item.audit_names), ['serverCron', 'signalFlushedDb']);
+  assert.ok(lines.some((l) => l.startsWith('[maintenance] check ') && l.includes(`advisory=${JSON.stringify(ADVISORY)}`)), lines.join('\n'));
+
+  // The next check finds it absent again: still advisory, still no audit.
+  const again = await run(nextCheck(s.table, 1), s.deps);
+  assert.equal(again.result.decision, 'clean');
+  assert.equal(s.modelBuilds(), 0);
+  item = s.table.item(KEY);
+  assert.ok(item.check_note.endsWith(`; ${ADVISORY}`), item.check_note);
+  assert.equal(item.lost_names, undefined);
+});
+
+test('a name only the description cites never refuses an accurate verdict', async () => {
+  const s = setup({
+    item: record({ audit_names: new Set(['emptyDB', 'signalFlushedDb', 'serverCron']) }),
+    skill: { name: NAME, skillMd: describedMd(['- Use `flushPlaceholder_x` for the callback.']) },
+    turns: [report('accurate')],
+  });
+  const { result } = await run(checkMessage(), s.deps);
+  assert.equal(result.decision, 'accurate');
+  assert.equal(s.model.calls, 1, 'accepted at the first report');
+  const item = s.table.item(KEY);
+  assert.equal(item.pending_revision, undefined);
+  assert.deepEqual(set(item.ignored_names), ['flushPlaceholder_x']);
+  assert.equal(item.lost_names, undefined);
+  assert.ok(item.check_note.startsWith('1 flagged name(s) judged accurate'), item.check_note);
+  assert.ok(item.check_note.endsWith(`; ${ADVISORY}`), item.check_note);
+});
+
+test('an applied revision whose body no longer cites a lost name the description cites leaves it advisory, not lost', async () => {
+  const md = describedMd(['- Flag callers of `emptyDB` that never call `signalFlushedDb`.']);
+  const s = setup({
+    item: record({ audit_names: new Set(['emptyDB', 'signalFlushedDb', 'serverCron']) }),
+    skill: { name: NAME, skillMd: md },
+    turns: [report('revise', [EDIT])],
+    settings: { checkApplyEdits: true },
+  });
+  assert.equal((await run(checkMessage(), s.deps)).result.decision, 'revised');
+  let item = s.table.item(KEY);
+  assert.equal(item.lost_names, undefined);
+  assert.equal(item.stale_names, undefined);
+  assert.ok(item.check_note.endsWith(`; ${ADVISORY}`), item.check_note);
+
+  // The edited skill is clean at the next check, with no audit.
+  const again = await run(nextCheck(s.table, 1), s.deps);
+  assert.equal(again.result.decision, 'clean');
+  assert.equal(s.model.calls, 1, 'only the first check ran an audit');
+  item = s.table.item(KEY);
+  assert.ok(item.check_note.endsWith(`; ${ADVISORY}`), item.check_note);
+});
+
+test('a description name an earlier audit judged accurate is no advisory, and one present is none either', async () => {
+  const s = setup({
+    item: record({ audit_names: new Set(['signalFlushedDb', 'serverCron']), ignored_names: new Set(['emptyDB']) }),
+    skill: { name: NAME, skillMd: describedMd() },
+  });
+  assert.equal((await run(checkMessage(), s.deps)).result.decision, 'clean');
+  assert.equal(s.table.item(KEY).check_note.includes('advisory'), false);
+  // SKILL_MD's description cites `src/db.c`, which the tip has.
+  const present = setup({ item: record({ audit_names: new Set(['src/db.c', 'signalFlushedDb', 'serverCron']) }), skill: { name: NAME, skillMd: SKILL_MD.replace(/.*emptyDB.*\n/, '') } });
+  assert.equal((await run(checkMessage(), present.deps)).result.decision, 'clean');
+  assert.equal(present.table.item(KEY).check_note.includes('advisory'), false);
+});
+
 test('names lost at earlier checks count toward an obsolete verdict\'s evidence', async () => {
   const md = '---\nname: db-flush\ndescription: Use when.\n---\n\n- `serverCron` runs before `emptyDB` and `flushAllGone`.\n';
   const s = setup({

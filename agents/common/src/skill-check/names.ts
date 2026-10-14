@@ -11,6 +11,10 @@
  * that edits.ts parseSuppressed reads as well formed count; reviewers
  * get any other piece as live text, so its names are checked.
  *
+ * A release check edits only the body, never the frontmatter (edits.ts),
+ * so it cannot correct a name only the description cites.
+ * descriptionOnlyNames lists those, so a check can tell them apart.
+ *
  * No runtime imports, so scripts can load this file directly under
  * Node's type stripping.
  */
@@ -268,6 +272,41 @@ function bareDescriptionName(word: string): CitedName | null {
   return null;
 }
 
+/** The name a code span cites, or null when it cites none. */
+function fromSpan(span: string): CitedName | null {
+  if (span.length < SPAN_MIN_CHARS || span.length > SPAN_MAX_CHARS) return null;
+  const token = normalizeSpan(span);
+  const kind = token === null ? null : classifyToken(token);
+  return kind ? { token: token!, kind } : null;
+}
+
+/** The names the frontmatter description cites, and those the body cites, each in document order with repeats. */
+function citedParts(skillMd: string): { description: CitedName[]; body: CitedName[] } {
+  const lines = skillMd.split('\n').map((l) => l.replace(/\r$/, ''));
+  const fmEnd = frontmatterEnd(lines);
+  const description: CitedName[] = [];
+  const body: CitedName[] = [];
+  const push = (list: CitedName[], name: CitedName | null) => {
+    if (name) list.push(name);
+  };
+
+  if (fmEnd > 0) {
+    const text = frontmatterDescription(lines.slice(1, fmEnd));
+    for (const m of text.matchAll(/`([^`]+)`|[^\s`]+/g)) {
+      push(description, m[1] !== undefined ? fromSpan(m[1]) : bareDescriptionName(m[0]));
+    }
+  }
+
+  const bodyLines = lines.slice(fmEnd + 1);
+  const fenced = fencedLines(bodyLines);
+  const suppressed = suppressedLines(bodyLines, fenced);
+  bodyLines.forEach((line, i) => {
+    if (fenced[i] || suppressed[i]) return;
+    for (const span of codeSpans(line)) push(body, fromSpan(span));
+  });
+  return { description, body };
+}
+
 /**
  * The code names a skill cites, first-seen order, at most MAX_NAMES.
  * Body names come from inline code spans outside fenced blocks and
@@ -275,35 +314,25 @@ function bareDescriptionName(word: string): CitedName | null {
  * and its bare path-like and `A::b` words.
  */
 export function extractNames(skillMd: string): CitedName[] {
-  const lines = skillMd.split('\n').map((l) => l.replace(/\r$/, ''));
-  const fmEnd = frontmatterEnd(lines);
+  const { description, body } = citedParts(skillMd);
   const out: CitedName[] = [];
   const seen = new Set<string>();
-  const add = (name: CitedName | null) => {
-    if (!name || seen.has(name.token) || out.length >= MAX_NAMES) return;
+  for (const name of [...description, ...body]) {
+    if (seen.has(name.token) || out.length >= MAX_NAMES) continue;
     seen.add(name.token);
     out.push(name);
-  };
-  const fromSpan = (span: string): CitedName | null => {
-    if (span.length < SPAN_MIN_CHARS || span.length > SPAN_MAX_CHARS) return null;
-    const token = normalizeSpan(span);
-    const kind = token === null ? null : classifyToken(token);
-    return kind ? { token: token!, kind } : null;
-  };
-
-  if (fmEnd > 0) {
-    const description = frontmatterDescription(lines.slice(1, fmEnd));
-    for (const m of description.matchAll(/`([^`]+)`|[^\s`]+/g)) {
-      add(m[1] !== undefined ? fromSpan(m[1]) : bareDescriptionName(m[0]));
-    }
   }
-
-  const body = lines.slice(fmEnd + 1);
-  const fenced = fencedLines(body);
-  const suppressed = suppressedLines(body, fenced);
-  body.forEach((line, i) => {
-    if (fenced[i] || suppressed[i]) return;
-    for (const span of codeSpans(line)) add(fromSpan(span));
-  });
   return out;
+}
+
+/**
+ * The tokens of extractNames that the frontmatter description cites and
+ * the body does not: a release-check edit can change no occurrence of
+ * them. A check reports such a name when it is absent, and does not hold
+ * it against the skill, since only a re-publication can change it.
+ */
+export function descriptionOnlyNames(skillMd: string): Set<string> {
+  const { description, body } = citedParts(skillMd);
+  const inBody = new Set(body.map((n) => n.token));
+  return new Set(description.map((n) => n.token).filter((t) => !inBody.has(t)));
 }

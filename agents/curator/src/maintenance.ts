@@ -15,7 +15,7 @@ import {
   type SkillRecord,
   type UpsertSkillInput,
 } from '../../common/src/skills-registry.js';
-import { extractNames } from '../../common/src/skill-check/names.js';
+import { descriptionOnlyNames, extractNames, type CitedName } from '../../common/src/skill-check/names.js';
 import { areaFileCounts, checkSkill, confirmableCommit, type CheckResult } from '../../common/src/skill-check/check.js';
 import {
   formatCitation,
@@ -91,6 +91,17 @@ import type { SkillPublisher } from './tools/submit-skill.js';
  * and it never goes into ignored_names. A check that finds it present
  * again, or a skill that no longer cites it (an applied revision
  * suppresses the piece that did), drops it.
+ *
+ * Description names. A release check never edits the frontmatter, so it
+ * cannot correct a name that only the description cites
+ * (descriptionOnlyNames). Such a name counts for presence, for the
+ * obsolete rule's evidence and for a suspect check's standing penalty,
+ * but it is never flagged, lost or new and absent to the audit or the
+ * record: it never refuses an "accurate" verdict, never goes into
+ * lost_names, stale_names or ignored_names, and leaves the baseline once
+ * absent like any other. While one is absent, every check_note ends with
+ * an advisory that names it, for the operator and the feedback path,
+ * whose re-publication can change it.
  *
  * Report mode. A dry_run message, or a switch that is off
  * (CHECK_APPLY_EDITS, RETIRE_SKILLS, CHECK_OPEN_PULL_REQUESTS), never
@@ -414,6 +425,8 @@ class Run {
   readonly now: Date;
   readonly nowIso: string;
   item: Item | undefined;
+  /** The check's advisory (advisoryText), which every check_note it writes ends with; '' when none. */
+  advisory = '';
   /**
    * The write that releases the claim removes the retirement marker: this
    * run read the registry record as DRAFT, PENDING_APPROVAL or APPROVED,
@@ -453,6 +466,12 @@ class Run {
       if (isConditionFailure(err)) return false;
       throw err;
     }
+  }
+
+  /** A check_note: `text`, then the advisory, within CHECK_NOTE_MAX. */
+  noted(text: string): string {
+    if (!this.advisory) return text;
+    return `${text.slice(0, CHECK_NOTE_MAX - this.advisory.length - 2)}; ${this.advisory}`;
   }
 
   /** REMOVE the claim in `w`, and the marker when dropsMarker says so. */
@@ -495,6 +514,7 @@ class Run {
       reviewer: this.req.reviewer_id,
       ...(this.req.reason === 'repo_check' ? {} : { bucket: this.req.area_bucket, id: this.req.record_id, name: this.name }),
       ...fields,
+      ...(kind === this.req.reason && this.advisory ? { advisory: this.advisory } : {}),
       dry_run: this.req.dry_run,
       maintenance: this.req.maintenance_id,
     }));
@@ -687,7 +707,8 @@ interface Checked {
   /**
    * The result as the audit and the record see it: `lost` also holds the
    * names of lost_names still cited and absent (`carried`), and
-   * `newAbsent` no longer does.
+   * `newAbsent` no longer does; no flagged list holds a name only the
+   * description cites.
    */
   readonly view: CheckResult;
   readonly baseline: readonly string[];
@@ -718,6 +739,25 @@ function nameList(list: readonly string[], room: number): string {
 function note(head: string, list: readonly string[] = []): string {
   const text = list.length ? `${head}: ${nameList(list, CHECK_NOTE_MAX - head.length - 2)}` : head;
   return text.slice(0, CHECK_NOTE_MAX);
+}
+
+/** Characters the advisory takes in a check_note at most. */
+const ADVISORY_MAX = 220;
+
+/**
+ * Names only the description cites that are absent at the tip, and no
+ * earlier audit judged accurate: the advisory's names.
+ */
+function advisoryNames(cited: readonly CitedName[], descOnly: ReadonlySet<string>, counts: ReadonlyMap<string, number>, ignored: readonly string[]): string[] {
+  const skip = new Set(ignored);
+  return cited.map((n) => n.token).filter((t) => descOnly.has(t) && !skip.has(t) && (counts.get(t) ?? 0) === 0);
+}
+
+/** The advisory part of a check_note, '' without names. */
+function advisoryText(list: readonly string[], ref: string): string {
+  if (list.length === 0) return '';
+  const head = `advisory: the description cites names absent at ${ref}, which only a re-publication changes`;
+  return `${head}: ${nameList(list, ADVISORY_MAX - head.length - 2)}`;
 }
 
 /** The note of a check with nothing flagged whose diff was not examined in full. */
@@ -823,7 +863,7 @@ function outcomeWrite(run: Run, v: Outcome): Write {
   const tag = run.req.reason === 'repo_check' || run.req.reason === 'check' ? run.req.release_tag : '';
   return run.releasing(new Write()
     .set('check_outcome', v.outcome)
-    .set('check_note', v.note)
+    .set('check_note', run.noted(v.note))
     .set('verified_release', tag)
     .set('verified_at', run.nowIso));
 }
@@ -947,7 +987,7 @@ async function inconclusive(run: Run, why: string, fields: LogFields = {}, c?: C
     return completed('inconclusive');
   }
   const recorded = await writeRetried(run, (it) => {
-    const w = new Write().set('check_outcome', 'inconclusive').set('check_note', note(why));
+    const w = new Write().set('check_outcome', 'inconclusive').set('check_note', run.noted(note(why)));
     // A check that ran: a partial result counts, since the verification does not move.
     if (c) countPartial(w, run, c, it);
     return w;
@@ -1022,6 +1062,8 @@ async function* withCheckout<T>(
     try {
       const cited = extractNames(skillMd);
       const citedSet = new Set(cited.map((n) => n.token));
+      const descOnly = descriptionOnlyNames(skillMd);
+      const flaggable = (n: string) => !descOnly.has(n);
       const baseline = names(baselineFrom.audit_names).filter((n) => citedSet.has(n));
       const lostBefore = new Set(names(baselineFrom.lost_names));
       const ignored = names(baselineFrom.ignored_names).filter((n) => !lostBefore.has(n));
@@ -1037,17 +1079,24 @@ async function* withCheckout<T>(
       }
       // A name lost before is outside the baseline, so the library calls it new and absent.
       const carried = result.newAbsent.filter((n) => lostBefore.has(n));
+      const lost = [...result.lost, ...carried].filter(flaggable);
+      const newAbsent = result.newAbsent.filter((n) => !lostBefore.has(n) && flaggable(n));
+      const touched = result.touched.filter(flaggable);
       const view: CheckResult = {
         ...result,
-        lost: [...result.lost, ...carried],
-        newAbsent: result.newAbsent.filter((n) => !lostBefore.has(n)),
+        lost,
+        newAbsent,
+        touched,
+        excerpts: result.excerpts.map((e) => ({ ...e, names: e.names.filter(flaggable) })).filter((e) => e.names.length > 0),
+        clean: lost.length === 0 && newAbsent.length === 0 && touched.length === 0 && result.incomplete.length === 0,
       };
       const tag = run.req.reason === 'retire' ? '' : run.req.release_tag;
+      const ref = `${co.defaultBranch}@${co.tipSha.slice(0, 12)}`;
       checked = {
-        dir, co, upstream, base, result, view, baseline, carried, ignored, skillMd,
-        ref: `${co.defaultBranch}@${co.tipSha.slice(0, 12)}`,
+        dir, co, upstream, base, result, view, baseline, carried, ignored, skillMd, ref,
         label: releaseLabel(tag, co.defaultBranch, co.tipSha),
       };
+      run.advisory = advisoryText(advisoryNames(cited, descOnly, result.counts, ignored), ref);
     } catch (err) {
       console.warn(`[maintenance] check of ${upstream} failed: ${errorText(err)}`);
       return await onError('the deterministic check failed');
@@ -1267,7 +1316,7 @@ async function* checkBody(run: Run, req: CheckRequest, c: Checked, skill: SkillR
   }
 
   if (report.verdict === 'obsolete' && valid && await obsoleteCorroborated(c, areaGlobs(item))) {
-    const v: Outcome = { outcome: 'obsolete', note: flaggedNote(`the skill's subject is gone (${r.lost.length} of ${c.baseline.length + c.carried.length} names lost)`) };
+    const v: Outcome = { outcome: 'obsolete', note: flaggedNote(`the skill's subject is gone (${c.result.lost.length + c.carried.length} of ${c.baseline.length + c.carried.length} names lost)`) };
     // What was written: a reinforcement since the read turns the finding into a suspect one.
     const written: { outcome: 'obsolete' | 'suspect' } = { outcome: 'obsolete' };
     const recorded = await finishCheck(run, (it, notReinforced) => {
@@ -1358,9 +1407,13 @@ async function* applyRevision(
     return completed('error');
   }
 
-  // The new text's names, checked in the same checkout.
+  // The new text's names, checked in the same checkout. The frontmatter
+  // is the same, but a name the edits took out of the body may now be
+  // one only the description cites.
   const cited = extractNames(edited);
+  const descOnly = descriptionOnlyNames(edited);
   const citedSet = new Set(cited.map((n) => n.token));
+  const inBody = new Set([...citedSet].filter((t) => !descOnly.has(t)));
   const item = run.item!;
   const baseline = c.baseline.filter((n) => citedSet.has(n));
   let after: CheckResult;
@@ -1370,9 +1423,10 @@ async function* applyRevision(
     console.warn(`[maintenance] re-check of ${quoted(run.name)} failed: ${errorText(err)}`);
     after = { ...c.result, lost: [], newAbsent: [], keptFraction: 1 };
   }
-  const remaining = [...after.lost, ...after.newAbsent];
-  // A lost name the edits suppressed is no longer cited, and stops being lost.
-  const stillLost = c.view.lost.filter((n) => citedSet.has(n));
+  const remaining = [...after.lost, ...after.newAbsent].filter((n) => inBody.has(n));
+  // A lost name the edits suppressed is no longer cited in the body, and stops being lost.
+  const stillLost = c.view.lost.filter((n) => inBody.has(n));
+  run.advisory = advisoryText(advisoryNames(cited, descOnly, after.counts, c.ignored), c.ref);
   const v: Outcome = {
     outcome: 'revised',
     note: advanced(ver, c, remaining.length
