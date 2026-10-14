@@ -78,6 +78,31 @@ export function fromItem(item) {
 }
 
 /**
+ * A plain value as a DynamoDB attribute value (typed JSON), the way the
+ * SDK's document client writes it: strings S, finite numbers N, booleans
+ * BOOL, null NULL, arrays L and plain objects M. Throws for anything else
+ * (sets included), so nothing is written in a shape the reader would not
+ * expect.
+ */
+export function toAttribute(value) {
+  if (typeof value === 'string') return { S: value };
+  if (typeof value === 'number') {
+    if (!Number.isFinite(value)) throw new Error(`cannot write the number ${value} to DynamoDB`);
+    return { N: String(value) };
+  }
+  if (typeof value === 'boolean') return { BOOL: value };
+  if (value === null) return { NULL: true };
+  if (Array.isArray(value)) return { L: value.map(toAttribute) };
+  if (typeof value === 'object' && Object.getPrototypeOf(value) === Object.prototype) return { M: toItem(value) };
+  throw new Error(`cannot write a ${typeof value} value to DynamoDB`);
+}
+
+/** A plain object as a DynamoDB item (typed JSON); undefined values are left out. */
+export function toItem(item) {
+  return Object.fromEntries(Object.entries(item).filter(([, v]) => v !== undefined).map(([k, v]) => [k, toAttribute(v)]));
+}
+
+/**
  * Every item of a table, read with `aws dynamodb scan` (the CLI follows
  * pagination), as plain objects. `names` maps #placeholders to attribute
  * names for `projection` and `filter`; `values` holds typed values.

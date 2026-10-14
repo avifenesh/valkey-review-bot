@@ -17,7 +17,8 @@ export const DEFAULT_CHECK_LIMIT = 10;
 const DAY_MS = 24 * 3600 * 1000;
 const CHECK_STAGGER_SECONDS = 60;
 const MAX_DELAY_SECONDS = 900;
-const RECORD_NAME_RE = /^[a-z0-9][a-z0-9-]{0,99}$/;
+/** A graduated_record_name the decay pass can put in a maintenance message (RECORD_NAME_RE in ops/src/decay.ts). */
+export const RECORD_NAME_RE = /^[a-z0-9][a-z0-9-]{0,99}$/;
 export const REVIEWER_ID_RE = /^[a-z0-9][a-z0-9-]{0,99}$/;
 const MAX_MAINTENANCE_ID = 200;
 const MAX_AREA_BUCKET = 200;
