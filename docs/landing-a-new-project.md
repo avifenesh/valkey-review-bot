@@ -178,8 +178,10 @@ Each of these lists the agents or reviewer ids by hand:
 - `agents/curator/config/prompt.md` and `agents/curator/config/skill.md`: the list of
   reviewers and their repositories, and the `area_bucket` examples. They ship with the
   curator stack at deploy.
-- Docs that count reviewers, images or registries: `README.md`, `infra/README.md`
-  ("three images", "three registries", the `skillsRegistries` and `agents` tables) and
+- Docs that count or name the reviewers, images or registries: `README.md`,
+  `infra/README.md` (the Stacks table, "three images", "three registries", "All three
+  are required" and the `skillsRegistries` table, the routes `reviewer` row, the
+  `upstreamRepos` defaults table and the `agents` table) and
   [architecture.md](architecture.md).
 
 ## 6. AWS and GitHub setup
@@ -193,9 +195,11 @@ These steps are for the operator of each deployment.
    not change. The token broker refuses a token unless the installation's account owns
    the repository, so install it from the account that owns `valkey-io/valkey-search`.
 3. Add a route in `infra/deploy.config.json`. Start narrow: `mentionOnly` or an
-   `authorAllowlist`. `threadReplyReview` (default `false`) can be on from the start:
-   it only lets maintainers answer the bot in threads it started, and those runs do not
-   use the daily budget. The example below turns it on.
+   `authorAllowlist`. `threadReplyReview` (default `false`) can be on from the start.
+   It lets users with push access start a run by tagging the bot in a reply in any
+   review thread: in the bot's own threads the run answers the reply, and in other
+   threads it is an ordinary summons. Neither uses the daily budget. The example below
+   turns it on.
 
    ```json
    {
@@ -262,8 +266,17 @@ are deployment-wide, so a new reviewer gets whatever the deployment has. See
 `agents/valkey-search-review/config/skill.md` ships with the code. It changes by pull
 request only, never in place. Merge it to `skillsRepo.baseBranch` before the first
 deploy of the new reviewer: the first decay pass after a known GA release queues a check
-of the file, and if the file is not on that branch yet the check finds nothing to read,
-is recorded as an error, and runs again at each daily pass until the file is there.
+of the file. If the file is not on that branch yet, the check finds nothing to read and
+is recorded as an error at that release, and the file is not checked again until the
+upstream's next GA release. After you merge the file, queue the check at once with a
+manual decay pass, which also makes every live graduated skill due (within
+`checksPerDay`). The function name is the `DecayFnName` output of `ValkeyReviewerDecay`:
+
+```sh
+aws lambda invoke --function-name DECAY_FN_NAME \
+  --cli-binary-format raw-in-base64-out --cli-read-timeout 360 \
+  --payload '{"recheck_all":true}' decay-result.json
+```
 
 - The decay job queues one check of the file per GA release of the upstream. The
   curator reads the file from `skillsRepo.repo` at `skillsRepo.baseBranch` without
@@ -304,11 +317,17 @@ Between releases, check the file yourself with `scripts/skill-facts.mjs` (sectio
    repository cannot be in both lists.
 3. Deploy with the route on `mentionOnly`, and mention the bot on a test pull request.
    Then check:
-   - the receiver logs `[mention] ... decision=enqueued:mention#issue_comment-<id>`;
+   - the receiver logs a `[delivery]` line for the comment:
+     `[delivery] event=issue_comment action=created ... status=200 decision=enqueued:mention#issue_comment-<id>`.
+     A tagged reply in a review thread on a `threadReplyReview` route also logs
+     `[mention] repo=... pr=... decision=enqueued:mention#review_comment-<id>`;
    - the reviewer runtime's log group has `[invoke]` and `[tool]` lines and no
      `[graduated-skills] registry load failed`;
-   - the review and the state comment appear on the pull request;
-   - the `DeadLetterQueueName<route>` queue of the webhook stack stays empty.
+   - the acknowledgement comment turns into the reply, and the state comment appears
+     on the pull request. A review appears only if the bot made inline comments;
+   - the route's dead-letter queue stays empty. The webhook stack's output for it is
+     `DeadLetterQueueName` plus the route id without hyphens, here
+     `DeadLetterQueueNamevalkeysearchreview`.
 4. `node scripts/registry-skills.mjs list --stack ValkeySearchReviewAgent` reads the
    registry. An empty list is fine.
 5. After the next daily decay pass, the decay job's log has

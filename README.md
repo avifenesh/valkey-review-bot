@@ -82,9 +82,10 @@ happened, and the check then does one of these:
   older release lines.
 - **Retires** it, when deterministic evidence shows its subject is gone from the code.
 
-The built-in skill files in this repository (`agents/*/config/skill.md`) get the same
-check once per release, but are changed only by pull request: the check opens one
-against this repository for maintainers to review. Revisions, retirements and pull
+The reviewers' built-in skill files in this repository
+(`agents/<reviewer>/config/skill.md`) get the same check once per release, but are
+changed only by pull request: the check opens one against this repository for
+maintainers to review. Revisions, retirements and pull
 requests are each off until the operator turns them on. Until then the checks record
 and log what they find, but change no skill text, retire nothing and open no pull
 request.
