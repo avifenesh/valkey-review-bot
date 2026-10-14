@@ -71,10 +71,14 @@ done
 # by '?'. So it cannot move the cursor, hide text or reorder how the
 # terminal shows it, and the operator sees that something was there.
 # One-line fields also have their line breaks and tabs turned into spaces.
+#
+# jq before 1.7 (Debian 12, Ubuntu 22.04) rejects a jq keyword as a
+# $variable name, so no binding below is named label, def, if, as, end,
+# reduce, foreach, try, catch, break or another keyword.
 JQ_PROGRAM='
 def clean: gsub("\r\n"; "\n") | gsub("[^\\t\\n\\P{Cc}]|[\\p{Cf}\\p{Zl}\\p{Zp}]"; "?");
 def line: gsub("\r?\n|\t"; " ") | clean;
-def opt($label; $value): if ($value // "") == "" then "" else "\n    " + $label + ": " + ($value | line) end;
+def opt($name; $value): if ($value // "") == "" then "" else "\n    " + $name + ": " + ($value | line) end;
 
 def maintenance:
   if .maintenance_id.S or .maintenance_requested_at.S then

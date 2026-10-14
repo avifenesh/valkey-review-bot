@@ -1,6 +1,8 @@
 import assert from 'node:assert/strict';
+import { readFileSync } from 'node:fs';
+import path from 'node:path';
 import test from 'node:test';
-import { fakeAwsCli, runShell } from './support/aws.mjs';
+import { fakeAwsCli, runShell, SCRIPTS_DIR } from './support/aws.mjs';
 
 const S = (S) => ({ S });
 const ITEMS = [
@@ -137,4 +139,21 @@ test('bad arguments print the usage and make no call', async () => {
     assert.match(r.stderr, /usage: .*concerns-dump\.sh|--region needs a region/, args.join(' '));
     assert.deepEqual(r.calls, [], args.join(' '));
   }
+});
+
+// The keywords of jq 1.6's lexer. Before 1.7 none of them can follow a
+// '$', so `def f($label)` or `. as $end` fails to compile there, though
+// jq 1.7 and later (CI, macOS) accept it.
+const JQ_KEYWORDS = new Set([
+  'as', 'import', 'include', 'module', 'def', 'if', 'then', 'elif', 'else', 'end', 'and', 'or',
+  'reduce', 'foreach', 'try', 'catch', 'label', 'break', '__loc__',
+]);
+
+test('the jq program binds no jq keyword as a $variable, so jq 1.6 compiles it', () => {
+  const source = readFileSync(path.join(SCRIPTS_DIR, 'concerns-dump.sh'), 'utf8');
+  const program = /^JQ_PROGRAM='([^']*)'/m.exec(source)?.[1];
+  assert.ok(program, 'JQ_PROGRAM not found');
+  const variables = new Set([...program.matchAll(/\$([A-Za-z_][A-Za-z0-9_]*)/g)].map((m) => m[1]));
+  assert.ok(variables.has('value'), 'the program\'s variables were read');
+  assert.deepEqual([...variables].filter((v) => JQ_KEYWORDS.has(v)), []);
 });
