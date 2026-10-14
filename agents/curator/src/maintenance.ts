@@ -647,16 +647,19 @@ async function* retire(run: Run, req: RetireRequest): AsyncGenerator<StreamFrame
     run.log('retire', { outcome: 'pending', registry_status: skill.status, why: 'the registry record is being written; the claim is kept' });
     return completed('pending');
   }
-  run.dropsMarker = LIVE_STATUSES.has(skill.status);
-
   if (req.dry_run || !run.deps.settings.retireSkills) {
+    // The record is live, so a marker an earlier run left can go with the claim.
+    run.dropsMarker = LIVE_STATUSES.has(skill.status);
     await run.release();
     run.log('retire', { outcome: 'would-retire', retired_reason: req.retire_reason, registry_status: skill.status, mode: 'report' });
     return completed('would-retire');
   }
 
   // The marker first, so a deprecation that lands but is never recorded
-  // here is still told apart from an operator's.
+  // here is still told apart from an operator's. If this write loses its
+  // condition, the release must leave the marker alone: a duplicate of this
+  // message may have set it and be deprecating the record now.
+  run.dropsMarker = false;
   if (await run.state(decayPin(new Write().set(MARKER, req.record_name), req)) === false) {
     run.log('retire', { outcome: 'skipped', why: 'the record changed before the deprecation' });
     return skipped('changed');

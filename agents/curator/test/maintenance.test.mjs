@@ -200,6 +200,29 @@ test('a retirement of a record reinforced since the request makes no registry ca
   assert.equal(item.retired_at, undefined);
 });
 
+test('a retirement whose marker write loses its condition leaves a duplicate copy\'s marker in place', async () => {
+  let fired = false;
+  const s = setup({
+    item: record({ ...retireClaim }),
+    settings: { retireSkills: true },
+    hooks: {
+      beforeUpdate: (input, table) => {
+        // A duplicate copy of this message set the marker and is deprecating
+        // the record; this copy's marker write then finds the record changed.
+        if (!fired && input.UpdateExpression.includes('#maintenancedeprecating') && input.UpdateExpression.startsWith('SET')) {
+          fired = true;
+          table.put({ ...table.item(KEY), maintenance_deprecating: NAME, updated_at: '2026-10-12T00:00:00.000Z' });
+        }
+      },
+    },
+  });
+  const { result } = await run(retireMessage(), s.deps);
+  assert.ok(fired);
+  assert.equal(result.status, 'skipped');
+  assert.equal(s.registry.calls.some((c) => c[0] === 'deprecate'), false);
+  assert.equal(s.table.item(KEY).maintenance_deprecating, NAME);
+});
+
 test('a retirement sets the marker, deprecates, then writes the tombstone', async () => {
   let atDeprecate;
   const s = setup({
