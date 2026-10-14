@@ -17,7 +17,7 @@ jobs:
     name: Type-check and test
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
           node-version: 24
@@ -44,7 +44,7 @@ jobs:
     name: CDK synth (example configuration)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
           node-version: 24
@@ -58,7 +58,7 @@ jobs:
     name: Lint agent configs (agnix)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: agent-sh/agnix@2c0e4efede3181599eca37619e8067ae2d941c00 # v0.57.0
         with:
           version: 'v0.57.0'
@@ -70,7 +70,7 @@ jobs:
       SCRUMP_VERSION: v0.1.8
       SCRUMP_SHA256: 7aeb7a48c7f38a7302ea265f501d2e3109910c2c732fe1d64a57373d8b3fcea8
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Install scrump
         run: |
           set -euo pipefail
