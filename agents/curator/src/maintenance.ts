@@ -1124,17 +1124,39 @@ async function* audit(
   }
 }
 
+/** An area entry the obsolete rule can test, once areaEntryGlobs has trimmed it: path and glob characters only. */
+const AREA_ENTRY_RE = /^[A-Za-z0-9_.@+*?\/-]{1,200}$/;
+
+/**
+ * The globs that find the files of one area entry: the entry itself, and
+ * the files under it, for an entry that names a directory (`src/modules`,
+ * `src/modules/`, `glide-core`); a name without '/' is a directory at
+ * any depth, as a glob without '/' matches basenames. A leading '/' or
+ * './' and a trailing '/' are dropped. Null when the entry is no path
+ * glob: other characters (a space, braces, brackets), or an empty, '.'
+ * or '..' component. areaFileCounts matches files only, so without this
+ * a directory-style entry would match nothing whatever the tree holds.
+ */
+function areaEntryGlobs(entry: string): string[] | null {
+  const e = entry.trim().replace(/^(?:\.?\/)+/, '').replace(/\/+$/, '');
+  if (!AREA_ENTRY_RE.test(e) || e.split('/').some((p) => p === '' || p === '.' || p === '..')) return null;
+  return e.includes('/') ? [e, `${e}/**`] : [e, `**/${e}/**`];
+}
+
 /**
  * Whether the skill's subject is gone on deterministic evidence: most of
  * the baseline lost, counting the names earlier checks lost, or no file
- * left in its area.
+ * left in its area. The area is model-written free text, so it counts
+ * only when every entry is a path glob areaEntryGlobs can test: an entry
+ * it cannot test may still name files.
  */
 async function obsoleteCorroborated(c: Checked, area: readonly string[]): Promise<boolean> {
   const baseline = c.baseline.length + c.carried.length;
   const kept = c.baseline.length - c.result.lost.length;
   if (baseline >= 3 && kept / baseline < 0.5) return true;
-  if (area.length === 0) return false;
-  const counts = await areaFileCounts(c.co.git, area);
+  const globs = area.map(areaEntryGlobs);
+  if (globs.length === 0 || globs.some((g) => g === null)) return false;
+  const counts = await areaFileCounts(c.co.git, globs.flatMap((g) => g!));
   return counts.every((n) => n === 0);
 }
 

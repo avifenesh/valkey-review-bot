@@ -1033,6 +1033,28 @@ test('obsolete with every area glob empty sets the score to 0 and records the re
   assert.ok(claimGone(item));
 });
 
+test('area entries that name a directory, or start with a slash, find its files for the obsolete rule', async () => {
+  // src/db.c and src/server.c are in the tip; every entry below covers one of them.
+  for (const area of [['src'], ['src/'], ['/src'], ['/src/**'], ['./src/'], ['db.c'], ['src/*.c'], ['src/gone/**', 'src']]) {
+    const s = setup({ item: record({ area }), turns: [report('obsolete')] });
+    const { result } = await run(checkMessage(), s.deps);
+    assert.equal(result.decision, 'suspect', JSON.stringify(area));
+    const item = s.table.item(KEY);
+    assert.equal(item.obsolete_release, undefined, JSON.stringify(area));
+    assert.equal(item.pending_revision.reason, 'obsolete without deterministic evidence', JSON.stringify(area));
+  }
+  // An entry the rule cannot test may name files: the area does not count.
+  for (const area of [['src/gone/**', 'the db module'], ['{src,lib}/gone/**'], ['src/../gone'], ['/']]) {
+    const s = setup({ item: record({ area }), turns: [report('obsolete')] });
+    assert.equal((await run(checkMessage(), s.deps)).result.decision, 'suspect', JSON.stringify(area));
+  }
+  // A directory that is gone is still evidence.
+  for (const area of [['src/gone'], ['/src/gone/'], ['gone-dir'], ['src/gone/**', '/lib/']]) {
+    const s = setup({ item: record({ area }), turns: [report('obsolete')] });
+    assert.equal((await run(checkMessage(), s.deps)).result.decision, 'obsolete', JSON.stringify(area));
+  }
+});
+
 test('an obsolete finding a reinforcement overtook is recorded, logged and returned as suspect', async () => {
   let bumped = false;
   const s = setup({
