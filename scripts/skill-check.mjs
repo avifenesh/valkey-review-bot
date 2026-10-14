@@ -54,16 +54,18 @@
 // report-mode run starts with the same records again (see below).
 //
 // Report mode (the default): the messages carry dry_run: true. The
-// curator runs each check and records and logs its outcome, but makes no
-// registry change and opens no pull request, whatever its own settings
-// say. A report-mode check advances no record, so the next run starts
-// with the same records: use --name for one skill, or a larger --limit.
-// --apply sends dry_run: false; the curator's skillLifecycle settings
-// (applyEdits, openPullRequests) still decide what it may change.
+// curator runs each check and logs its outcome. It stores only an
+// audit's pending edit (pending_revision, reason "dry run"): it writes no
+// check_outcome, check_note or names, makes no registry change and opens
+// no pull request, whatever its own settings say. A report-mode check
+// advances no record, so the next run starts with the same records: use
+// --name for one skill, or a larger --limit. --apply sends dry_run:
+// false; the curator's skillLifecycle settings (applyEdits,
+// openPullRequests) still decide what it may change.
 //
 // Outcomes: the curator's [maintenance] log lines, and
-// scripts/concerns-dump.sh (check_outcome, check_note, stale names and
-// pending edits).
+// scripts/concerns-dump.sh: pending edits after either mode, and
+// check_outcome, check_note and stale names only after --apply checks.
 //
 // Needs Node 24 or later, the AWS CLI v2, and credentials allowed to call
 // cloudformation:DescribeStacks (for the stack options), dynamodb:Scan and
@@ -165,6 +167,8 @@ if (result.deferred > 0) {
     : 'Run again for them once these checks have run; before that, a new run queues the next ones on top of these.'}`);
 }
 if (result.queued > 0 && !values.plan) {
-  console.log('Outcomes: the curator\'s [maintenance] log lines, and scripts/concerns-dump.sh once the checks have run.');
+  console.log(dryRun
+    ? 'Outcomes: the curator\'s [maintenance] log lines. A report-mode check stores only an audit\'s pending edit, which scripts/concerns-dump.sh shows once the checks have run; it writes no check_outcome or check_note.'
+    : 'Outcomes: the curator\'s [maintenance] log lines, and scripts/concerns-dump.sh (check_outcome, check_note, stale names and pending edits) once the checks have run.');
 }
 if (result.errors > 0) process.exit(1);

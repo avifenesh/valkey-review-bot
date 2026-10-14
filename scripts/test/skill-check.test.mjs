@@ -46,6 +46,8 @@ test('report mode by default: every graduated skill is claimed and queued with d
   ]);
   assert.match(r.stdout, /^report mode: dry_run=true/m);
   assert.match(r.stdout, /^queued 2 check\(s\) on the curator queue; skipped 0; errors 0$/m);
+  // A dry-run check writes no check_outcome or check_note (curator maintenance.ts), so the script does not promise them.
+  assert.match(r.stdout, /^Outcomes: .*A report-mode check stores only an audit's pending edit.*; it writes no check_outcome or check_note\.$/m);
 });
 
 test('--apply sends dry_run false; --name queues one skill; no --release sends an empty tag', async () => {
@@ -53,6 +55,7 @@ test('--apply sends dry_run false; --name queues one skill; no --release sends a
   assert.equal(r.code, 0, r.stderr);
   assert.deepEqual(r.sent.map((m) => [m.record_name, m.release_tag, m.dry_run]), [['emptydb-flush', '', false]]);
   assert.match(r.stdout, /^apply mode: dry_run=false/m);
+  assert.match(r.stdout, /^Outcomes: .*scripts\/concerns-dump\.sh \(check_outcome, check_note, stale names and pending edits\)/m);
 });
 
 test('--table and --queue-url need no stacks; the reviewer comes from the table name or --reviewer', async () => {
