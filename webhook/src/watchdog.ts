@@ -27,6 +27,16 @@ import { heartbeatRunKey, pullRequestRunPrefix } from './review-envelope.js';
  * holds it, the review has never run: any receive is its first attempt,
  * on the primary model, and its heartbeat is not read.
  *
+ * A message can also have lost its marker without running: the marker
+ * expired, or was given back, while the message waited. The worker's
+ * start record tells: before a run starts, the worker writes it with the
+ * message's id, and the runtime's writes keep that id. So a review whose
+ * run key has no record, or a record another message wrote (an earlier
+ * run of a reopen or ready key that was released and used again), has
+ * never run either, and is treated the same way. Only a record without
+ * a message id (one from before start records, or from a worker that may
+ * not write them) is judged by its heartbeat alone.
+ *
  * An automatic review does not start while another review of the same
  * pull request runs. Before it runs, on any attempt, the heartbeats of
  * the pull request's runs are read; while one of them is running and
@@ -85,6 +95,8 @@ export interface HeartbeatRecord {
   readonly status?: string;
   /** Epoch seconds when DynamoDB may delete the record. */
   readonly ttl?: number;
+  /** The queue message whose run wrote the start record (src/invoker.ts claimRunStart). */
+  readonly message_id?: string;
 }
 
 export interface PullRequestRun extends HeartbeatRecord {
@@ -94,6 +106,8 @@ export interface PullRequestRun extends HeartbeatRecord {
 export interface WatchdogInput {
   readonly envelope: Readonly<Record<string, unknown>>;
   readonly receiveCount: number;
+  /** The queue message's id, which its run's start record carries. */
+  readonly messageId: string;
   /** SentTimestamp of the message in epoch milliseconds; 0 when unknown. */
   readonly sentAt: number;
   readonly now: number;
@@ -197,7 +211,11 @@ async function reviewDecision(input: WatchdogInput): Promise<Decision> {
   if (input.holdsMarker) return { action: 'invoke', useFallbackModel: false, reason: 'first attempt, still holding the pending marker' };
 
   const record = await input.readHeartbeat(heartbeatRunKey(input.envelope));
-  if (record?.status === 'completed') return { action: 'delete', reason: 'prior attempt completed' };
+  if (!record) return { action: 'invoke', useFallbackModel: false, reason: 'first attempt, no start record' };
+  if (typeof record.message_id === 'string' && record.message_id !== input.messageId) {
+    return { action: 'invoke', useFallbackModel: false, reason: 'first attempt, the start record is another message\'s' };
+  }
+  if (record.status === 'completed') return { action: 'delete', reason: 'prior attempt completed' };
 
   const elapsedMs = input.sentAt ? input.now - input.sentAt : 0;
   if (elapsedMs > input.runBudgetMs) {
@@ -208,7 +226,7 @@ async function reviewDecision(input: WatchdogInput): Promise<Decision> {
     };
   }
 
-  if (!record?.last_activity) return { action: 'invoke', useFallbackModel: true, reason: 'no heartbeat record' };
+  if (!record.last_activity) return { action: 'invoke', useFallbackModel: true, reason: 'no heartbeat in the record' };
   if (record.status === 'failed') return { action: 'invoke', useFallbackModel: true, reason: 'runtime reported failed' };
   const ageMs = input.now - record.last_activity;
   if (ageMs > input.staleMs) {

@@ -215,6 +215,7 @@ async function handleOne(record: SqsRecord): Promise<void> {
   const decision = await decide({
     envelope,
     receiveCount,
+    messageId: record.messageId,
     sentAt: parseInt(record.attributes?.SentTimestamp ?? '0', 10),
     now: Date.now(),
     runBudgetMs: config.runBudgetMs,

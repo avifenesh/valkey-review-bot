@@ -24,6 +24,7 @@ function input(overrides = {}) {
     value: {
       envelope: review,
       receiveCount: 2,
+      messageId: 'm1',
       sentAt: NOW - 20 * MIN,
       now: NOW,
       runBudgetMs: 90 * MIN,
@@ -64,8 +65,9 @@ test('a live run is left alone until the next visibility timeout', async () => {
 
 test('a dead run is retried on the fallback model', async () => {
   for (const record of [
-    undefined,
     { status: 'running' },
+    { status: 'running', last_activity: NOW - 13 * MIN, message_id: 'm1' },
+    { status: 'failed', last_activity: NOW - MIN, message_id: 'm1' },
     { status: 'failed', last_activity: NOW - MIN },
     { status: 'running', last_activity: NOW - 13 * MIN },
   ]) {
@@ -82,7 +84,7 @@ test('the staleness threshold comes from the input', async () => {
 });
 
 test('a review past its run budget is abandoned', async () => {
-  for (const record of [undefined, { status: 'running', last_activity: NOW - MIN }, { status: 'failed', last_activity: NOW - MIN }]) {
+  for (const record of [{ status: 'running', last_activity: NOW - MIN }, { status: 'failed', last_activity: NOW - MIN }, { ...beat(MIN), message_id: 'm1' }]) {
     const { value } = input({ sentAt: NOW - 91 * MIN, receiveCount: 7, ...withHeartbeat(record) });
     const decision = await decide(value);
     assert.equal(decision.action, 'delete', JSON.stringify(record));
@@ -92,6 +94,43 @@ test('a review past its run budget is abandoned', async () => {
 
   const longer = input({ sentAt: NOW - 91 * MIN, runBudgetMs: 120 * MIN });
   assert.equal((await decide(longer.value)).action, 'invoke');
+});
+
+test('a review whose run key has no record has never run: a first attempt on the primary model, even past its budget', async () => {
+  for (const sentAt of [NOW - 20 * MIN, NOW - 91 * MIN]) {
+    const { value } = input({ sentAt, ...withHeartbeat(undefined) });
+    assert.deepEqual(await decide(value), { action: 'invoke', useFallbackModel: false, reason: 'first attempt, no start record' });
+  }
+});
+
+test('a review whose run key holds another message\'s record has never run, whatever that record says', async () => {
+  // An earlier run of a reopen key that was released and used again.
+  for (const record of [
+    { status: 'completed', last_activity: NOW - 30 * MIN, message_id: 'm0' },
+    { ...beat(MIN), message_id: 'm0' },
+    { status: 'running', last_activity: NOW - 30 * MIN, message_id: 'm0' },
+  ]) {
+    for (const sentAt of [NOW - 20 * MIN, NOW - 91 * MIN]) {
+      const { value } = input({ sentAt, ...withHeartbeat(record) });
+      assert.deepEqual(
+        await decide(value),
+        { action: 'invoke', useFallbackModel: false, reason: 'first attempt, the start record is another message\'s' },
+        JSON.stringify(record),
+      );
+    }
+  }
+});
+
+test('a review whose run key holds its own record is judged by that record', async () => {
+  const own = (record) => withHeartbeat({ ...record, message_id: 'm1' });
+  assert.equal((await decide(input(own({ status: 'completed', last_activity: NOW - MIN })).value)).action, 'delete');
+  assert.deepEqual(await decide(input(own(beat(MIN))).value), { action: 'wait', reason: 'heartbeat 60s ago' });
+  assert.deepEqual(await decide(input(own(beat(13 * MIN))).value), { action: 'invoke', useFallbackModel: true, reason: 'heartbeat stale 780s' });
+});
+
+test('a never-run review that lost its marker still waits for another run of its pull request', async () => {
+  const { value } = pushInput([otherRun(beat(MIN))], { receiveCount: 3, holdsMarker: false, readHeartbeat: async () => undefined });
+  assert.deepEqual(await decide(value), { action: 'wait', reason: 'heartbeat 60s ago', otherRun: 'example-org/valkey#7#aaa' });
 });
 
 test('a review that completed is not reported as abandoned once past its budget', async () => {

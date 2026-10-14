@@ -208,7 +208,7 @@ test('a redelivery whose marker is gone is watched like any review', async () =>
   assert.deepEqual(alive.result, { batchItemFailures: [{ itemIdentifier: 'm1' }] });
   assert.deepEqual(ops(), ['GetCommand idempotency', 'GetCommand heartbeat']);
 
-  ddbAnswer = tables({});
+  ddbAnswer = tables({ heartbeat: { status: 'running', last_activity: Date.now() - 13 * 60_000, ttl: ttlAt(Date.now()), message_id: 'm1' } });
   await run(sqsEvent({ ...review, pending_marker: 'marker-1' }, 2));
   assert.deepEqual(ops(), ['GetCommand idempotency', 'GetCommand heartbeat', 'ScanCommand heartbeat', 'UpdateCommand heartbeat', 'InvokeAgentRuntimeCommand']);
   assert.equal(invoked().use_fallback_model, true, 'a run that died is retried on the fallback model');
@@ -347,6 +347,29 @@ test('a forged running record of the pull request holds no automatic review back
     assert.deepEqual(result, { batchItemFailures: [] }, JSON.stringify(forged));
     assert.equal(invokes(), 1);
   }
+});
+
+test('a review that lost its marker before it ever ran runs on the primary model', async () => {
+  // No start record: the review waited at its first receive, and its marker expired meanwhile.
+  ddbAnswer = tables({});
+  const fresh = await run(sqsEvent({ ...review, pending_marker: 'marker-1' }, 2));
+  assert.deepEqual(fresh.result, { batchItemFailures: [] });
+  assert.equal(invoked().use_fallback_model, undefined);
+
+  // The start record of an earlier message with the same run key: a
+  // reopen key that pullRequestLeft released and the next reopen used.
+  const t = memoryTables();
+  const key = 'Example-Org/Valkey#7#bbb#reopened';
+  t.runs.set(key, { status: 'completed', last_activity: Date.now() - 30 * 60_000, ttl: ttlAt(Date.now()), message_id: 'm0' });
+  ddbAnswer = t.answer;
+  const event = sqsEvent({ ...review, run_nonce: 'reopened', pending_marker: 'marker-1', trigger: 'reopened', skip_drafts: false }, 2);
+  event.Records[0].attributes.SentTimestamp = String(Date.now() - 95 * 60_000);
+  const reused = await run(event);
+  assert.deepEqual(reused.result, { batchItemFailures: [] });
+  assert.equal(invokes(), 1, 'not taken for done');
+  assert.equal(invoked().use_fallback_model, undefined);
+  assert.equal(t.runs.get(key).message_id, 'm1');
+  assert.ok(reused.lines.some((l) => l.startsWith('[invoke] review repo=Example-Org/Valkey pr=7 head=bbb attempt=2')), reused.lines.join('\n'));
 });
 
 test('the worker writes the run\'s start record before it lets go of the marker and invokes', async () => {

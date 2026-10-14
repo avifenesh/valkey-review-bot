@@ -95,8 +95,8 @@ export interface InvokerConfig {
    * request's pending marker until the worker starts the run. Empty on
    * the curator's worker. A review worker without it leaves markers to
    * expire, and automatic reviews of that pull request are skipped until
-   * then; it also cannot tell a review that waited for another one from
-   * a run that died, so such a review runs on the fallback model.
+   * then. It still tells a review that never ran from a run that died,
+   * by the run's start record (src/watchdog.ts).
    */
   readonly idempotencyTable: string;
 }
