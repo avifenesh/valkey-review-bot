@@ -502,7 +502,12 @@ pull request. A dry run (below) records even less.
    node scripts/registry-skills.mjs adopt --stack ValkeyReviewAgent --curator-stack ValkeyReviewerCurator --region REGION
    node scripts/registry-skills.mjs adopt --stack ValkeyReviewAgent --curator-stack ValkeyReviewerCurator --region REGION --apply
    ```
-   Do the same for `ValkeyGlideReviewAgent`. Read the `would-adopt` lines
+   Do the same for `ValkeyGlideReviewAgent`. A skill that cites no
+   directory, only bare file names such as `server.c`, goes to the bucket
+   `--bucket` names (default `**`, which the curator never lists, so
+   maintainers could not reinforce it): pass the project's main source
+   directory, for example `--bucket src` for Valkey and
+   `--bucket glide-core` for GLIDE. Read the `would-adopt` lines
    before `--apply`: each shows the record's `area`, and if no upstream
    file matches it, a check can confirm an `obsolete` verdict and retire
    the skill. Do not deprecate orphans instead: `DEPRECATED` is final, and

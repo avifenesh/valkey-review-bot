@@ -94,15 +94,19 @@ setting a new reviewer touches, and starts with the issue step 1 asks for.
 The repository has one npm package per component. Node.js 24 or later is required.
 
 ```sh
-for pkg in agents/common agents/curator agents/valkey-review agents/valkey-glide-review webhook ops infra scripts; do
-  (cd "$pkg" && npm ci && npm run --if-present typecheck && npm run --if-present test)
-done
+pkgs="agents/common agents/curator agents/valkey-review agents/valkey-glide-review webhook ops infra scripts"
+for pkg in $pkgs; do (cd "$pkg" && npm ci); done
+for pkg in $pkgs; do (cd "$pkg" && npm run --if-present typecheck && npm run --if-present test); done
 ```
+
+Install every package before testing any: some tests load code from another
+package (the curator's lifecycle test runs the decay job from `ops`, for
+example).
 
 `scripts` holds the operator scripts and their tests. It has no dependencies of
 its own: its tests (`npm test` there, or `node --test scripts/test/*.test.mjs`
 from the repository root) load code from `agents/common` and `ops`, so run
-`npm ci` in those two first, as the loop does. They also need git, bash and jq.
+`npm ci` in those two first, as the install loop does. They also need git, bash and jq.
 They call no AWS service: a fake `aws` executable stands in for the AWS CLI.
 
 To check that the CDK app still synthesizes, using placeholder values only:
