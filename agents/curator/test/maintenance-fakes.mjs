@@ -16,8 +16,8 @@ export function conditionFailed() {
 
 /**
  * One condition clause against an item: `#n = :v`, `#n <> :v`,
- * attribute_exists, attribute_not_exists, or an OR of those in
- * parentheses. Anything else throws, so a test cannot pass on a clause it
+ * `#n >= :v` (numbers), attribute_exists, attribute_not_exists, or an
+ * OR of those in parentheses. Anything else throws, so a test cannot pass on a clause it
  * did not evaluate.
  */
 function clauseHolds(item, clause, names, values) {
@@ -29,6 +29,7 @@ function clauseHolds(item, clause, names, values) {
   if ((m = clause.match(/^attribute_not_exists\((#\w+)\)$/))) return attr(m[1]) === undefined;
   if ((m = clause.match(/^(#\w+) = (:\w+)$/))) return attr(m[1]) !== undefined && attr(m[1]) === values[m[2]];
   if ((m = clause.match(/^(#\w+) <> (:\w+)$/))) return attr(m[1]) !== undefined && attr(m[1]) !== values[m[2]];
+  if ((m = clause.match(/^(#\w+) >= (:\w+)$/))) return typeof attr(m[1]) === 'number' && attr(m[1]) >= values[m[2]];
   throw new Error(`cannot evaluate "${clause}"`);
 }
 
@@ -74,7 +75,8 @@ function checkPlaceholders(input) {
 /**
  * A concerns table in memory. `hooks.beforeUpdate(input, table)` runs
  * before each update is evaluated, to model a concurrent writer; it may
- * also throw.
+ * also throw. A scan returns every item in one page, whatever it
+ * projects.
  */
 export function memoryTable(items = [], hooks = {}) {
   const keyOf = (key) => `${key.area_bucket}\u0000${key.record_id}`;
@@ -99,9 +101,11 @@ export function memoryTable(items = [], hooks = {}) {
         await hooks.beforeUpdate?.(input, table);
         const current = rows.get(keyOf(input.Key));
         if (!conditionHolds(current, input)) throw conditionFailed();
-        rows.set(keyOf(input.Key), applyUpdate(current, input));
-        return {};
+        const next = applyUpdate(current, input);
+        rows.set(keyOf(input.Key), next);
+        return input.ReturnValues === 'ALL_NEW' ? { Attributes: structuredClone(next) } : {};
       }
+      if (op === 'ScanCommand') return { Items: [...rows.values()].map((row) => structuredClone(row)) };
       throw new Error(`unexpected ${op}`);
     },
   };

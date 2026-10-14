@@ -230,6 +230,8 @@ const NAMES: Readonly<Record<string, string>> = {
   '#mra': 'maintenance_requested_at',
   '#mr': 'maintenance_reason',
   '#mdep': 'maintenance_deprecating',
+  '#ds': 'decay_score',
+  '#da': 'decayed_at',
 };
 
 /**
@@ -239,8 +241,17 @@ const NAMES: Readonly<Record<string, string>> = {
  * after verified_at and queues a check of the new text. audit_names,
  * ignored_names and verified_* stay, so that check compares against the
  * old baseline.
+ *
+ * An obsolete finding (obsolete_release) also set decay_score to 0. The
+ * publish that clears the finding restores the standing it took as a
+ * reinforcement does (RESTORED_ON_PUBLISH): decay_score 1.0, counted
+ * from now. Without that, the next pass would see a score below the
+ * floor and retire the corrected skill as decayed before any check.
  */
 const CLEARED_ON_PUBLISH = '#sn, #ss, #or, #pr, #ret, #rr, #rfs, #rra, #mid, #mra, #mr';
+
+/** decay_score and decayed_at as the decay pass reads them: 1.0, set now (ops/src/decay.ts). */
+const RESTORED_ON_PUBLISH = '#ds = :full, #da = :now';
 
 /** A queued check or retirement of the old text is void once a new text is claimed. */
 const CANCEL_MAINTENANCE = 'REMOVE #mid, #mra, #mr';
@@ -556,8 +567,13 @@ Do not delete the source record afterwards; it stays as the skill's provenance.`
 
         // Claim the name first, conditioned on the state it was chosen
         // from, so two runs submitting the same record agree on one
-        // registry record.
-        await deps.ddb.send(updateCommand(deps.table, key, target.update, target.conditions, target.values));
+        // registry record. The claim also holds obsolete_release as read,
+        // since the write after the publish restores the standing from
+        // it, and it voids any check that could set it afterwards.
+        const claimConditions = [...target.conditions];
+        const claimValues = { ...target.values };
+        asRead(claimConditions, claimValues, '#or', ':readOr', source.obsolete_release);
+        await deps.ddb.send(updateCommand(deps.table, key, target.update, claimConditions, claimValues));
 
         let result: Awaited<ReturnType<SkillPublisher['upsert']>>;
         try {
@@ -589,10 +605,12 @@ Do not delete the source record afterwards; it stays as the skill's provenance.`
         // until a reinforcement and submit_skill finish the publication
         // under the same name (chooseTarget).
         const now = new Date().toISOString();
+        const restore = source.obsolete_release !== undefined;
         try {
-          await sendWithRetries(deps, () => updateCommand(deps.table, key, `SET #ga = :now REMOVE ${cleared}`, ['#grn = :name'], {
+          await sendWithRetries(deps, () => updateCommand(deps.table, key, `SET #ga = :now${restore ? `, ${RESTORED_ON_PUBLISH}` : ''} REMOVE ${cleared}`, ['#grn = :name'], {
             ':now': now,
             ':name': target.name,
+            ...(restore ? { ':full': 1.0 } : {}),
           }));
         } catch (err) {
           // The ids are the model's input: quoted, as every model-written string in the log is.

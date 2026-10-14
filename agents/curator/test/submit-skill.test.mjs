@@ -845,6 +845,48 @@ test('publishing clears the old text\'s check and maintenance state and keeps th
   assertUpdatesWellFormed(w.ddb);
 });
 
+test('a re-publication that clears an obsolete finding restores the standing the finding took', async () => {
+  const before = Date.now();
+  for (const [label, reinforced, edited] of [['update_concern', false, true], ['bump', true, false]]) {
+    const w = world({
+      item: live({ obsolete_release: '9.1.2', decay_score: 0, decayed_at: '2026-10-01T00:00:00.000Z', check_outcome: 'obsolete' }),
+      skills: { [OLD]: { status: 'DRAFT', skillMd: 'live body' } },
+      reinforced,
+      edited,
+    });
+    const out = parse(await w.submit.invoke(INPUT));
+    assert.equal(out.ok, true, `${label}: ${out.error}`);
+    const rec = w.record();
+    assert.ok(!('obsolete_release' in rec), label);
+    assert.equal(rec.decay_score, 1, label);
+    assert.ok(Date.parse(rec.decayed_at) >= before, `${label}: the restored score counts from now`);
+    assert.equal(rec.updated_at, '2026-10-01T00:00:00.000Z', `${label}: a re-publication is not a reinforcement`);
+    assertUpdatesWellFormed(w.ddb);
+  }
+
+  // Without an obsolete finding the standing is the decay pass's alone.
+  const plain = world({ item: live({ decay_score: 0.4, decayed_at: '2026-10-01T00:00:00.000Z' }), skills: { [OLD]: { status: 'DRAFT', skillMd: 'live body' } }, reinforced: false, edited: true });
+  assert.equal(parse(await plain.submit.invoke(INPUT)).ok, true);
+  assert.equal(plain.record().decay_score, 0.4);
+  assert.equal(plain.record().decayed_at, '2026-10-01T00:00:00.000Z');
+});
+
+test('an obsolete finding recorded between the read and the claim fails the claim', async () => {
+  const isClaim = (command) => command.constructor.name === 'UpdateCommand' && command.input.UpdateExpression.startsWith('SET #grn = :name');
+  const w = world({
+    item: live(),
+    skills: { [OLD]: { status: 'DRAFT', skillMd: 'live body' } },
+    reinforced: false,
+    edited: true,
+    intercept: (command, row) => { if (isClaim(command)) Object.assign(row, { obsolete_release: '9.1.2', decay_score: 0 }); },
+  });
+  const out = parse(await w.submit.invoke(INPUT));
+  assert.equal(out.ok, false);
+  assert.match(out.error, /the record changed or graduated under another name while submitting/);
+  assert.ok(!w.registry.calls.some((c) => c.startsWith('upsert')), 'nothing is published');
+  assert.equal(w.record().obsolete_release, '9.1.2', 'the finding stays for the next submit to clear with its standing');
+});
+
 const ago = (ms) => new Date(Date.now() - ms).toISOString();
 const DAY_MS = 24 * 3600 * 1000;
 const CHECK_ID = 'check#valkey-review#r1#2026-10-01T00:00:00.000Z';
