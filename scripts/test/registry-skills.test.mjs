@@ -74,7 +74,9 @@ test('orphans --stack reads the registry and table from the stack and lists the 
   const rows = r.stdout.split('\n').filter((l) => l.includes('\t'));
   assert.deepEqual(rows.map((l) => l.split('\t').slice(0, 3)), [['orphan-a', 'r-e', 'DRAFT'], ['orphan-b', 'r-b', 'APPROVED']]);
   assert.match(r.stdout, /2 live skill\(s\) in registry reg-1 that no concern record in valkey_review_concerns names/);
-  assert.match(r.stdout, /registry-skills\.mjs deprecate --stack ValkeyReviewAgent --record-id RECORD_ID/);
+  // Deprecation is final; the way into the lifecycle is adopt, a dry run unless --apply is added.
+  assert.match(r.stdout, /^ {2}node scripts\/registry-skills\.mjs adopt --stack ValkeyReviewAgent --region eu-west-1$/m);
+  assert.ok(!r.stdout.includes('deprecate'), 'no deprecate command is offered');
   assert.deepEqual(r.calls.map((c) => c.op), ['cloudformation describe-stacks', 'dynamodb scan'], 'the stack is read once');
   assert.ok(r.calls.every((c) => flag(c.args, '--region') === 'eu-west-1'));
   assert.equal(flag(r.calls[1].args, '--table-name'), 'valkey_review_concerns');
@@ -88,6 +90,12 @@ test('orphans with --registry-id and --table needs no stack; none found says so'
   assert.equal(r.code, 0, r.stderr);
   assert.match(r.stdout, /^no orphaned skills in registry reg-1: every live skill has a concern record in valkey_review_concerns$/m);
   assert.deepEqual(r.calls.map((c) => c.op), ['dynamodb scan']);
+});
+
+test('orphans with --registry-id points at adopt with the same registry and table', async () => {
+  const r = await registrySkills(['orphans', '--registry-id', 'reg-1', '--table', 'valkey_review_concerns']);
+  assert.equal(r.code, 0, r.stderr);
+  assert.match(r.stdout, /^ {2}node scripts\/registry-skills\.mjs adopt --registry-id reg-1 --table valkey_review_concerns$/m);
 });
 
 test('orphans refuses a missing table, and --table outside orphans', async () => {

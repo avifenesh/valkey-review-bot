@@ -20,13 +20,14 @@
 // new name.
 //
 // orphans lists the reviewer's skills that are not retired and that no
-// concern record names (graduated_record_name). The decay job used to
-// delete graduated records, so those skills have no source record and the
-// skill lifecycle (standing, checks, retirement) never reaches them.
-// Retire them with deprecate. The concerns table comes from the
-// reviewer stack's ConcernsTableName output, or --table.
+// concern record names (graduated_record_name): skills published by hand,
+// outside the curator, and skills whose source record the old decay job
+// deleted. Reviewers still load them, but the skill lifecycle (decay,
+// release checks, retirement) never reaches them. Bring them in with
+// adopt. The concerns table comes from the reviewer stack's
+// ConcernsTableName output, or --table.
 //
-// adopt gives each skill that orphans lists the concern record it would have if the
+// adopt gives each such skill the concern record it would have if the
 // curator had graduated it, so the decay job decays it on the graduated
 // half-life and queues release checks for it (up to checksPerDay per
 // reviewer per day, never-checked records first). It is a dry run that
@@ -148,11 +149,13 @@ try {
       console.log(`no orphaned skills in registry ${registryId}: every live skill has a concern record in ${table}`);
     } else {
       for (const r of orphans) console.log(row(r));
-      const where = values.stack ? `--stack ${values.stack}` : `--registry-id ${registryId}`;
+      const where = values.stack ? `--stack ${values.stack}` : `--registry-id ${registryId} --table ${table}`;
       console.log('');
       console.log(`${orphans.length} live skill(s) in registry ${registryId} that no concern record in ${table} names.`);
-      console.log('A skill published by hand, not by the curator, is listed too. Retire an orphan with:');
-      console.log(`  node scripts/registry-skills.mjs deprecate ${where} --record-id RECORD_ID --reason "orphaned: no concern record"`);
+      console.log('Reviewers load them, but the skill lifecycle (decay, release checks, retirement) never reaches them.');
+      console.log('A skill published by hand, not by the curator, is listed too. Bring them into the lifecycle with');
+      console.log('adopt, which prints what it would write; run it again with --apply to write it:');
+      console.log(printable(`  node scripts/registry-skills.mjs adopt ${where}${values.region ? ` --region ${values.region}` : ''}`));
     }
   } else if (command === 'adopt') {
     await adopt(records);
