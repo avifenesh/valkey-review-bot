@@ -7,9 +7,10 @@ import { conditionFailed } from './support/fakes.mjs';
 
 // The invoker reads its settings and builds its clients when it loads, so
 // the environment and the client stubs go in first.
+const ACCOUNT = '123456789012';
 Object.assign(process.env, {
   AWS_REGION: 'us-east-1',
-  RUNTIME_ARN: 'arn:aws:bedrock-agentcore:us-east-1:123456789012:runtime/reviewer',
+  RUNTIME_ARN: `arn:aws:bedrock-agentcore:us-east-1:${ACCOUNT}:runtime/reviewer`,
   HEARTBEAT_TABLE: 'heartbeat',
   IDEMPOTENCY_TABLE: 'idempotency',
 });
