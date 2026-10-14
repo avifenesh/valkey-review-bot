@@ -355,7 +355,7 @@ one on.
 | `recheckDays` | `90` | A check is also due when the last one is older than this (7 to 3650). `SKILL_RECHECK_SECONDS`. |
 | `applyEdits` | `false` | Write validated edits to the registry skills. When `false`, they are kept in the record's `pending_revision` for the operator. Curator `CHECK_APPLY_EDITS`. |
 | `retireSkills` | `false` | Deprecate skills that decayed below the floor or whose subject is gone. When `false`, the decay job logs them as `would-retire`. `RETIRE_SKILLS`, on both the decay Lambda and the curator. |
-| `openPullRequests` | `false` | Propose edits to the reviewers' repo skill files by pull request against `skillsRepo.repo`. Does nothing without `skillsRepo`. Curator `CHECK_OPEN_PULL_REQUESTS`. |
+| `openPullRequests` | `false` | Propose edits to the reviewers' repo skill files by pull request against `skillsRepo.repo`. `true` without `skillsRepo` fails validation, so synthesis stops. Curator `CHECK_OPEN_PULL_REQUESTS`. |
 | `maxRetirementsPerDay` | `3` | Retire requests per reviewer per pass (1 to 50). `MAX_RETIREMENTS_PER_DAY`. |
 | `maxCheckRounds` | `25` | Tool rounds of one audit (5 to 100). Curator `CHECK_MAX_ROUNDS`. |
 | `retireRefusedBackoffDays` | `30` | After the registry refused a retirement, the decay job waits this long before it asks again (1 to 3650). `RETIRE_REFUSED_BACKOFF_SECONDS`. |
@@ -521,8 +521,8 @@ read it: `npx cdk deploy ValkeyReviewerCurator ValkeyReviewerDecay`.
   or brought back. A retired skill returns only under a new name, when a
   maintainer reinforces its concern again.
 - `openPullRequests: true`: needs `skillsRepo` and
-  [the skills-repo App](#the-skills-repo-app); without `skillsRepo` it does
-  nothing. Pull requests open on
+  [the skills-repo App](#the-skills-repo-app); without `skillsRepo` the
+  configuration fails validation. Pull requests open on
   `skill-check/<reviewer>/<release>` branches of `skillsRepo.repo`. Close one
   to reject it; nothing more is proposed for that release.
 
@@ -655,7 +655,7 @@ settings:
 | Variable | From | Meaning |
 | --- | --- | --- |
 | `UPSTREAM_REPOS_JSON` | `upstreamRepos` | As for the decay Lambda. |
-| `CHECK_PROMPT_S3_KEY` | the stack | `curator/skill-check.md`, which the stack uploads. A missing object stops the runtime at boot; an unset key makes every flagged skill end inconclusive. The stack does not order the runtime update after the upload, so on the first deploy a message can reach the new runtime before the object exists; that receive fails and SQS delivers the message again after the 16-minute visibility timeout. |
+| `CHECK_PROMPT_S3_KEY` | the stack | `curator/skill-check.md`, which the stack uploads. A missing object stops the runtime at boot; an unset key makes every flagged skill end inconclusive. The runtime depends on the upload of `prompt.md`, `skill.md` and `skill-check.md`, so a new runtime version never starts before the objects exist. |
 | `CHECK_MAX_ROUNDS`, `CHECK_APPLY_EDITS`, `RETIRE_SKILLS`, `CHECK_OPEN_PULL_REQUESTS` | `skillLifecycle` | Unset: 25 and `false`. |
 | `SKILLS_REPO`, `SKILLS_REPO_BASE_BRANCH`, `SKILLS_REPO_SIGN_OFF`, `SKILLS_REPO_TOKEN_FUNCTION` | `skillsRepo` and the broker | Set only with `skillsRepo` (`SKILLS_REPO_SIGN_OFF` only with `signOff`). With `CHECK_OPEN_PULL_REQUESTS=true` and `SKILLS_REPO` set, a missing token function stops the runtime at boot. |
 | `SKILL_CHECK_DIR` | not set | Where checkouts are made; default `/tmp/skill-check`. |
