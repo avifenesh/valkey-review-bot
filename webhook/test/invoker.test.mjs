@@ -88,7 +88,10 @@ function tables({ marker, heartbeat, pages = [[]], deleteError, claimError } = {
   };
 }
 
-const CLAIM_CONDITION = 'NOT ((#s = :running AND #a >= :fresh) OR (#s = :completed AND #m = :message))';
+const CLAIM_CONDITION = 'NOT ((#s = :running AND #a BETWEEN :fresh AND :ahead AND #t <= :ttlMax) OR (#s = :completed AND #m = :message))';
+
+/** A day past `at`, in epoch seconds: the ttl a run writes. */
+const ttlAt = (at) => Math.floor(at / 1000) + 24 * 3600;
 
 /**
  * Both tables in memory, for receives that see each other's writes: the
@@ -122,7 +125,9 @@ function memoryTables({ marker } = {}) {
           assert.equal(command.input.ConditionExpression, CLAIM_CONDITION);
           await t.beforeClaim();
           const r = t.runs.get(Key.run_key);
-          const live = r?.status === 'running' && r.last_activity >= v[':fresh'];
+          // DynamoDB: a comparison with a missing attribute is false.
+          const live = r?.status === 'running' && r.last_activity >= v[':fresh'] && r.last_activity <= v[':ahead']
+            && typeof r.ttl === 'number' && r.ttl <= v[':ttlMax'];
           const done = r?.status === 'completed' && r.message_id === v[':message'];
           if (live || done) throw conditionFailed();
           t.runs.set(Key.run_key, { ...r, last_activity: v[':now'], status: 'running', ttl: v[':ttl'], message_id: v[':message'] });
@@ -198,7 +203,7 @@ test('a worker not allowed to read the marker runs the review like any other', a
 });
 
 test('a redelivery whose marker is gone is watched like any review', async () => {
-  ddbAnswer = tables({ heartbeat: { status: 'running', last_activity: Date.now() } });
+  ddbAnswer = tables({ heartbeat: { status: 'running', last_activity: Date.now(), ttl: ttlAt(Date.now()) } });
   const alive = await run(sqsEvent({ ...review, pending_marker: 'marker-1' }, 2));
   assert.deepEqual(alive.result, { batchItemFailures: [{ itemIdentifier: 'm1' }] });
   assert.deepEqual(ops(), ['GetCommand idempotency', 'GetCommand heartbeat']);
@@ -232,7 +237,7 @@ test('without IDEMPOTENCY_TABLE the marker is left to expire', async () => {
 });
 
 const pushed = { ...review, run_nonce: 'push', pending_marker: 'marker-1', trigger: 'push', skip_drafts: false };
-const running = (runKey, agoMs = 60_000) => ({ run_key: runKey, status: 'running', last_activity: Date.now() - agoMs });
+const running = (runKey, agoMs = 60_000) => ({ run_key: runKey, status: 'running', last_activity: Date.now() - agoMs, ttl: ttlAt(Date.now() - agoMs) });
 
 test('a review of new commits looks for other runs of its pull request before it runs', async () => {
   ddbAnswer = tables({ marker: 'marker-1' });
@@ -242,8 +247,8 @@ test('a review of new commits looks for other runs of its pull request before it
   assert.deepEqual(calls[1].input, {
     TableName: 'heartbeat',
     FilterExpression: 'begins_with(#k, :prefix) AND #s = :running',
-    ProjectionExpression: '#k, #a, #s',
-    ExpressionAttributeNames: { '#k': 'run_key', '#a': 'last_activity', '#s': 'status' },
+    ProjectionExpression: '#k, #a, #s, #t',
+    ExpressionAttributeNames: { '#k': 'run_key', '#a': 'last_activity', '#s': 'status', '#t': 'ttl' },
     ExpressionAttributeValues: { ':prefix': 'Example-Org/Valkey#7#', ':running': 'running' },
     ConsistentRead: true,
   });
@@ -295,15 +300,17 @@ test('a running review on a later page of the scan is found', async () => {
   assert.deepEqual(calls.filter((c) => c.op === 'ScanCommand').map((c) => c.input.ExclusiveStartKey), [undefined, { page: 1 }, { page: 2 }]);
 });
 
-test('a review of new commits still waiting past its run budget is dropped and lets go of its marker', async () => {
+test('a review of new commits still waiting past its run budget runs, with a warning naming the run it waited for', async () => {
   ddbAnswer = tables({ marker: 'marker-1', pages: [[running('Example-Org/Valkey#7#aaa')]] });
   const event = sqsEvent(pushed, 7);
   event.Records[0].attributes.SentTimestamp = String(Date.now() - 91 * 60_000);
   const { result, lines } = await run(event);
   assert.deepEqual(result, { batchItemFailures: [] });
-  assert.deepEqual(ops(), ['GetCommand idempotency', 'ScanCommand heartbeat', 'DeleteCommand idempotency']);
-  assert.ok(lines.some((l) => /^\[abandoned\] review repo=Example-Org\/Valkey pr=7 head=bbb attempt=7: still waiting for Example-Org\/Valkey#7#aaa/.test(l)), lines.join('\n'));
+  assert.deepEqual(ops(), ['GetCommand idempotency', 'ScanCommand heartbeat', 'UpdateCommand heartbeat', 'DeleteCommand idempotency', 'InvokeAgentRuntimeCommand']);
+  assert.equal(invoked().use_fallback_model, undefined);
+  assert.ok(lines.some((l) => l === '[watchdog] review repo=Example-Org/Valkey pr=7 head=bbb waited for Example-Org/Valkey#7#aaa (heartbeat 60s ago) past the run budget: 91 min > 90 min; running it anyway'), lines.join('\n'));
   assert.ok(lines.some((l) => / marker=marker-1 cleared$/.test(l)));
+  assert.equal(lines.some((l) => l.startsWith('[abandoned]')), false);
 });
 
 test('a dead review of new commits waits too, without a marker to keep', async () => {
@@ -327,6 +334,21 @@ const invokes = () => calls.filter((c) => c.op === 'InvokeAgentRuntimeCommand').
 const quiet = (lines) => !lines.some((l) => /^\[(fail|invoke|abandoned)\]/.test(l));
 const mention = { ...review, run_nonce: 'm5', status_comment_id: 5, instruction: 'review' };
 
+test('a forged running record of the pull request holds no automatic review back', async () => {
+  const now = Date.now();
+  for (const forged of [
+    { status: 'running', last_activity: 9e15 },
+    { status: 'running', last_activity: now + 2 * 60_000, ttl: ttlAt(now) },
+    { status: 'running', last_activity: now },
+    { status: 'running', last_activity: now, ttl: ttlAt(now) + 3600 },
+  ]) {
+    ddbAnswer = tables({ marker: 'marker-1', pages: [[{ run_key: 'Example-Org/Valkey#7#forged', ...forged }]] });
+    const { result } = await run(sqsEvent(pushed));
+    assert.deepEqual(result, { batchItemFailures: [] }, JSON.stringify(forged));
+    assert.equal(invokes(), 1);
+  }
+});
+
 test('the worker writes the run\'s start record before it lets go of the marker and invokes', async () => {
   ddbAnswer = tables({ marker: 'marker-1' });
   const before = Date.now();
@@ -347,6 +369,8 @@ test('the worker writes the run\'s start record before it lets go of the marker 
     ':running': 'running',
     ':completed': 'completed',
     ':fresh': v[':now'] - 12 * 60_000,
+    ':ahead': v[':now'] + 60_000,
+    ':ttlMax': Math.floor((v[':now'] + 60_000) / 1000) + 24 * 3600,
     ':ttl': Math.floor(v[':now'] / 1000) + 24 * 3600,
     ':message': 'm1',
   });
@@ -457,6 +481,29 @@ test('a start claim goes ahead over a run that died, and over a finished run of 
     assert.equal(claimed.status, 'running');
     assert.equal(claimed.message_id, 'm1');
   }
+});
+
+test('a start claim goes ahead over a running record no run wrote', async () => {
+  const now = Date.now();
+  for (const forged of [
+    { status: 'running', last_activity: now + 2 * 60_000, ttl: ttlAt(now), message_id: 'x' },
+    { status: 'running', last_activity: now, message_id: 'x' },
+    { status: 'running', last_activity: now, ttl: ttlAt(now) + 3600, message_id: 'x' },
+  ]) {
+    const t = memoryTables();
+    t.runs.set('Example-Org/Valkey#7#bbb#m5', forged);
+    ddbAnswer = t.answer;
+    const { result } = await run(sqsEvent(mention));
+    assert.deepEqual(result, { batchItemFailures: [] }, JSON.stringify(forged));
+    assert.equal(invokes(), 1);
+    assert.equal(t.runs.get('Example-Org/Valkey#7#bbb#m5').message_id, 'm1');
+  }
+  // A run's own record, a minute ahead of the worker's clock, still holds.
+  const t = memoryTables();
+  t.runs.set('Example-Org/Valkey#7#bbb#m5', { status: 'running', last_activity: now + 50_000, ttl: ttlAt(now + 50_000), message_id: 'm1' });
+  ddbAnswer = t.answer;
+  assert.deepEqual((await run(sqsEvent(mention))).result, { batchItemFailures: [{ itemIdentifier: 'm1' }] });
+  assert.equal(invokes(), 0);
 });
 
 test('once the start is claimed, a marker that went some other way does not stop the run', async () => {

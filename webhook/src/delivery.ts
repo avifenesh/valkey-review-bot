@@ -296,10 +296,11 @@ export function createDeliveryHandler(
     // skipped delivery's key is released, and a redelivery of it is
     // processed instead of being dropped as a duplicate. What remains:
     // GitHub does not redeliver on its own, so in that case this head is
-    // reviewed only after a manual redelivery or the next push, as it is
-    // when the worker drops the waiting review (still waiting for another
-    // review past its run budget); and a redelivery that comes after the
-    // waiting review has started queues another review of this head.
+    // reviewed only after a manual redelivery or the next push; and a
+    // redelivery that comes after the waiting review has started queues
+    // another review of this head. A review that waits for another review
+    // of the pull request past its run budget is not dropped: the worker
+    // runs it then (src/watchdog.ts).
     const joinWaitingReview = async (): Promise<Outcome> => {
       await giveBack();
       log(`[auto-review] route=${route.routeId} repo=${repo} pr=${prNumber} head=${headSha} joins the waiting review; skipped`);

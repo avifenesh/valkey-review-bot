@@ -4,10 +4,12 @@ import test from 'node:test';
 import './support/ts-resolve.mjs';
 
 const { heartbeatRunKey, pendingMarkerOf, pullRequestRunPrefix } = await import('../src/review-envelope.ts');
-const { CURATOR_MAX_RECEIVES, decide, isCuratorMessage, liveRun, messageTag } = await import('../src/watchdog.ts');
+const { CURATOR_MAX_RECEIVES, decide, isCuratorMessage, isFresh, liveRun, messageTag } = await import('../src/watchdog.ts');
 
 const MIN = 60_000;
 const NOW = Date.parse('2026-10-13T12:00:00Z');
+/** A running record as a run writes it `agoMs` before NOW: its ttl is a day past that write. */
+const beat = (agoMs) => ({ status: 'running', last_activity: NOW - agoMs, ttl: Math.floor((NOW - agoMs) / 1000) + 24 * 3600 });
 const review = { repo: 'example-org/valkey', pr_number: 7, installation_id: 42, head_sha: 'abc123' };
 const curator = { reviewer_id: 'valkey-review', feedback_id: 'rc-1', kind: 'review_comment_reply', repo: 'example-org/valkey', pr_number: 7 };
 const maintenance = {
@@ -56,7 +58,7 @@ test('a completed run is not repeated', async () => {
 });
 
 test('a live run is left alone until the next visibility timeout', async () => {
-  const { value } = input(withHeartbeat({ status: 'running', last_activity: NOW - 3 * MIN }));
+  const { value } = input(withHeartbeat(beat(3 * MIN)));
   assert.deepEqual(await decide(value), { action: 'wait', reason: 'heartbeat 180s ago' });
 });
 
@@ -104,7 +106,7 @@ test('a healthy long review ends on its budget before the queue dead-letters it'
   let decision;
   for (; receive <= 8; receive++) {
     const sentAt = NOW - (receive - 1) * 16 * MIN;
-    const { value } = input({ receiveCount: receive, sentAt, ...withHeartbeat({ status: 'running', last_activity: NOW - MIN }) });
+    const { value } = input({ receiveCount: receive, sentAt, ...withHeartbeat(beat(MIN)) });
     decision = await decide(value);
     if (decision.action === 'delete') break;
   }
@@ -144,7 +146,7 @@ test('a review of new commits runs when no other review of its pull request is r
 
 test('a review of new commits waits while another review of its pull request runs', async () => {
   for (const receiveCount of [1, 4]) {
-    const { value, reads } = pushInput([otherRun({ status: 'running', last_activity: NOW - 2 * MIN })], { receiveCount });
+    const { value, reads } = pushInput([otherRun(beat(2 * MIN))], { receiveCount });
     assert.deepEqual(await decide(value), { action: 'wait', reason: 'heartbeat 120s ago', otherRun: 'example-org/valkey#7#aaa' });
     assert.equal(reads.length, 0);
   }
@@ -160,12 +162,12 @@ test('finished, failed, stale and silent runs do not hold a review back', async 
     const { value } = pushInput([otherRun(record)]);
     assert.equal((await decide(value)).action, 'invoke', JSON.stringify(record));
   }
-  const { value } = pushInput([otherRun({ status: 'completed', last_activity: NOW }), otherRun({ run_key: 'example-org/valkey#7#bbb#m5', status: 'running', last_activity: NOW })]);
+  const { value } = pushInput([otherRun({ status: 'completed', last_activity: NOW }), otherRun({ run_key: 'example-org/valkey#7#bbb#m5', ...beat(0) })]);
   assert.equal((await decide(value)).otherRun, 'example-org/valkey#7#bbb#m5', 'an @mention run counts too');
 });
 
 test('a dead run of new commits is not retried while another review runs', async () => {
-  const { value, reads } = pushInput([otherRun({ status: 'running', last_activity: NOW - MIN })], {
+  const { value, reads } = pushInput([otherRun(beat(MIN))], {
     receiveCount: 2,
     sentAt: NOW - 30 * MIN,
     holdsMarker: false,
@@ -179,7 +181,7 @@ test('the other runs are read only when the review would run', async () => {
   const { value, prefixes } = pushInput([], {
     receiveCount: 2,
     holdsMarker: false,
-    readHeartbeat: async () => ({ status: 'running', last_activity: NOW - MIN }),
+    readHeartbeat: async () => beat(MIN),
   });
   assert.equal((await decide(value)).action, 'wait');
   assert.deepEqual(prefixes, [], 'its own run is alive');
@@ -188,15 +190,30 @@ test('the other runs are read only when the review would run', async () => {
   assert.deepEqual(done.prefixes, []);
 });
 
-test('a review of new commits still waiting past its run budget is dropped', async () => {
-  const { value } = pushInput([otherRun({ status: 'running', last_activity: NOW - MIN })], { receiveCount: 7, sentAt: NOW - 91 * MIN });
+test('a review of new commits still waiting past its run budget runs, with a warning naming the run it waited for', async () => {
+  const { value } = pushInput([otherRun(beat(MIN))], { receiveCount: 7, sentAt: NOW - 91 * MIN });
+  assert.deepEqual(await decide(value), {
+    action: 'invoke',
+    useFallbackModel: false,
+    reason: 'first attempt, still holding the pending marker',
+    warning: 'waited for example-org/valkey#7#aaa (heartbeat 60s ago) past the run budget: 91 min > 90 min; running it anyway',
+  });
+
+  const free = pushInput([], { receiveCount: 7, sentAt: NOW - 91 * MIN });
+  assert.deepEqual(await decide(free.value), { action: 'invoke', useFallbackModel: false, reason: 'first attempt, still holding the pending marker' }, 'no warning without a wait');
+});
+
+test('a review that has run before is still abandoned past its budget, whatever else runs', async () => {
+  const { value } = pushInput([otherRun(beat(MIN))], {
+    receiveCount: 7,
+    sentAt: NOW - 91 * MIN,
+    holdsMarker: false,
+    readHeartbeat: async () => beat(MIN),
+  });
   const decision = await decide(value);
   assert.equal(decision.action, 'delete');
   assert.equal(decision.error, true);
-  assert.equal(decision.reason, 'still waiting for example-org/valkey#7#aaa (heartbeat 60s ago) past the run budget: 91 min > 90 min');
-
-  const free = pushInput([], { receiveCount: 7, sentAt: NOW - 91 * MIN });
-  assert.equal((await decide(free.value)).action, 'invoke', 'one that never ran still gets its run');
+  assert.equal(decision.reason, 'run budget exceeded: 91 min > 90 min');
 });
 
 test('a review of new commits that waits ends before the queue dead-letters it', async () => {
@@ -208,12 +225,12 @@ test('a review of new commits that waits ends before the queue dead-letters it',
   const decisions = [];
   for (let receive = 1; receive <= 8; receive++) {
     const at = delay + (receive - 1) * 16 * MIN;
-    const runs = at < 60 * MIN ? [otherRun({ status: 'running', last_activity: NOW - MIN })] : [];
+    const runs = at < 60 * MIN ? [otherRun(beat(MIN))] : [];
     const { value } = pushInput(runs, {
       receiveCount: receive,
       sentAt: NOW - at,
       holdsMarker: held,
-      readHeartbeat: async () => ({ status: 'running', last_activity: NOW - MIN }),
+      readHeartbeat: async () => beat(MIN),
     });
     const decision = await decide(value);
     decisions.push(decision.action);
@@ -223,10 +240,68 @@ test('a review of new commits that waits ends before the queue dead-letters it',
   assert.deepEqual(decisions, ['wait', 'wait', 'wait', 'wait', 'invoke', 'wait', 'delete']);
 });
 
+test('a review that waits for a run that never ends runs once past its budget, before the queue dead-letters it', async () => {
+  // A stuck or forged record that stays fresh: the review waits until
+  // its budget is used up, then runs on the primary model.
+  const delay = 5 * MIN;
+  let held = true;
+  const decisions = [];
+  for (let receive = 1; receive <= 8; receive++) {
+    const { value } = pushInput([otherRun(beat(MIN))], {
+      receiveCount: receive,
+      sentAt: NOW - (delay + (receive - 1) * 16 * MIN),
+      holdsMarker: held,
+      readHeartbeat: async () => beat(MIN),
+    });
+    const decision = await decide(value);
+    decisions.push(decision.action === 'invoke' ? `invoke${decision.useFallbackModel ? ' fallback' : ''}${decision.warning ? ' warned' : ''}` : decision.action);
+    if (decision.action === 'invoke') held = false;
+    if (decision.action === 'delete') break;
+  }
+  assert.deepEqual(decisions, ['wait', 'wait', 'wait', 'wait', 'wait', 'wait', 'invoke warned', 'delete']);
+});
+
+test('a forged record with a last_activity far ahead does not hold automatic reviews back', async () => {
+  const forged = { run_key: 'example-org/valkey#7#forged', status: 'running', last_activity: 9e15 };
+  for (const sentAgo of [0, 30 * MIN, 120 * MIN]) {
+    const { value } = pushInput([forged, { ...forged, ttl: Math.floor(NOW / 1000) + 3600 }], { sentAt: NOW - sentAgo });
+    assert.deepEqual(await decide(value), { action: 'invoke', useFallbackModel: false, reason: 'first attempt' }, `sent ${sentAgo / MIN} min ago`);
+  }
+});
+
+test('a record no run wrote under the review\'s own key is not a live run', async () => {
+  for (const record of [
+    { status: 'running', last_activity: NOW + 2 * MIN, ttl: Math.floor(NOW / 1000) + 3600 },
+    { status: 'running', last_activity: NOW - MIN },
+    { ...beat(MIN), ttl: Math.floor(NOW / 1000) + 30 * 24 * 3600 },
+  ]) {
+    const { value } = input(withHeartbeat(record));
+    const decision = await decide(value);
+    assert.equal(decision.action, 'invoke', JSON.stringify(record));
+    assert.equal(decision.useFallbackModel, true);
+  }
+});
+
 test('liveRun picks a running, fresh record', () => {
   assert.equal(liveRun([], NOW, 12 * MIN), undefined);
-  const fresh = otherRun({ status: 'running', last_activity: NOW - 12 * MIN });
-  assert.equal(liveRun([otherRun({ status: 'running', last_activity: NOW - 12 * MIN - 1 }), fresh], NOW, 12 * MIN), fresh);
+  const fresh = otherRun(beat(12 * MIN));
+  assert.equal(liveRun([otherRun(beat(12 * MIN + 1)), fresh], NOW, 12 * MIN), fresh);
+  assert.equal(liveRun([otherRun({ ...beat(MIN), status: 'completed' })], NOW, 12 * MIN), undefined);
+});
+
+test('a record counts as fresh only when a run could have written it', () => {
+  const day = 24 * 3600;
+  const now = Math.floor(NOW / 1000);
+  const fresh = (record) => isFresh(record, NOW, 12 * MIN);
+  assert.equal(fresh(beat(MIN)), true);
+  // A run's clock may be a minute ahead of the worker's.
+  assert.equal(fresh({ last_activity: NOW + MIN, ttl: now + 60 + day }), true);
+  assert.equal(fresh({ last_activity: NOW + MIN + 1, ttl: now + day }), false, 'last_activity more than a minute ahead');
+  assert.equal(fresh({ last_activity: 9e15, ttl: now + day }), false);
+  assert.equal(fresh({ last_activity: NOW - MIN }), false, 'no ttl');
+  assert.equal(fresh({ last_activity: NOW - MIN, ttl: String(now + day) }), false, 'a ttl that is not a number');
+  assert.equal(fresh({ last_activity: NOW - MIN, ttl: now + 61 + day }), false, 'a ttl more than a day ahead');
+  assert.equal(fresh({ last_activity: NOW - 13 * MIN, ttl: now + day }), false, 'stale');
 });
 
 test('curator messages run on every receive up to the queue limit, then are deleted', async () => {

@@ -34,8 +34,8 @@ import { heartbeatRunKey, pullRequestRunPrefix } from './review-envelope.js';
  * does for its own live run, and keeps its marker, so later events still
  * join it. @mention runs do not wait; src/invoker.ts says why. The wait
  * and the push delay both count against the run budget, from
- * SentTimestamp: a review still waiting when the budget is used up is
- * dropped with an error, and one that starts late is watched only until
+ * SentTimestamp: a review still waiting when the budget is used up runs
+ * then, with a warning, and one that starts late is watched only until
  * the budget ends (the run itself goes on, without the fallback). A run
  * shows up as soon as it starts: before the worker removes an automatic
  * review's marker and invokes the runtime, it writes the run's start
@@ -45,6 +45,16 @@ import { heartbeatRunKey, pullRequestRunPrefix } from './review-envelope.js';
  * failed, holds other automatic reviews of the pull request back until
  * it goes stale, and is then treated like the record of a run that died.
  *
+ * Any reviewer runtime can write any heartbeat record, and PR code can
+ * use a reviewer runtime's role (SECURITY.md). So a record counts as
+ * fresh only when a run could have written it (isFresh): its
+ * last_activity is at most CLOCK_SKEW_MS ahead of now, and its ttl is
+ * set and at most HEARTBEAT_TTL_SECONDS (plus the skew) ahead. A forged
+ * record then looks alive only while something rewrites it every few
+ * minutes, and a review that waits for another run past its budget runs
+ * anyway: a record forged under another run's key can delay the pull
+ * request's automatic reviews, but not drop them.
+ *
  * Curator messages, feedback or maintenance, have no heartbeat. Each
  * receive runs the curator; the curator queue dead-letters after three
  * receives, and a message seen more often than that (a queue without its
@@ -53,8 +63,19 @@ import { heartbeatRunKey, pullRequestRunPrefix } from './review-envelope.js';
 
 export const CURATOR_MAX_RECEIVES = 3;
 
+/** How far ahead of the worker's clock a run's clock may be. */
+export const CLOCK_SKEW_MS = 60_000;
+
+/**
+ * How long a heartbeat record lives: every write, by the runtime
+ * (agents/common/src/heartbeat.ts) or the worker's start record, sets its
+ * ttl this far ahead.
+ */
+export const HEARTBEAT_TTL_SECONDS = 24 * 3600;
+
 export type Decision =
-  | { readonly action: 'invoke'; readonly useFallbackModel: boolean; readonly reason: string }
+  /** warning: why the run starts although something is wrong, for the log. */
+  | { readonly action: 'invoke'; readonly useFallbackModel: boolean; readonly reason: string; readonly warning?: string }
   | { readonly action: 'delete'; readonly reason: string; readonly error?: boolean }
   /** otherRun: the run key of another review of the pull request that this one waits for. */
   | { readonly action: 'wait'; readonly reason: string; readonly otherRun?: string };
@@ -62,6 +83,8 @@ export type Decision =
 export interface HeartbeatRecord {
   readonly last_activity?: number;
   readonly status?: string;
+  /** Epoch seconds when DynamoDB may delete the record. */
+  readonly ttl?: number;
 }
 
 export interface PullRequestRun extends HeartbeatRecord {
@@ -109,14 +132,33 @@ export function messageTag(envelope: Readonly<Record<string, unknown>>): string 
   return `review repo=${envelope.repo} pr=${envelope.pr_number} head=${envelope.head_sha}`;
 }
 
-/** A run whose heartbeat says running and is no older than `staleMs`. */
+/**
+ * True when the record's heartbeat is no older than `staleMs`, and is one
+ * a run could have written: last_activity at most CLOCK_SKEW_MS ahead of
+ * `now`, and a ttl at most HEARTBEAT_TTL_SECONDS ahead (plus the skew).
+ * A record with a later last_activity, or with no ttl or a later one, is
+ * not a run's and never counts as fresh. src/invoker.ts claimRunStart
+ * applies the same test in its condition.
+ */
+export function isFresh(record: HeartbeatRecord, now: number, staleMs: number): record is HeartbeatRecord & { readonly last_activity: number } {
+  const { last_activity: at, ttl } = record;
+  return typeof at === 'number' && now - at <= staleMs && at <= now + CLOCK_SKEW_MS
+    && typeof ttl === 'number' && ttl <= latestTtl(now);
+}
+
+/** The latest ttl a run can have written by `now`, in epoch seconds. */
+export function latestTtl(now: number): number {
+  return Math.floor((now + CLOCK_SKEW_MS) / 1000) + HEARTBEAT_TTL_SECONDS;
+}
+
+/** A run whose heartbeat says running and is fresh (isFresh). */
 export function liveRun(
   runs: readonly PullRequestRun[],
   now: number,
   staleMs: number,
 ): (PullRequestRun & { readonly last_activity: number }) | undefined {
   return runs.find((r): r is PullRequestRun & { readonly last_activity: number } =>
-    r.status === 'running' && typeof r.last_activity === 'number' && now - r.last_activity <= staleMs);
+    r.status === 'running' && isFresh(r, now, staleMs));
 }
 
 const minutes = (ms: number): number => Math.round(ms / 60_000);
@@ -138,10 +180,11 @@ export async function decide(input: WatchdogInput): Promise<Decision> {
   const age = `heartbeat ${Math.round((input.now - other.last_activity) / 1000)}s ago`;
   const elapsedMs = input.sentAt ? input.now - input.sentAt : 0;
   if (elapsedMs > input.runBudgetMs) {
+    // Run, not dropped: the record it waits for may be stuck, or forged
+    // by PR code, and must not stop the pull request's automatic reviews.
     return {
-      action: 'delete',
-      reason: `still waiting for ${other.run_key} (${age}) past the run budget: ${minutes(elapsedMs)} min > ${minutes(input.runBudgetMs)} min`,
-      error: true,
+      ...decision,
+      warning: `waited for ${other.run_key} (${age}) past the run budget: ${minutes(elapsedMs)} min > ${minutes(input.runBudgetMs)} min; running it anyway`,
     };
   }
   return { action: 'wait', reason: age, otherRun: other.run_key };
@@ -170,6 +213,9 @@ async function reviewDecision(input: WatchdogInput): Promise<Decision> {
   const ageMs = input.now - record.last_activity;
   if (ageMs > input.staleMs) {
     return { action: 'invoke', useFallbackModel: true, reason: `heartbeat stale ${Math.round(ageMs / 1000)}s` };
+  }
+  if (!isFresh(record, input.now, input.staleMs)) {
+    return { action: 'invoke', useFallbackModel: true, reason: 'heartbeat record not written by a run (last_activity ahead of now, or ttl missing or too far ahead)' };
   }
   return { action: 'wait', reason: `heartbeat ${Math.round(ageMs / 1000)}s ago` };
 }

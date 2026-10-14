@@ -4,7 +4,16 @@ import { DynamoDBDocumentClient, GetCommand, ScanCommand, UpdateCommand } from '
 import { loadInvokerConfig } from './config.js';
 import { heartbeatRunKey, pendingMarkerOf, type PendingMarker } from './review-envelope.js';
 import { clearPendingReview, extendPendingReview, holdsPendingReview } from './store.js';
-import { decide, isCuratorMessage, messageTag, type HeartbeatRecord, type PullRequestRun } from './watchdog.js';
+import {
+  CLOCK_SKEW_MS,
+  decide,
+  HEARTBEAT_TTL_SECONDS,
+  isCuratorMessage,
+  latestTtl,
+  messageTag,
+  type HeartbeatRecord,
+  type PullRequestRun,
+} from './watchdog.js';
 
 /**
  * Queue worker: one message per invocation, forwarded unchanged to the
@@ -36,9 +45,6 @@ interface SqsEvent {
  */
 class StillRunning extends Error {}
 
-/** Same lifetime as the records the runtime writes (agents/common/src/heartbeat.ts). */
-const HEARTBEAT_TTL_SECONDS = 24 * 3600;
-
 async function readHeartbeat(runKey: string): Promise<HeartbeatRecord | undefined> {
   const resp = await ddb.send(new GetCommand({ TableName: config.heartbeatTable, Key: { run_key: runKey } }));
   return resp.Item as HeartbeatRecord | undefined;
@@ -58,8 +64,8 @@ async function readPullRequestRuns(prefix: string): Promise<PullRequestRun[]> {
     const resp = await ddb.send(new ScanCommand({
       TableName: config.heartbeatTable,
       FilterExpression: 'begins_with(#k, :prefix) AND #s = :running',
-      ProjectionExpression: '#k, #a, #s',
-      ExpressionAttributeNames: { '#k': 'run_key', '#a': 'last_activity', '#s': 'status' },
+      ProjectionExpression: '#k, #a, #s, #t',
+      ExpressionAttributeNames: { '#k': 'run_key', '#a': 'last_activity', '#s': 'status', '#t': 'ttl' },
       ExpressionAttributeValues: { ':prefix': prefix, ':running': 'running' },
       ConsistentRead: true,
       ...(start ? { ExclusiveStartKey: start } : {}),
@@ -107,7 +113,8 @@ async function holdsMarker(marker: PendingMarker | undefined, tag: string): Prom
  *     The write is refused while the key has a fresh running record
  *     (this run, or another message's run of the same key) or a
  *     completed one this message wrote: "taken". Over a dead run (stale
- *     or failed), or one that another message finished, it goes ahead.
+ *     or failed), one that another message finished, or a record no run
+ *     wrote (src/watchdog.ts isFresh), it goes ahead.
  *
  * The runtime's heartbeat writes keep message_id. A worker without the
  * grant to write the table runs the review unclaimed, as before, and an
@@ -121,14 +128,17 @@ async function claimRunStart(runKey: string, messageId: string, tag: string): Pr
       TableName: config.heartbeatTable,
       Key: { run_key: runKey },
       UpdateExpression: 'SET #a = :now, #s = :running, #t = :ttl, #m = :message',
-      ConditionExpression: 'NOT ((#s = :running AND #a >= :fresh) OR (#s = :completed AND #m = :message))',
+      // A missing ttl fails the comparison, so such a record is not fresh.
+      ConditionExpression: 'NOT ((#s = :running AND #a BETWEEN :fresh AND :ahead AND #t <= :ttlMax) OR (#s = :completed AND #m = :message))',
       ExpressionAttributeNames: { '#a': 'last_activity', '#s': 'status', '#t': 'ttl', '#m': 'message_id' },
       ExpressionAttributeValues: {
         ':now': now,
         ':running': 'running',
         ':completed': 'completed',
-        // Fresh as src/watchdog.ts liveRun counts it.
+        // Fresh as src/watchdog.ts isFresh counts it.
         ':fresh': now - config.staleMs,
+        ':ahead': now + CLOCK_SKEW_MS,
+        ':ttlMax': latestTtl(now),
         ':ttl': Math.floor(now / 1000) + HEARTBEAT_TTL_SECONDS,
         ':message': messageId,
       },
@@ -248,6 +258,7 @@ async function handleOne(record: SqsRecord): Promise<void> {
     throw new StillRunning();
   }
 
+  if (decision.warning) console.warn(`[watchdog] ${tag} ${decision.warning}`);
   const payload = decision.useFallbackModel ? { ...envelope, use_fallback_model: true } : envelope;
   console.log(`[invoke] ${tag} attempt=${receiveCount}${decision.useFallbackModel ? ` fallback_model=true (${decision.reason})` : ''}`);
 
