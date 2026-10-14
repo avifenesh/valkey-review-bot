@@ -346,6 +346,51 @@ test('with retirement off a retire message is only reported', async () => {
   assert.ok(lines.some((l) => l.includes('[maintenance] retire') && l.includes('outcome="would-retire"')), lines.join('\n'));
 });
 
+test('every release after a live read of the registry removes a leftover retirement marker', async () => {
+  // A marker left by a retire run whose deprecation failed ambiguously and never took effect.
+  const marker = { maintenance_deprecating: NAME };
+  const cases = [
+    ['retire in report mode', retireMessage(), record({ ...retireClaim, ...marker }), {}, undefined],
+    ['retire dry run', retireMessage({ dry_run: true }), record({ ...retireClaim, ...marker }), { retireSkills: true }, undefined],
+    ['check without an upstream', checkMessage(), record(marker), { upstreamRepos: {} }, undefined],
+    ['clean check dry run', checkMessage({ dry_run: true }), record({ ...marker, audit_names: new Set(['serverCron', 'src/server.c']) }), {}, { name: NAME, skillMd: CLEAN_MD }],
+    ['audited dry run', checkMessage({ dry_run: true }), record(marker), {}, undefined],
+    ['inconclusive dry run', checkMessage({ dry_run: true }), record(marker), {}, undefined, ''],
+  ];
+  for (const [label, message, item, settings, skill, prompt = 'audit'] of cases) {
+    const s = setup({ item, settings, prompt, turns: [report('unsure')], ...(skill ? { skill } : {}) });
+    await run(message, s.deps);
+    const after = s.table.item(KEY);
+    assert.ok(claimGone(after), label);
+    assert.equal(after.maintenance_deprecating, undefined, label);
+    assert.equal(after.retired_at, undefined, label);
+  }
+});
+
+test('a release without a live read since the last deprecation keeps the marker', async () => {
+  // Refused, then read as UPDATE_FAILED: the deprecation's effect is unknown.
+  const s = setup({
+    item: record({ ...retireClaim }),
+    settings: { retireSkills: true },
+    registryOpts: {
+      deprecate: (recordId, reason, byName) => {
+        byName.get(NAME).status = 'UPDATE_FAILED';
+        throw Object.assign(new Error('bad transition'), { name: 'ValidationException' });
+      },
+    },
+  });
+  assert.equal((await run(retireMessage(), s.deps)).result.decision, 'refused');
+  const item = s.table.item(KEY);
+  assert.ok(claimGone(item));
+  assert.equal(item.retire_refused_at, NOW);
+  assert.equal(item.maintenance_deprecating, NAME);
+
+  // Read as CREATE_FAILED: no live read, so a check that cannot run keeps it too.
+  const failed = setup({ item: record({ maintenance_deprecating: NAME }), skill: { name: NAME, skillMd: SKILL_MD, status: 'CREATE_FAILED' } });
+  assert.equal((await run(checkMessage(), failed.deps)).result.decision, 'error');
+  assert.equal(failed.table.item(KEY).maintenance_deprecating, NAME);
+});
+
 test('a dry run records no retirement the registry already shows, and says what it would record', async () => {
   const cases = [
     ['check', record(), { name: NAME, skillMd: SKILL_MD, status: 'DEPRECATED' }, 'operator'],
@@ -785,10 +830,29 @@ test('an applied revision records nothing once another edit has replaced its rev
   assert.ok(lines.some((l) => l.startsWith('[maintenance] check ') && l.includes('outcome="revised"') && l.includes('recorded=false')), lines.join('\n'));
 });
 
-test('an applied revision clears a leftover retirement marker, also when the registry update fails', async () => {
-  const s = setup({ item: record({ maintenance_deprecating: NAME }), turns: [report('revise', [EDIT])], settings: { checkApplyEdits: true } });
+test('an applied revision clears a leftover retirement marker in its first write, also when the registry update fails', async () => {
+  let atUpdate;
+  const s = setup({
+    item: record({ maintenance_deprecating: NAME }),
+    turns: [report('revise', [EDIT])],
+    settings: { checkApplyEdits: true },
+    registryOpts: {
+      update: (input, byName) => {
+        atUpdate = structuredClone(s.table.item(KEY));
+        byName.get(NAME).skillMd = input.skillMd;
+        return { status: 'UPDATING' };
+      },
+    },
+  });
   assert.equal((await run(checkMessage(), s.deps)).result.decision, 'revised');
+  // Gone with the claim's id, before the registry write.
+  assert.equal(atUpdate.maintenance_id, undefined);
+  assert.equal(atUpdate.maintenance_deprecating, undefined);
   assert.equal(s.table.item(KEY).maintenance_deprecating, undefined);
+  // The later writes leave the marker alone.
+  const later = s.table.updates().map((c) => c.input).filter((i) => i.UpdateExpression.includes('#checkoutcome'));
+  assert.ok(later.length > 0);
+  for (const input of later) assert.equal(Object.values(input.ExpressionAttributeNames).includes('maintenance_deprecating'), false);
 
   const failed = setup({
     item: record({ maintenance_deprecating: NAME }),

@@ -73,10 +73,15 @@ import type { SkillPublisher } from './tools/submit-skill.js';
  * maintenance_deprecating to the record name. A DEPRECATED registry
  * record with that marker is the lifecycle's own retirement, from this
  * run or an earlier one; without it, someone else retired the skill
- * (retired_reason "operator", which submit_skill never undoes). The
- * marker is removed only in a tombstone write, or in a write made after
- * this run read the registry record as DRAFT, PENDING_APPROVAL or
- * APPROVED.
+ * (retired_reason "operator", which submit_skill never undoes). Runs
+ * follow the marker rule in ops/src/decay.ts. A tombstone write removes
+ * the marker. Once a run has read the registry record as DRAFT,
+ * PENDING_APPROVAL or APPROVED, after its last deprecateSkill call if it
+ * made one, no deprecation is under way, so every write that releases
+ * the claim removes the marker too, whatever the outcome: a skip, a
+ * report-mode or dry-run end, and on the revise path its first write,
+ * the one that takes the claim's id (Run.releasing). Every other release
+ * keeps it.
  *
  * Lost names. A name of the baseline (audit_names) that a check finds
  * absent is lost. It leaves audit_names, so its loss costs standing
@@ -91,11 +96,12 @@ import type { SkillPublisher } from './tools/submit-skill.js';
  * (CHECK_APPLY_EDITS, RETIRE_SKILLS, CHECK_OPEN_PULL_REQUESTS), never
  * writes the registry or opens a pull request. Every run logs one
  * "[maintenance] ..." report line, plus one line per proposed edit. A
- * dry run also writes nothing the feedback path or the decay job acts
- * on: no tombstone, no outcome, verification, names or standing. It
- * records only the audit's result for the operator (pending_revision,
+ * dry run also writes nothing else the feedback path or the decay job
+ * acts on: no tombstone, no outcome, verification, names or standing.
+ * It records only the audit's result for the operator (pending_revision,
  * reason "dry run", never in place of a real check's), and releases
- * the claim, so the next real pass checks again. Its decision says
+ * the claim, so the next real pass checks again; that release removes a
+ * leftover marker as any other does. Its decision says
  * what a real run would do: would-<outcome> after an audit,
  * would-retire, or would-record-retirement.
  *
@@ -408,8 +414,13 @@ class Run {
   readonly now: Date;
   readonly nowIso: string;
   item: Item | undefined;
-  /** This run read the registry record as DRAFT, PENDING_APPROVAL or APPROVED. */
-  liveRead = false;
+  /**
+   * The write that releases the claim removes the retirement marker: this
+   * run read the registry record as DRAFT, PENDING_APPROVAL or APPROVED,
+   * after its last deprecateSkill call if it made one (see the module
+   * comment).
+   */
+  dropsMarker = false;
 
   constructor(deps: MaintenanceDeps, req: MaintenanceRequest) {
     this.deps = deps;
@@ -444,9 +455,16 @@ class Run {
     }
   }
 
-  /** The release write: REMOVE the claim, conditioned on maintenance_id alone. False when another claim owns the record. */
+  /** REMOVE the claim in `w`, and the marker when dropsMarker says so. */
+  releasing(w: Write): Write {
+    w.remove(...CLAIM);
+    if (this.dropsMarker) w.remove(MARKER);
+    return w;
+  }
+
+  /** The release write: REMOVE the claim (releasing), conditioned on maintenance_id alone. False when another claim owns the record. */
   async release(): Promise<boolean> {
-    return this.send(new Write().remove(...CLAIM).is('maintenance_id', this.req.maintenance_id));
+    return this.send(this.releasing(new Write()).is('maintenance_id', this.req.maintenance_id));
   }
 
   /**
@@ -577,11 +595,13 @@ async function retirement(run: Run, reason: string, fromStatus: string | undefin
   return await tombstone(run, reason, fromStatus, pin) ? completed('retired') : skipped('changed');
 }
 
-/** A retirement the registry refused: back off (decay waits RETIRE_REFUSED_BACKOFF_SECONDS) and release the claim. */
+/**
+ * A retirement the registry refused: back off (decay waits
+ * RETIRE_REFUSED_BACKOFF_SECONDS) and release the claim, with the marker
+ * when the record was read live after the refusal.
+ */
 async function refused(run: Run, status: string): Promise<MaintenanceResult> {
-  const w = new Write().set('retire_refused_at', run.nowIso).remove(...CLAIM);
-  if (LIVE_STATUSES.has(status)) w.remove(MARKER);
-  await run.state(w);
+  await run.state(run.releasing(new Write().set('retire_refused_at', run.nowIso)));
   console.warn(`[maintenance] retire-refused ${quoted(run.name)} status=${quoted(status)}`);
   run.log('retire', { outcome: 'refused', registry_status: status });
   return completed('refused');
@@ -607,7 +627,7 @@ async function* retire(run: Run, req: RetireRequest): AsyncGenerator<StreamFrame
     run.log('retire', { outcome: 'pending', registry_status: skill.status, why: 'the registry record is being written; the claim is kept' });
     return completed('pending');
   }
-  run.liveRead = LIVE_STATUSES.has(skill.status);
+  run.dropsMarker = LIVE_STATUSES.has(skill.status);
 
   if (req.dry_run || !run.deps.settings.retireSkills) {
     await run.release();
@@ -623,6 +643,8 @@ async function* retire(run: Run, req: RetireRequest): AsyncGenerator<StreamFrame
   }
   yield { event: 'status', data: { phase: 'deprecate', name: req.record_name } };
 
+  // A deprecation may be under way from here on: only a read after the call tells.
+  run.dropsMarker = false;
   try {
     await run.deps.registry.deprecate(skill.recordId, statusReason(req.retire_reason, run.nowIso.slice(0, 10), item!));
   } catch (err) {
@@ -630,6 +652,7 @@ async function* retire(run: Run, req: RetireRequest): AsyncGenerator<StreamFrame
     // and the redelivered message finds out what happened.
     if ((err as { name?: string } | null)?.name !== 'ValidationException') throw err;
     const fresh = await run.deps.registry.get(req.record_name);
+    run.dropsMarker = fresh !== null && LIVE_STATUSES.has(fresh.status);
     if (!fresh) return await tombstone(run, req.retire_reason, skill.status, 'decay') ? completed('retired') : skipped('changed');
     if (fresh.status === 'REJECTED') return await tombstone(run, 'operator', 'REJECTED', null) ? completed('retired') : skipped('changed');
     if (BUSY_STATUSES.has(fresh.status)) {
@@ -738,7 +761,7 @@ const DRY_RUN_REASON = 'dry run';
 async function dryRunEnd(run: Run, c: Checked, report: CheckReport): Promise<boolean> {
   const held = run.item?.pending_revision as { reason?: unknown } | null | undefined;
   const real = held != null && held.reason !== DRY_RUN_REASON;
-  const w = new Write().remove(...CLAIM);
+  const w = run.releasing(new Write());
   if (!real) w.set('pending_revision', pendingRevision(run.nowIso, c, report, DRY_RUN_REASON));
   await run.state(w);
   return !real;
@@ -784,30 +807,25 @@ async function writeRetried(run: Run, build: (item: Item, unchanged: boolean) =>
 
 /**
  * The terminal write of a check that is not a dry run: the outcome, the
- * verification, the names, and the claim released, retried as
- * writeRetried does. `penalty` is false after a reinforcement, so the
- * standing penalty is dropped.
+ * verification, the names, and the claim released (outcomeWrite),
+ * retried as writeRetried does. `penalty` is false after a
+ * reinforcement, so the standing penalty is dropped.
  */
 async function finishCheck(run: Run, build: (item: Item, penalty: boolean) => Write): Promise<boolean> {
-  return writeRetried(run, (item, penalty) => {
-    const w = build(item, penalty);
-    if (run.liveRead) w.remove(MARKER);
-    return w;
-  });
+  return writeRetried(run, build);
 }
 
 /** pending_revision.reason of an obsolete finding a reinforcement overtook. */
 const REINFORCED_SINCE = 'reinforced since the check';
 
-/** Fields every completed check sets: outcome, note, release and time; the claim goes. */
+/** Fields every completed check sets: outcome, note, release and time; the claim goes (Run.releasing). */
 function outcomeWrite(run: Run, v: Outcome): Write {
   const tag = run.req.reason === 'repo_check' || run.req.reason === 'check' ? run.req.release_tag : '';
-  return new Write()
+  return run.releasing(new Write()
     .set('check_outcome', v.outcome)
     .set('check_note', v.note)
     .set('verified_release', tag)
-    .set('verified_at', run.nowIso)
-    .remove(...CLAIM);
+    .set('verified_at', run.nowIso));
 }
 
 // Partial checks. A check whose diff since the base was examined only in
@@ -1146,7 +1164,7 @@ async function* check(run: Run, req: CheckRequest): AsyncGenerator<StreamFrame, 
   if (skill.status === 'REJECTED') return retirement(run, 'operator', skill.status, null);
   if (BUSY_STATUSES.has(skill.status)) return inconclusive(run, `the registry record is ${skill.status}`);
   if (!LIVE_STATUSES.has(skill.status)) return failedForGood(run, `the registry record is ${skill.status || 'in no status'}`);
-  run.liveRead = true;
+  run.dropsMarker = true;
 
   // A deployment gap, fixed by configuration: skip and leave the check due.
   const upstream = run.deps.settings.upstreamRepos[req.reviewer_id];
@@ -1283,7 +1301,9 @@ async function* checkBody(run: Run, req: CheckRequest, c: Checked, skill: SkillR
  * Apply validated edits to the registry skill. The first write takes
  * the claim's id off the record together with the old text, so of two
  * copies of the message only one reaches the registry; the later writes
- * are conditioned on its revised_at.
+ * are conditioned on its revised_at. The first write is the release the
+ * marker rule means, so it removes the marker and the later writes
+ * leave it.
  */
 async function* applyRevision(
   run: Run,
@@ -1294,10 +1314,10 @@ async function* applyRevision(
   ver: Verification,
 ): AsyncGenerator<StreamFrame, MaintenanceResult> {
   const revisedAt = run.nowIso;
-  const claimed = await run.state(new Write()
-    .set('previous_skill_md', skill.skillMd)
-    .set('revised_at', revisedAt)
-    .remove('maintenance_id'));
+  const first = new Write().set('previous_skill_md', skill.skillMd).set('revised_at', revisedAt).remove('maintenance_id');
+  if (run.dropsMarker) first.remove(MARKER);
+  const claimed = await run.state(first);
+  run.dropsMarker = false;
   if (!claimed) {
     run.log('check', { outcome: 'skipped', why: 'another run holds the record' });
     return skipped('changed');
@@ -1309,8 +1329,7 @@ async function* applyRevision(
   } catch (err) {
     console.warn(`[maintenance] registry update of ${quoted(run.name)} failed: ${errorText(err)}`);
     const v: Outcome = { outcome: 'error', note: note(`the edited skill could not be written to the registry at ${c.ref}`) };
-    // The record was read live, so a leftover marker goes, as in every terminal write after a live read.
-    const w = outcomeWrite(run, v).set('pending_revision', pendingRevision(run.nowIso, c, report, 'the registry update failed')).remove(MARKER);
+    const w = outcomeWrite(run, v).set('pending_revision', pendingRevision(run.nowIso, c, report, 'the registry update failed'));
     countPartial(w, run, c, run.item!);
     await run.afterEdit(w, revisedAt);
     run.log('check', { outcome: 'error', ...fields, note: v.note });
@@ -1344,7 +1363,6 @@ async function* applyRevision(
     confirm(w, run, c, after.present, it, ver);
     stale(w, it, remaining, run.nowIso);
     lostNames(w, stillLost);
-    if (run.liveRead) w.remove(MARKER);
     if (penalty) penalize(w, it, after.keptFraction, after.lost.length);
     return w;
   };
@@ -1403,7 +1421,7 @@ async function* repoCheck(run: Run, req: RepoCheckRequest): AsyncGenerator<Strea
   /** Record a repo check's end on the item (not in a dry run) and log it. */
   const finish = async (v: Outcome, extra: (w: Write, it: Item) => void = () => {}, fields: LogFields = {}): Promise<MaintenanceResult> => {
     if (req.dry_run) {
-      const w = new Write().remove(...CLAIM);
+      const w = run.releasing(new Write());
       extra(w, item!);
       await run.state(w);
       run.log('repo_check', { file: filePath, outcome: v.outcome, ...fields, note: v.note });
