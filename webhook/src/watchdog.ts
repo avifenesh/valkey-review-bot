@@ -8,11 +8,13 @@ import { heartbeatRunKey, pullRequestRunPrefix } from './review-envelope.js';
  * heartbeat record as it goes. So a redelivered review message means
  * "check on the run", not "it failed":
  *
+ *   - no record, or another message's   -> never ran; run it on the
+ *                                          primary model (see below)
  *   - heartbeat completed               -> done; delete the message
  *   - older than the run budget         -> give up; delete with an error log
  *   - heartbeat running and fresh       -> alive; leave the message for
  *                                          the next visibility timeout
- *   - heartbeat stale, failed or absent -> dead; run again on the
+ *   - heartbeat stale or failed         -> dead; run again on the
  *                                          fallback model
  *
  * In that order: a run that completed after the last check is not
