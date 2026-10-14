@@ -399,6 +399,61 @@ events while it waits join it, so a burst gets one review of the newest
 head. Passed to the receiver as `PUSH_REVIEW_DELAY_SECONDS`. The delay comes
 out of the review's 90-minute run budget.
 
+## Upgrading and rolling back
+
+### Upgrading a deployment that already reviews pull requests
+
+Earlier versions reviewed a pull request only when it was opened, reopened
+or marked ready, and kept no round counter. After the upgrade:
+
+- Reviews of new commits start at once on every open pull request. A pull
+  request that was open at the deploy has no round counter, so one that the
+  earlier receiver reviewed when it opened can still get
+  `maxAutomaticReviewsPerPr` reviews of new commits, one more than the cap.
+  These reviews share each route's `dailyReviewBudget` with new pull
+  requests, and an event that finds the budget used up is not reviewed
+  until the pull request's next push or a manual redelivery. On busy
+  repositories, set a lower `maxAutomaticReviewsPerPr` (with 1, new pull
+  requests get no reviews of new commits) or a higher `dailyReviewBudget`
+  for the first weeks, and watch the receiver's `[auto-review]` and
+  `[budget]` lines.
+- In the first hour after `ValkeyReviewWebhook` is deployed,
+  `[auto-review] ... joins the waiting review; skipped` lines for a pull
+  request opened, reopened or marked ready during the update are
+  expected. The receiver and the workers update in parallel, a worker of
+  the earlier version does not remove the pending marker of a review the
+  new receiver queued, and the marker expires an hour later. Until then,
+  new commits on that pull request are not reviewed.
+
+Then roll out the skill lifecycle in report mode
+([below](#rollout-in-report-mode)).
+
+### Rolling back
+
+A straight `npx cdk deploy --all` of an earlier version fails at its first
+stack. This version adds two cross-stack imports: `ValkeyReviewerDecay`
+imports the curator queue from `ValkeyReviewWebhook`, and, with
+`skillsRepo` set, `ValkeyReviewerCurator` imports the skills-repo broker
+from `ValkeyReviewerSubstrate`. An earlier version deploys the substrate
+and webhook stacks first, and CloudFormation refuses to delete an export
+that another stack still imports. From a checkout of the earlier version:
+
+1. Remove from `deploy.config.json` the keys that version does not know,
+   since its parser rejects unknown keys: `skillLifecycle`, `skillsRepo`,
+   `maxAutomaticReviewsPerPr`, `pushReviewDelaySeconds` and
+   `decay.graduatedHalfLifeDays`.
+2. Deploy the two importing stacks first, which drops the imports, then
+   the rest:
+   ```sh
+   npx cdk deploy ValkeyReviewerDecay ValkeyReviewerCurator --exclusively
+   npx cdk deploy --all
+   ```
+
+The earlier decay job decays every concern record on `decay.halfLifeDays`
+and deletes it below the floor, graduated records and tombstones included.
+Their skills stay in the registries, and reviewers keep loading the live
+ones.
+
 ## Skill lifecycle operations
 
 The daily decay job schedules skill checks and retirements, and the

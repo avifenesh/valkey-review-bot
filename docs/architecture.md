@@ -210,7 +210,9 @@ conditioned on the count being below `MAX_AUTOMATIC_REVIEWS_PER_PR`
 (default 3, 1 to 20), counting the first review. It expires 180 days after
 the pull request's latest automatic review. @mentions and thread replies
 take no round. Open pull requests at the time of the deploy start with no
-counter.
+counter, so one an earlier version reviewed when it opened can get the cap
+in reviews of new commits on top of that review
+([Upgrading](../infra/README.md#upgrading-a-deployment-that-already-reviews-pull-requests)).
 
 A review that is not queued (at the cap, at the budget, or on a failed
 send) gives back what it took, newest first: the round, the marker and the
