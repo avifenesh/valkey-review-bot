@@ -5,6 +5,7 @@ The Lambda functions between GitHub and the AgentCore runtimes.
 | Entry point | Role |
 | --- | --- |
 | `src/receiver.ts` | Behind the HTTP API. Verifies each GitHub App delivery and turns it into a queue message: a review on the route's queue, or maintainer feedback on the curator queue. |
+| `src/authorizer.ts` | Lambda authorizer on the webhook route. Passes only requests with the headers GitHub sends on every delivery (signature, event, delivery id, `GitHub-Hookshot/` user agent). It cannot see the body, so it does not check the signature; the receiver does. |
 | `src/invoker.ts` | One worker per queue. Forwards each message to its AgentCore runtime and, for reviews, uses SQS redelivery to watch over long runs. |
 | `src/token-broker.ts` | Gives a reviewer runtime a short-lived installation token for the one repository it reviews. The checks are in `src/broker.ts`. |
 | `src/skills-repo-broker.ts` | Gives the curator a short-lived token for the bot's own repository, to open pull requests that propose edits to the reviewers' skill files. Deployed only when `skillsRepo` is configured. |

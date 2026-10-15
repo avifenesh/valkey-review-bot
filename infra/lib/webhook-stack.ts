@@ -8,6 +8,7 @@ import * as sqs from 'aws-cdk-lib/aws-sqs';
 import * as dynamodb from 'aws-cdk-lib/aws-dynamodb';
 import * as apigwv2 from 'aws-cdk-lib/aws-apigatewayv2';
 import * as apigwv2int from 'aws-cdk-lib/aws-apigatewayv2-integrations';
+import * as apigwv2auth from 'aws-cdk-lib/aws-apigatewayv2-authorizers';
 import * as logs from 'aws-cdk-lib/aws-logs';
 import * as secretsmanager from 'aws-cdk-lib/aws-secretsmanager';
 import * as lambdaEventSources from 'aws-cdk-lib/aws-lambda-event-sources';
@@ -302,10 +303,32 @@ export class WebhookStack extends cdk.Stack {
       throttlingRateLimit: API_RATE_LIMIT,
       throttlingBurstLimit: API_BURST_LIMIT,
     };
+    // Rejects requests that are not shaped like a GitHub delivery before
+    // they reach the receiver. The receiver's HMAC check is still the
+    // authentication; see webhook/src/authorizer.ts.
+    const authorizerFn = new nodelambda.NodejsFunction(this, 'WebhookAuthorizerFn', {
+      entry: path.join(webhookSrc, 'authorizer.ts'),
+      runtime: lambda.Runtime.NODEJS_24_X,
+      architecture: lambda.Architecture.ARM_64,
+      timeout: cdk.Duration.seconds(5),
+      memorySize: 128,
+      logGroup: new logs.LogGroup(this, 'WebhookAuthorizerFnLogs', { retention: logs.RetentionDays.ONE_MONTH }),
+      projectRoot: webhookRoot,
+      depsLockFilePath: depsLock,
+      bundling,
+    });
+    const authorizer = new apigwv2auth.HttpLambdaAuthorizer('GitHubDeliveryAuthorizer', authorizerFn, {
+      responseTypes: [apigwv2auth.HttpLambdaResponseType.SIMPLE],
+      // API Gateway answers 401 without invoking the function when one is missing.
+      identitySource: ['$request.header.X-Hub-Signature-256', '$request.header.X-GitHub-Event'],
+      // Every delivery has its own signature, so a cache would never hit.
+      resultsCacheTtl: cdk.Duration.seconds(0),
+    });
     api.addRoutes({
       path: '/webhook',
       methods: [apigwv2.HttpMethod.POST],
       integration: new apigwv2int.HttpLambdaIntegration('ReceiverIntegration', receiver),
+      authorizer,
     });
 
     new cdk.CfnOutput(this, 'ApiUrl', {

@@ -445,6 +445,22 @@ describe('webhook', () => {
     });
   });
 
+  test('the webhook route has a Lambda authorizer', () => {
+    const t = s.template(s.stacks.webhook);
+    t.hasResourceProperties('AWS::ApiGatewayV2::Authorizer', {
+      AuthorizerType: 'REQUEST',
+      AuthorizerPayloadFormatVersion: '2.0',
+      EnableSimpleResponses: true,
+      AuthorizerResultTtlInSeconds: 0,
+      IdentitySource: ['$request.header.X-Hub-Signature-256', '$request.header.X-GitHub-Event'],
+    });
+    t.hasResourceProperties('AWS::ApiGatewayV2::Route', {
+      RouteKey: 'POST /webhook',
+      AuthorizationType: 'CUSTOM',
+      AuthorizerId: Match.anyValue(),
+    });
+  });
+
   test('receiver settings come from the configuration', () => {
     const env = functionEnv(s.template(s.stacks.webhook), 'ReceiverFn');
     expect(env).toMatchObject({
