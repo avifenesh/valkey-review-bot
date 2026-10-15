@@ -10,7 +10,7 @@ import { RegionInfo } from 'aws-cdk-lib/region-info';
  * documents every key.
  */
 
-export const REVIEWER_IDS = ['valkey-review', 'valkey-glide-review'] as const;
+export const REVIEWER_IDS = ['valkey-review', 'valkey-glide-review', 'valkey-review-bot-review'] as const;
 export type ReviewerId = (typeof REVIEWER_IDS)[number];
 
 /** Effort levels both providers accept (Bedrock Converse output_config and Mantle reasoning). */
@@ -368,6 +368,7 @@ export function parseDeploymentConfig(raw: unknown, env: { readonly CDK_DEFAULT_
   const skillsRegistries: SkillsRegistries = {
     'valkey-review': registry('valkey-review'),
     'valkey-glide-review': registry('valkey-glide-review'),
+    'valkey-review-bot-review': registry('valkey-review-bot-review'),
     curator: registry('curator'),
   };
 
@@ -423,6 +424,9 @@ export function parseDeploymentConfig(raw: unknown, env: { readonly CDK_DEFAULT_
     }),
     'valkey-glide-review': r.string(upRaw['valkey-glide-review'], 'upstreamRepos.valkey-glide-review', {
       pattern: REPO, hint: 'owner/name, or empty to use the pull request repository', fallback: 'valkey-io/valkey-glide', allowEmpty: true,
+    }),
+    'valkey-review-bot-review': r.string(upRaw['valkey-review-bot-review'], 'upstreamRepos.valkey-review-bot-review', {
+      pattern: REPO, hint: 'owner/name, or empty to use the pull request repository', fallback: 'valkey-io/valkey-review-bot', allowEmpty: true,
     }),
   };
 
@@ -623,6 +627,7 @@ function parseAgents(r: Reader, value: unknown): AgentsConfig {
   return {
     'valkey-review': reviewer('valkey-review'),
     'valkey-glide-review': reviewer('valkey-glide-review'),
+    'valkey-review-bot-review': reviewer('valkey-review-bot-review'),
     curator: {
       maxIterations: r.number(c.maxIterations, 'agents.curator.maxIterations', { fallback: 40, ...MAX_ITERATIONS }),
       maxTokens: r.number(c.maxTokens, 'agents.curator.maxTokens', { fallback: 16_384, ...MAX_TOKENS }),

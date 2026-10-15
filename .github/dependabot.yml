@@ -17,6 +17,14 @@ updates:
       security-and-patches:
         update-types: [minor, patch]
   - package-ecosystem: npm
+    directory: "/agents/valkey-review-bot-review"
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 5
+    groups:
+      security-and-patches:
+        update-types: [minor, patch]
+  - package-ecosystem: npm
     directory: "/agents/common"
     schedule:
       interval: weekly
@@ -63,6 +71,11 @@ updates:
     open-pull-requests-limit: 3
   - package-ecosystem: docker
     directory: "/agents/valkey-glide-review"
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 3
+  - package-ecosystem: docker
+    directory: "/agents/valkey-review-bot-review"
     schedule:
       interval: weekly
     open-pull-requests-limit: 3

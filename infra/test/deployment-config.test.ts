@@ -7,6 +7,7 @@ import {
   loadDeploymentConfig,
   parseDeploymentConfig,
   resolveConfigPath,
+  REVIEWER_IDS,
   tokenBrokerRepos,
 } from '../lib/deployment-config';
 import { ACCOUNT, fixture } from './helpers';
@@ -44,9 +45,12 @@ describe('defaults', () => {
     expect(config.agents).toEqual({
       'valkey-review': { maxIterations: 150, maxTokens: 32768, allowBuild: true, allowWrite: true },
       'valkey-glide-review': { maxIterations: 150, maxTokens: 32768, allowBuild: true, allowWrite: true },
+      'valkey-review-bot-review': { maxIterations: 150, maxTokens: 32768, allowBuild: true, allowWrite: true },
       curator: { maxIterations: 40, maxTokens: 16384, graduationThreshold: 4 },
     });
-    expect(config.upstreamRepos).toEqual({ 'valkey-review': 'valkey-io/valkey', 'valkey-glide-review': 'valkey-io/valkey-glide' });
+    expect(config.upstreamRepos).toEqual({
+      'valkey-review': 'valkey-io/valkey', 'valkey-glide-review': 'valkey-io/valkey-glide', 'valkey-review-bot-review': 'valkey-io/valkey-review-bot',
+    });
     expect(config.decay).toEqual({ halfLifeDays: 30, floor: 0.05, graduatedHalfLifeDays: 180 });
     // Report mode: nothing edits, retires or opens a pull request until the operator turns it on.
     expect(config.skillLifecycle).toEqual({
@@ -100,6 +104,8 @@ describe('defaults', () => {
     const config = parseDeploymentConfig(fixture());
     expect(tokenBrokerRepos(config, 'valkey-review')).toEqual(['example-org/valkey', 'upstream-org/valkey']);
     expect(tokenBrokerRepos(config, 'valkey-glide-review')).toEqual(['example-org/valkey-glide']);
+    // No route in the fixture: the broker issues no token at all.
+    expect(tokenBrokerRepos(config, 'valkey-review-bot-review')).toEqual([]);
   });
 
   test('a repository named . or .. is refused, as the decay job and the curator refuse it', () => {
@@ -118,6 +124,7 @@ describe('defaults', () => {
     const config = parseDeploymentConfig(withChange((raw) => { raw.upstreamRepos = { 'valkey-review': '' }; }));
     expect(config.upstreamRepos['valkey-review']).toBe('');
     expect(config.upstreamRepos['valkey-glide-review']).toBe('valkey-io/valkey-glide');
+    expect(config.upstreamRepos['valkey-review-bot-review']).toBe('valkey-io/valkey-review-bot');
   });
 });
 
@@ -200,8 +207,9 @@ describe('skillsRegistries', () => {
     }
   });
 
-  test('every registry is required', () => {
-    expect(problems(withChange((raw) => { delete raw.skillsRegistries.curator; }))).toContain('skillsRegistries.curator is required');
+  // Every reviewer id is deployed, so a configuration without its registry no longer parses.
+  test.each([...REVIEWER_IDS, 'curator'])('the %s registry is required', (id) => {
+    expect(problems(withChange((raw) => { delete raw.skillsRegistries[id]; }))).toContain(`skillsRegistries.${id} is required`);
   });
 });
 
@@ -229,7 +237,7 @@ describe('routes', () => {
       raw.routes[1].reviewer = 'valkey-other-review';
     }));
     expect(message).toContain('routes[0].repo must be owner/name');
-    expect(message).toContain('routes[1].reviewer must be one of valkey-review, valkey-glide-review');
+    expect(message).toContain('routes[1].reviewer must be one of valkey-review, valkey-glide-review, valkey-review-bot-review (got "valkey-other-review")');
   });
 
   test('flags are booleans and the allowlist holds logins', () => {
@@ -370,9 +378,11 @@ describe('numbers', () => {
   const agentLimits: [string, number, number][] = [
     ['valkey-review.maxIterations', 1, 500],
     ['valkey-glide-review.maxIterations', 1, 500],
+    ['valkey-review-bot-review.maxIterations', 1, 500],
     ['curator.maxIterations', 1, 500],
     ['valkey-review.maxTokens', 1024, 200_000],
     ['valkey-glide-review.maxTokens', 1024, 200_000],
+    ['valkey-review-bot-review.maxTokens', 1024, 200_000],
     ['curator.maxTokens', 1024, 200_000],
     ['curator.graduationThreshold', 2, 100],
   ];

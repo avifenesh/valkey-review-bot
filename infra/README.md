@@ -10,7 +10,7 @@ secret names.
 | Stack | Contents |
 | --- | --- |
 | `ValkeyReviewerSubstrate` | KMS key, prompt and skill bucket, reference to the GitHub App secret, one token broker Lambda per reviewer, the skills-repo token broker Lambda when `skillsRepo` is set, run heartbeat table |
-| `ValkeyReviewAgent`, `ValkeyGlideReviewAgent` | One reviewer each: AgentCore runtime, its execution role, its concerns table, prompt and skill upload |
+| `ValkeyReviewAgent`, `ValkeyGlideReviewAgent`, `ValkeyReviewBotReviewAgent` | One reviewer each: AgentCore runtime, its execution role, its concerns table, prompt and skill upload |
 | `ValkeyReviewerCurator` | Curator runtime and its execution role, and the upload of `prompt.md`, `skill.md` and `skill-check.md` under `curator/` |
 | `ValkeyReviewWebhook` | HTTP API, receiver Lambda, idempotency table, one queue and worker per route, the curator queue and worker, dead-letter queues |
 | `ValkeyReviewerDecay` | Daily Lambda that decays concerns and queues skill checks and retirements on the curator queue |
@@ -76,10 +76,10 @@ permissions are granted only when an `openai.*` model is configured.
 ## Before the first deployment
 
 1. Install Node.js 24 or later, Docker and the AWS CLI. `cdk deploy`
-   builds the three agent images for linux/arm64. On an x86 machine
-   Docker needs arm64 emulation (buildx with QEMU; Docker Desktop
-   includes it), or deploy from an arm64 machine. The operator scripts in
-   `scripts/` use the AWS CLI.
+   builds the four agent images (three reviewers and the curator) for
+   linux/arm64. On an x86 machine Docker needs arm64 emulation (buildx
+   with QEMU; Docker Desktop includes it), or deploy from an arm64
+   machine. The operator scripts in `scripts/` use the AWS CLI.
 2. Bootstrap CDK in the target account and region, preferably an account
    used for nothing else (see [Stacks](#stacks)):
    `npx cdk bootstrap aws://ACCOUNT/REGION`. If you use a custom qualifier,
@@ -100,7 +100,7 @@ permissions are granted only when an `openai.*` model is configured.
    ```json
    { "app_id": "123456", "private_key": "-----BEGIN RSA PRIVATE KEY-----\n...", "webhook_secret": "..." }
    ```
-5. Create three registries in AWS Agent Registry in the same account and
+5. Create four registries in AWS Agent Registry in the same account and
    region: one per reviewer and one for the curator. This app does not
    create them. Put their IDs or ARNs under `skillsRegistries`.
 6. Make sure the account can invoke every model in `models`.
@@ -202,7 +202,7 @@ value as an empty list.
 
 ### `skillsRegistries`
 
-All three are required. Each value is a registry ID (letters, digits, `_`,
+All four are required, also for a reviewer with no route. Each value is a registry ID (letters, digits, `_`,
 `-`, up to 64 characters) or an `agent-registry` registry ARN in the same
 partition, region and account as `aws`.
 
@@ -210,6 +210,7 @@ partition, region and account as `aws`.
 | --- | --- |
 | `valkey-review` | Graduated skills for the Valkey reviewer. |
 | `valkey-glide-review` | Graduated skills for the Valkey GLIDE reviewer. |
+| `valkey-review-bot-review` | Graduated skills for the reviewer of this repository, valkey-io/valkey-review-bot. |
 | `curator` | The curator's own reference material, such as how to write a skill. |
 
 ### `routes`
@@ -220,9 +221,9 @@ reviewer. The token broker issues tokens only for these repositories.
 | Key | Default | Meaning |
 | --- | --- | --- |
 | `id` | required | Route name: letters, digits and hyphens. It names the route's queue and worker, so keep it stable once deployed. Ids must stay unique after hyphens are removed. |
-| `reviewer` | required | `valkey-review` or `valkey-glide-review`. |
+| `reviewer` | required | `valkey-review`, `valkey-glide-review` or `valkey-review-bot-review`. |
 | `repo` | required | `owner/name`, spelled as GitHub shows it. A repository can appear in one route only (compared case-insensitively). |
-| `threadReplyReview` | `false` | A maintainer tagging the bot in a reply inside any review thread starts a review. In a thread the bot started, that review answers the reply from the code: it verifies a claimed fix, re-checks a disputed finding (and withdraws it if the reply is right), or answers a question. In any other thread the tag is an ordinary summons. When `false`, tags in review-thread replies start nothing (the replies are still feedback). Enable it on every route where maintainers should be able to answer the bot; the example does so on both routes. |
+| `threadReplyReview` | `false` | A maintainer tagging the bot in a reply inside any review thread starts a review. In a thread the bot started, that review answers the reply from the code: it verifies a claimed fix, re-checks a disputed finding (and withdraws it if the reply is right), or answers a question. In any other thread the tag is an ordinary summons. When `false`, tags in review-thread replies start nothing (the replies are still feedback). Enable it on every route where maintainers should be able to answer the bot; the example does so on every route. |
 | `skipDrafts` | `false` | Draft pull requests are not reviewed when opened or pushed to; the review runs when the draft is marked ready. |
 | `mentionOnly` | `false` | No automatic reviews, on open, reopen or new commits. Reviews run only when a maintainer tags the bot. |
 | `authorAllowlist` | `[]` | When not empty, only pull requests by these logins get automatic reviews. |
@@ -247,6 +248,7 @@ apply. A repository named `.` or `..` is refused.
 | --- | --- |
 | `valkey-review` | `valkey-io/valkey` |
 | `valkey-glide-review` | `valkey-io/valkey-glide` |
+| `valkey-review-bot-review` | `valkey-io/valkey-review-bot` |
 
 ### `models`
 
@@ -305,10 +307,10 @@ models.
 
 | Key | Default | Meaning |
 | --- | --- | --- |
-| `valkey-review.maxIterations`, `valkey-glide-review.maxIterations` | `150` | Maximum model calls per review, retries included (1 to 500). |
-| `valkey-review.maxTokens`, `valkey-glide-review.maxTokens` | `32768` | Output token limit per model call (1024 to 200000). |
-| `valkey-review.allowBuild`, `valkey-glide-review.allowBuild` | `true` | Lets the reviewer run the repository's build and tests. |
-| `valkey-review.allowWrite`, `valkey-glide-review.allowWrite` | `true` | Lets the reviewer write files in its checkout, for example a test that checks a claim. |
+| `valkey-review.maxIterations`, `valkey-glide-review.maxIterations`, `valkey-review-bot-review.maxIterations` | `150` | Maximum model calls per review, retries included (1 to 500). |
+| `valkey-review.maxTokens`, `valkey-glide-review.maxTokens`, `valkey-review-bot-review.maxTokens` | `32768` | Output token limit per model call (1024 to 200000). |
+| `valkey-review.allowBuild`, `valkey-glide-review.allowBuild`, `valkey-review-bot-review.allowBuild` | `true` | Lets the reviewer run the repository's build and tests. |
+| `valkey-review.allowWrite`, `valkey-glide-review.allowWrite`, `valkey-review-bot-review.allowWrite` | `true` | Lets the reviewer write files in its checkout, for example a test that checks a claim. |
 | `curator.maxIterations` | `40` | Maximum tool rounds per feedback event (1 to 500). |
 | `curator.maxTokens` | `16384` | Output token limit per model call (1024 to 200000). |
 | `curator.graduationThreshold` | `4` | Distinct reinforcements a concern needs before the curator may write it to a reviewer's skills registry (2 to 100). |
@@ -431,6 +433,14 @@ or marked ready, and kept no round counter. After the upgrade:
   new receiver queued, and the marker expires an hour later. Until then,
   new commits on that pull request are not reviewed.
 
+The `valkey-review-bot-review` reviewer, for pull requests to this
+repository, is new as well. Every reviewer id is always deployed, so
+synthesis fails on `skillsRegistries.valkey-review-bot-review is required`
+until you create a registry for it (step 5 of
+[Before the first deployment](#before-the-first-deployment)) and add it to
+`skillsRegistries`. Without a route it reviews nothing, but its image,
+runtime, token broker and concerns table are still deployed.
+
 Then roll out the skill lifecycle in report mode
 ([below](#rollout-in-report-mode)).
 
@@ -502,7 +512,7 @@ pull request. A dry run (below) records even less.
    node scripts/registry-skills.mjs adopt --stack ValkeyReviewAgent --curator-stack ValkeyReviewerCurator --region REGION
    node scripts/registry-skills.mjs adopt --stack ValkeyReviewAgent --curator-stack ValkeyReviewerCurator --region REGION --apply
    ```
-   Do the same for `ValkeyGlideReviewAgent`. A skill that cites no
+   Do the same for `ValkeyGlideReviewAgent` and `ValkeyReviewBotReviewAgent`. A skill that cites no
    directory, only bare file names such as `server.c`, goes to the bucket
    `--bucket` names (default `**`, which the curator never lists, so
    maintainers could not reinforce it): pass the project's main source
@@ -587,7 +597,7 @@ so the next real pass checks the same skills again.
   `[decay] <table> scanned= decayed= deleted= skipped= errors= kept_retired= checks_requested= retire_requested= would_retire= deferred= retire_backoff= reserved=`.
 - The records themselves:
   ```sh
-  scripts/concerns-dump.sh --stack ValkeyReviewAgent --stack ValkeyGlideReviewAgent --region REGION
+  scripts/concerns-dump.sh --stack ValkeyReviewAgent --stack ValkeyGlideReviewAgent --stack ValkeyReviewBotReviewAgent --region REGION
   ```
   For each graduated record it prints the skill state, the last check, the
   stale names, a maintenance request in flight, and the pending edit: its
@@ -678,6 +688,7 @@ changes it:
 ```sh
 node scripts/skill-facts.mjs --file agents/valkey-review/config/skill.md --repo valkey-io/valkey
 node scripts/skill-facts.mjs --file agents/valkey-glide-review/config/skill.md --repo valkey-io/valkey-glide
+node scripts/skill-facts.mjs --file agents/valkey-review-bot-review/config/skill.md --repo valkey-io/valkey-review-bot
 ```
 
 It makes an anonymous checkout of the default branch tip in a temporary

@@ -94,7 +94,7 @@ setting a new reviewer touches, and starts with the issue step 1 asks for.
 The repository has one npm package per component. Node.js 24 or later is required.
 
 ```sh
-pkgs="agents/common agents/curator agents/valkey-review agents/valkey-glide-review webhook ops infra scripts"
+pkgs="agents/common agents/curator agents/valkey-review agents/valkey-glide-review agents/valkey-review-bot-review webhook ops infra scripts"
 for pkg in $pkgs; do (cd "$pkg" && npm ci); done
 for pkg in $pkgs; do (cd "$pkg" && npm run --if-present typecheck && npm run --if-present test); done
 ```

@@ -15,6 +15,7 @@ export function fixture(): any {
     skillsRegistries: {
       'valkey-review': 'valkeyRegistry1',
       'valkey-glide-review': 'glideRegistry1',
+      'valkey-review-bot-review': 'reviewBotRegistry1',
       curator: 'curatorRegistry1',
     },
     routes: [

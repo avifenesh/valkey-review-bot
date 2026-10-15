@@ -11,6 +11,7 @@
   "skillsRegistries": {
     "valkey-review": "your-valkey-review-registry-id",
     "valkey-glide-review": "your-valkey-glide-review-registry-id",
+    "valkey-review-bot-review": "your-valkey-review-bot-review-registry-id",
     "curator": "your-curator-registry-id"
   },
   "routes": [
@@ -24,6 +25,13 @@
       "id": "valkey-glide-review",
       "reviewer": "valkey-glide-review",
       "repo": "your-org/valkey-glide",
+      "threadReplyReview": true
+    },
+    {
+      "id": "valkey-review-bot-review",
+      "reviewer": "valkey-review-bot-review",
+      "repo": "your-org/valkey-review-bot",
+      "mentionOnly": true,
       "threadReplyReview": true
     }
   ],
