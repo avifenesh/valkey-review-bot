@@ -141,6 +141,15 @@ HTTP API -> receiver -+-> route queue -> route worker -> reviewer runtime -> Git
 
 ## 2. The receiver
 
+### Authorizer
+
+The route has a Lambda authorizer (`webhook/src/authorizer.ts`). API Gateway
+answers 401 itself when `X-Hub-Signature-256` or `X-GitHub-Event` is missing,
+and the authorizer rejects requests whose GitHub headers are malformed. It
+has no cache, because every delivery has its own signature. It cannot
+authenticate: an HTTP API authorizer does not see the body, so the HMAC
+check below stays the only proof that a delivery came from GitHub.
+
 ### Signature check
 
 `verifySignature` (`webhook/src/signature.ts`) computes the HMAC-SHA256 of

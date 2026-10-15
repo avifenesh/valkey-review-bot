@@ -12,7 +12,7 @@ secret names.
 | `ValkeyReviewerSubstrate` | KMS key, prompt and skill bucket, reference to the GitHub App secret, one token broker Lambda per reviewer, the skills-repo token broker Lambda when `skillsRepo` is set, run heartbeat table |
 | `ValkeyReviewAgent`, `ValkeyGlideReviewAgent` | One reviewer each: AgentCore runtime, its execution role, its concerns table, prompt and skill upload |
 | `ValkeyReviewerCurator` | Curator runtime and its execution role, and the upload of `prompt.md`, `skill.md` and `skill-check.md` under `curator/` |
-| `ValkeyReviewWebhook` | HTTP API, receiver Lambda, idempotency table, one queue and worker per route, the curator queue and worker, dead-letter queues |
+| `ValkeyReviewWebhook` | HTTP API with a Lambda authorizer, receiver Lambda, idempotency table, one queue and worker per route, the curator queue and worker, dead-letter queues |
 | `ValkeyReviewerDecay` | Daily Lambda that decays concerns and queues skill checks and retirements on the curator queue |
 
 Each runtime has its own role:
