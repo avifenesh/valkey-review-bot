@@ -75,7 +75,7 @@ function normalizeDir(dir: string): string {
 }
 
 /** `run <script>` or `test`, then nothing or `--` and the script's own arguments. */
-function checkNpm(args: readonly string[]): string | null {
+function checkNpm(args: readonly string[], dir: string): string | null {
   let rest: readonly string[];
   if (args[0] === 'run') {
     if (!NPM_SCRIPTS.includes(args[1] ?? '')) {
@@ -87,6 +87,13 @@ function checkNpm(args: readonly string[]): string | null {
   }
   if (rest.length > 0 && rest[0] !== '--') {
     return `npm takes no options of its own here. Pass arguments for the script after "--", e.g. ["test", "--", "--testNamePattern=Webhook"]. Got "${rest[0]}".`;
+  }
+  // infra's tsc has no outDir: it writes lib/*.js and bin/*.js next to the
+  // sources. They are gitignored, so they survive the workspace reset, and
+  // jest resolves .js before .ts, so later test runs would load them
+  // instead of the pull request's code.
+  if (args[0] === 'run' && args[1] === 'build' && normalizeDir(dir) === 'infra') {
+    return 'npm run build is not allowed in infra: it writes .js files next to the sources, and later jest runs would load those instead of the .ts. Use npm run typecheck.';
   }
   return null;
 }
@@ -143,6 +150,16 @@ function checkNodeTest(args: readonly string[]): string | null {
   return null;
 }
 
+/**
+ * The argv to run for an accepted call. cdk synth always gets --no-notices,
+ * so the CLI does not fetch its notices from the network.
+ */
+export function finalArgs(subcommand: Subcommand, args: readonly string[]): string[] {
+  const out = [...SUBCOMMANDS[subcommand].prefix, ...args];
+  if (subcommand === 'npx' && args[0] === 'cdk' && !args.includes('--no-notices')) out.push('--no-notices');
+  return out;
+}
+
 /** Why the argv is refused in `dir`, or null when it may run. */
 export function checkBuildArgs(subcommand: Subcommand, args: readonly string[], dir: string): string | null {
   const spec = SUBCOMMANDS[subcommand];
@@ -150,7 +167,7 @@ export function checkBuildArgs(subcommand: Subcommand, args: readonly string[], 
   if (!spec.actions.includes(args[0])) {
     return `${subcommand} action "${args[0]}" not allowed. Allowed: ${spec.actions.join(', ')}.`;
   }
-  if (subcommand === 'npm') return checkNpm(args);
+  if (subcommand === 'npm') return checkNpm(args, dir);
   if (subcommand === 'node') return checkNodeTest(args);
   return args[0] === 'tsc' ? checkTsc(args) : checkCdk(args, dir);
 }
@@ -160,8 +177,8 @@ export function describeBuildTool(): string {
   const list = (s: Subcommand) => SUBCOMMANDS[s].actions.join(', ');
   return `Run a type-check, test, build or CDK synth in one package of the valkey-review-bot checkout. \`args\` is an argv array with no shell. \`args[0]\` is the action. \`dir\` is the package directory, such as \`infra\`, \`webhook\`, \`ops\`, \`scripts\` or \`agents/common\`.
 
-- \`npm\`: ${list('npm')}. \`npm run\` starts only ${NPM_SCRIPTS.join(', ')}. npm takes no options of its own. Arguments after \`--\` go to the script.
-- \`npx\`: ${list('npx')}. \`npx tsc\` needs \`--noEmit\` and takes ${TSC_OPTIONS.filter((o) => o !== '--noEmit').join(', ')}. \`npx cdk\` runs only \`synth\`, only in \`infra\`, with \`-c config=<file>\` (for example \`config=deploy.config.example.json\`), stack names, and ${CDK_OPTIONS.join(', ')}. npx never installs a missing package.
+- \`npm\`: ${list('npm')}. \`npm run\` starts only ${NPM_SCRIPTS.join(', ')}, and not build in \`infra\`. npm takes no options of its own. Arguments after \`--\` go to the script.
+- \`npx\`: ${list('npx')}. \`npx tsc\` needs \`--noEmit\` and takes ${TSC_OPTIONS.filter((o) => o !== '--noEmit').join(', ')}. \`npx cdk\` runs only \`synth\`, only in \`infra\`, with \`-c config=<file>\` (for example \`config=deploy.config.example.json\`), stack names, and ${CDK_OPTIONS.join(', ')}. npx never installs a missing package, and cdk synth always runs with --no-notices.
 - \`node\`: ${list('node')} with test files by relative path, and only --experimental-strip-types, --test-name-pattern=<pattern> and --test-skip-pattern=<pattern>.
 
 Every command gets an environment without credentials, with the AWS config files and instance metadata turned off and npm offline. The packages installed are those of main when the image was built. Nothing installs, publishes or deploys.

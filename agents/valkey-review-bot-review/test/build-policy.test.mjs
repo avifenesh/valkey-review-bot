@@ -2,7 +2,7 @@ import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
 import test from 'node:test';
 import {
-  CDK_OPTIONS, NPM_SCRIPTS, OFFLINE_ENV, SUBCOMMANDS, SUBCOMMAND_NAMES, TSC_OPTIONS, buildToolEnabled, checkBuildArgs, describeBuildTool,
+  CDK_OPTIONS, NPM_SCRIPTS, OFFLINE_ENV, SUBCOMMANDS, SUBCOMMAND_NAMES, TSC_OPTIONS, buildToolEnabled, checkBuildArgs, describeBuildTool, finalArgs,
 } from '../src/tools/build-policy.ts';
 
 const ok = (sub, args, dir = 'infra') => assert.equal(checkBuildArgs(sub, args, dir), null, `${sub} ${args.join(' ')} in ${dir}`);
@@ -30,6 +30,20 @@ test('npm runs only the build, typecheck and test scripts', () => {
     refused('npm', ['run', script], /not allowed/);
   }
   assert.deepEqual([...NPM_SCRIPTS], ['build', 'typecheck', 'test']);
+});
+
+test('npm run build is refused in infra, where tsc writes .js next to the sources', () => {
+  for (const dir of ['infra', './infra', 'infra/']) refused('npm', ['run', 'build'], /not allowed in infra/, dir);
+  ok('npm', ['run', 'typecheck'], 'infra');
+  ok('npm', ['test'], 'infra');
+});
+
+test('cdk synth always runs with --no-notices', () => {
+  assert.deepEqual(finalArgs('npx', ['cdk', 'synth', '-c', 'config=deploy.config.example.json']),
+    ['--offline', '--no', '--', 'cdk', 'synth', '-c', 'config=deploy.config.example.json', '--no-notices']);
+  assert.deepEqual(finalArgs('npx', ['cdk', 'synth', '--no-notices', '-c', 'config=x.json']),
+    ['--offline', '--no', '--', 'cdk', 'synth', '--no-notices', '-c', 'config=x.json']);
+  assert.deepEqual(finalArgs('npm', ['run', 'typecheck']), ['run', 'typecheck']);
 });
 
 test('npm refuses installs, publishes and every option of its own', () => {

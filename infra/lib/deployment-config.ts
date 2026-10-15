@@ -439,6 +439,13 @@ export function parseDeploymentConfig(raw: unknown, env: { readonly CDK_DEFAULT_
   if (skillLifecycle.openPullRequests && skillsRepo === undefined) {
     r.fail('skillLifecycle.openPullRequests', 'is true but skillsRepo is not set, so there is no repository to open pull requests against');
   }
+  // A review route on the bot repository lets pull request code there get
+  // reviewer tokens for it. With the main App as the skills App, that App
+  // also holds Contents write on the repository.
+  if (skillsRepo && skillsRepo.appSecretName === github.appSecretName
+    && routes.some((route) => route.repo.toLowerCase() === skillsRepo.repo.toLowerCase())) {
+    r.fail('skillsRepo.appSecretName', `is the main App's secret, but routes review ${skillsRepo.repo}. Give skillsRepo an App of its own (infra/README.md, "The skills-repo App")`);
+  }
 
   const dailyReviewBudget = r.number(top.dailyReviewBudget, 'dailyReviewBudget', { fallback: 40, min: 0, max: 10_000, integer: true });
   // The receiver enforces the same ranges (webhook/src/config.ts); SQS

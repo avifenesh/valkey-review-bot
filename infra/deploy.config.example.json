@@ -53,7 +53,8 @@
   },
   "skillsRepo": {
     "repo": "your-org/valkey-review-bot",
-    "baseBranch": "main"
+    "baseBranch": "main",
+    "appSecretName": "valkey-reviewer/skills-repo-app"
   },
   "dailyReviewBudget": 40,
   "maxAutomaticReviewsPerPr": 3,

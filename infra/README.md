@@ -374,7 +374,7 @@ the files from it without credentials, so it must be public.
 | --- | --- | --- |
 | `repo` | required | `owner/name` of the bot repository, for example `valkey-io/valkey-review-bot`. Passed to the curator and the broker as `SKILLS_REPO`. |
 | `baseBranch` | `main` | The branch the files are read from and pull requests target: at most 100 characters, a name git accepts. `SKILLS_REPO_BASE_BRANCH`. |
-| `appSecretName` | `github.appSecretName` | Secrets Manager secret of the App that opens the pull requests, with `app_id` and `private_key` (the same JSON shape as the main App secret; `webhook_secret` is not needed). See [The skills-repo App](#the-skills-repo-app). Passed to the broker as `SKILLS_REPO_APP_SECRET_NAME`. |
+| `appSecretName` | `github.appSecretName` | Secrets Manager secret of the App that opens the pull requests, with `app_id` and `private_key` (the same JSON shape as the main App secret; `webhook_secret` is not needed). See [The skills-repo App](#the-skills-repo-app). Required to differ from it when a route reviews `repo`. Passed to the broker as `SKILLS_REPO_APP_SECRET_NAME`. |
 | `signOff` | the App's bot identity | `Name <email>` on one line for the commit's `Signed-off-by` line. The name is 1 to 100 characters, with no control characters, no `<` or `>`, and no space or other whitespace at either end. `SKILLS_REPO_SIGN_OFF`. |
 
 ### `dailyReviewBudget`
@@ -439,7 +439,12 @@ synthesis fails on `skillsRegistries.valkey-review-bot-review is required`
 until you create a registry for it (step 5 of
 [Before the first deployment](#before-the-first-deployment)) and add it to
 `skillsRegistries`. Without a route it reviews nothing, but its image,
-runtime, token broker and concerns table are still deployed.
+runtime, token broker and concerns table are still deployed. The repository
+has no GA release yet, so the decay job never queues a check of that
+reviewer's repo skill file, `agents/valkey-review-bot-review/config/skill.md`,
+not even with `recheck_all`. Check it by hand with `scripts/skill-facts.mjs`.
+A route that reviews the bot repository also needs `skillsRepo` to use an App
+of its own ([The skills-repo App](#the-skills-repo-app)).
 
 Then roll out the skill lifecycle in report mode
 ([below](#rollout-in-report-mode)).
@@ -657,6 +662,8 @@ write), and each account it is installed on, such as `valkey-io` for
 `valkey-io/valkey`, must approve that new permission. Its private key,
 which the receiver and the reviewer brokers can read, could then mint
 `contents: write` tokens for every repository the App is installed on.
+A deployment with a route that reviews the bot repository must use an App
+of its own here: the configuration refuses the main App's secret then.
 
 The receiver and the reviewer brokers ask for explicit permissions without
 Contents either way: the receiver for `pull_requests: write`,

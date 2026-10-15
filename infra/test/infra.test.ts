@@ -124,7 +124,7 @@ describe('reviewer role', () => {
     expect(JSON.stringify(bySid(bot, 'ReadAgentAssets')[0]!.Resource)).toContain('/valkey-review-bot-review/*');
     const invoke = JSON.stringify(bot.filter((st) => actionsOf(st).includes('lambda:InvokeFunction')));
     expect(invoke).toContain('TokenBrokerValkeyReviewBotReviewFn');
-    expect(invoke).not.toContain('TokenBrokerValkeyReviewFn"');
+    expect(invoke).not.toMatch(/TokenBrokerValkeyReviewFn[0-9A-F]{8}/);
     expect(invoke).not.toContain('TokenBrokerValkeyGlideReviewFn');
     expect(s.stacks.reviewers.get('valkey-review-bot-review')!.stackName).toBe('ValkeyReviewBotReviewAgent');
     expect(runtimeEnv(reviewerTemplate('valkey-review-bot-review'))).toMatchObject({
@@ -381,14 +381,16 @@ describe('skills repository', () => {
         const permissions = Object.values<any>(x.template(stack).findResources('AWS::Lambda::Permission'));
         expect(permissions.filter((p) => JSON.stringify(p).includes('SkillsRepoTokenBroker'))).toEqual([]);
       }
-      // The reviewer runtimes keep invoke on their own brokers only, and
-      // their brokers do not cover the bot repository.
+      // The reviewer runtimes keep invoke on their own brokers only. The
+      // Valkey and GLIDE brokers never cover the bot repository; the bot
+      // reviewer's broker covers it only through a route, which config
+      // validation allows only with a skills App of its own.
       for (const id of REVIEWER_IDS) {
         const t = x.template(x.stacks.reviewers.get(id)!);
         expect(JSON.stringify(statementsForRole(t, runtimeRoleId(t)))).not.toContain('SkillsRepoTokenBroker');
       }
       const substrate = x.template(x.stacks.substrate);
-      for (const fn of ['TokenBrokerValkeyReviewFn', 'TokenBrokerValkeyGlideReviewFn', 'TokenBrokerValkeyReviewBotReviewFn']) {
+      for (const fn of ['TokenBrokerValkeyReviewFn', 'TokenBrokerValkeyGlideReviewFn']) {
         expect(functionEnv(substrate, fn).ALLOWED_REPOS_JSON).not.toContain('valkey-review-bot');
       }
     }

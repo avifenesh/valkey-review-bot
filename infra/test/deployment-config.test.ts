@@ -88,6 +88,8 @@ describe('defaults', () => {
     // The example ships in report mode.
     expect(config.skillLifecycle).toMatchObject({ applyEdits: false, retireSkills: false, openPullRequests: false });
     expect(config.skillsRepo?.repo.startsWith('your-org/')).toBe(true);
+    // The example reviews the bot repository, so its skills App is a separate one.
+    expect(config.skillsRepo?.appSecretName).not.toBe(config.github.appSecretName);
   });
 
   test('the committed example spells out every skill lifecycle and review round setting at its default', () => {
@@ -503,6 +505,19 @@ describe('skillsRepo', () => {
     expect(problems(withSkillsRepo({}))).toContain('skillsRepo.repo is required');
     expect(problems(withSkillsRepo('example-org/valkey-review-bot'))).toContain('skillsRepo must be an object');
     expect(problems(withSkillsRepo({ repo: 'example-org/x', branch: 'main' }))).toContain('skillsRepo.branch is not a known setting');
+  });
+
+  test('a review route on the bot repository needs a skills App of its own', () => {
+    const routeTo = (repo: string, appSecretName?: string) => withChange((raw) => {
+      raw.skillsRepo = { repo: 'example-org/valkey-review-bot', ...(appSecretName ? { appSecretName } : {}) };
+      raw.routes = [...raw.routes, { id: 'bot-review', reviewer: 'valkey-review-bot-review', repo }];
+    });
+    const message = "skillsRepo.appSecretName is the main App's secret, but routes review example-org/valkey-review-bot. Give skillsRepo an App of its own (infra/README.md, \"The skills-repo App\")";
+    expect(problems(routeTo('example-org/valkey-review-bot'))).toContain(message);
+    expect(problems(routeTo('Example-Org/Valkey-Review-Bot'))).toContain(message);
+    expect(problems(routeTo('example-org/valkey-review-bot', 'example/github-app'))).toContain(message);
+    expect(parseDeploymentConfig(routeTo('example-org/valkey-review-bot', 'example/skills-app')).skillsRepo?.appSecretName).toBe('example/skills-app');
+    expect(parseDeploymentConfig(routeTo('example-org/other')).skillsRepo?.appSecretName).toBe('example/github-app');
   });
 
   test.each(['just-a-name', 'example-org/..', 'example-org/.', 'example-org/a b'])('repo %j is rejected', (repo) => {

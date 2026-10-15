@@ -182,8 +182,9 @@ Each of these lists the agents or reviewer ids by hand:
   reviewers and their repositories, and the `area_bucket` examples. They ship with the
   curator stack at deploy.
 - Docs that count or name the reviewers, images or registries: `README.md`,
-  `infra/README.md` (the Stacks table, "three images", "three registries", "All three
-  are required" and the `skillsRegistries` table, the routes `reviewer` row, the
+  `infra/README.md` (the Stacks table, the count of agent images in "builds the four
+  agent images", "Create four registries", "All four are required" and the
+  `skillsRegistries` table, the routes `reviewer` row, the
   `upstreamRepos` defaults table and the `agents` table) and
   [architecture.md](architecture.md).
 

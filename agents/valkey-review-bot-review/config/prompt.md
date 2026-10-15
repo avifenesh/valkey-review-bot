@@ -142,8 +142,8 @@ The PR overview in the first user message already includes existing reviews and 
 
 `build` runs one allowlisted command in one package directory (`dir`, such as `infra`, `webhook`, `ops`, `scripts`, `agents/common` or `agents/curator`). Use it only when a specific claim hinges on a type-check, test or synth outcome. `args` is an argv array with no shell, and `args[0]` is the action. Output is capped at 1 MB and 8 minutes.
 
-- `npm`: `run`, `test`. `npm run` starts only `build`, `typecheck` and `test`. npm takes no options of its own; arguments after `--` go to the script, e.g. `npm`, `args: ["run", "typecheck"]`, `dir: "webhook"` or `npm`, `args: ["test", "--", "--testNamePattern=token broker"]`, `dir: "infra"`.
-- `npx`: `tsc`, `cdk`. `npx tsc` needs `--noEmit`, e.g. `npx`, `args: ["tsc", "--noEmit", "-p", "tsconfig.json"]`, `dir: "ops"`. `npx cdk` runs only `synth`, only in `infra`, with `-c config=<file>`, e.g. `npx`, `args: ["cdk", "synth", "--quiet", "-c", "config=deploy.config.example.json"]`, `dir: "infra"`. npx never installs a missing package.
+- `npm`: `run`, `test`. `npm run` starts only `build`, `typecheck` and `test`, and not `build` in `infra`, where `tsc` writes `.js` files next to the sources that later jest runs would load. Use `typecheck` there. npm takes no options of its own; arguments after `--` go to the script, e.g. `npm`, `args: ["run", "typecheck"]`, `dir: "webhook"` or `npm`, `args: ["test", "--", "--testNamePattern=token broker"]`, `dir: "infra"`.
+- `npx`: `tsc`, `cdk`. `npx tsc` needs `--noEmit`, e.g. `npx`, `args: ["tsc", "--noEmit", "-p", "tsconfig.json"]`, `dir: "ops"`. `npx cdk` runs only `synth`, only in `infra`, with `-c config=<file>`, e.g. `npx`, `args: ["cdk", "synth", "--quiet", "-c", "config=deploy.config.example.json"]`, `dir: "infra"`. npx never installs a missing package, and `cdk synth` always gets `--no-notices`.
 - `node`: `--test`. Runs named test files, with `--experimental-strip-types`, `--test-name-pattern=<pattern>` or `--test-skip-pattern=<pattern>`, e.g. `node`, `args: ["--test", "--experimental-strip-types", "test/broker.test.mjs"]`, `dir: "webhook"`.
 
 What works in this container:

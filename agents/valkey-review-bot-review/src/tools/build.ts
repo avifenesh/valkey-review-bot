@@ -2,7 +2,7 @@ import { buildChildEnv, resolveInside } from '../../../common/src/tools/child-en
 import { runBounded } from '../../../common/src/tools/spawn.js';
 import { z } from 'zod';
 import { tool } from '@strands-agents/sdk';
-import { OFFLINE_ENV, SUBCOMMAND_NAMES, SUBCOMMANDS, checkBuildArgs, describeBuildTool } from './build-policy.js';
+import { OFFLINE_ENV, SUBCOMMAND_NAMES, SUBCOMMANDS, checkBuildArgs, describeBuildTool, finalArgs } from './build-policy.js';
 
 export function buildReviewBotBuildTool(opts: { workspaceRoot: string }) {
   return tool({
@@ -21,7 +21,7 @@ export function buildReviewBotBuildTool(opts: { workspaceRoot: string }) {
       if (!cwd) return `ERROR: dir "${input.dir}" is outside the workspace.`;
 
       const spec = SUBCOMMANDS[input.subcommand];
-      const r = await runBounded(spec.binary, [...spec.prefix, ...input.args], {
+      const r = await runBounded(spec.binary, finalArgs(input.subcommand, input.args), {
         cwd, env: { ...buildChildEnv(), ...OFFLINE_ENV }, timeoutMs: 8 * 60_000, maxBytes: 1_000_000, maxErrBytes: 128_000, graceMs: 3000,
       });
       return `${r.out}\n${r.err ? `\n--- stderr ---\n${r.err}` : ''}\n[exit ${r.code}]`;
