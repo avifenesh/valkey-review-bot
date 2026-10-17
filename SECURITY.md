@@ -37,6 +37,14 @@ away from it:
   branch and require reviews on it. The curator runs no code from a pull
   request or from upstream, has no shell, and its model never sees the token.
   Use a small App of its own for this, installed only on the bot repository.
+- A deployment can also review pull requests to the bot repository. Code in
+  those pull requests then gets that reviewer's `pull_requests: write` tokens
+  for the bot repository, like code in pull requests to any routed
+  repository. With them it can post reviews and comments as the bot, and
+  edit or close pull requests there, the curator's skill pull requests
+  included. The configuration refuses such a route unless `skillsRepo` has an
+  App of its own, so the App the reviewers use never holds Contents on that
+  repository. Keep required reviews from maintainers on its base branch.
   The receiver and the reviewer brokers ask for explicit permissions without
   `contents`, so with the reviewer App here none of their tokens carries it.
   But every account the reviewer App is installed on would have to grant it

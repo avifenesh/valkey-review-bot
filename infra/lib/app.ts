@@ -19,6 +19,11 @@ const REVIEWERS: Readonly<Record<ReviewerId, { stackId: string; workspaceRoot: s
     workspaceRoot: '/workspace/valkey-glide',
     description: 'valkey-glide-review: pull request reviewer for Valkey GLIDE (Rust core with Java, Python, Node and Go bindings).',
   },
+  'valkey-review-bot-review': {
+    stackId: 'ValkeyReviewBotReviewAgent',
+    workspaceRoot: '/workspace/valkey-review-bot',
+    description: 'valkey-review-bot-review: pull request reviewer for the Valkey review bot itself (TypeScript on Node.js, AWS CDK).',
+  },
 };
 
 export interface ValkeyReviewerStacks {

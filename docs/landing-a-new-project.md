@@ -72,7 +72,9 @@ registry for it. Tell the other operators before the change merges.
 ## 3. The agent package
 
 Copy the closest reviewer. `agents/valkey-review` fits a C or C++ project,
-`agents/valkey-glide-review` a project with several language toolchains. For
+`agents/valkey-glide-review` a project with several language toolchains, and
+`agents/valkey-review-bot-review` a TypeScript project of npm packages whose
+image installs their dependencies at build time. For
 valkey-search, copy `agents/valkey-review` to `agents/valkey-search-review`.
 
 - `package.json`: set `name` and `description`. `main` and the `start` script point at
@@ -171,16 +173,18 @@ Each of these lists the agents or reviewer ids by hand:
 - `infra/test/deployment-config.test.ts` and `infra/test/infra.test.ts`: the expected
   defaults and environment maps, and every `test.each` list and loop over reviewer ids.
   With the five code changes, the fixture and the agent's files in place, about eight
-  infra tests fail on expected maps that miss the new id. The `test.each` lists do not
-  fail: they skip the new reviewer, so the security pins (no secrets, no registry
-  writes, no concerns access for the reviewer role) do not cover it until you add the
-  id to them.
+  infra tests fail on expected maps that miss the new id. The security pins on the
+  reviewer role (no secrets, no registry writes, no concerns access) and the session
+  limit run `test.each(REVIEWER_IDS)`, so they cover the new id by themselves. The
+  lists that pair an id with its runtime name or its broker function do not fail when
+  the id is missing: they skip it until you add it.
 - `agents/curator/config/prompt.md` and `agents/curator/config/skill.md`: the list of
   reviewers and their repositories, and the `area_bucket` examples. They ship with the
   curator stack at deploy.
 - Docs that count or name the reviewers, images or registries: `README.md`,
-  `infra/README.md` (the Stacks table, "three images", "three registries", "All three
-  are required" and the `skillsRegistries` table, the routes `reviewer` row, the
+  `infra/README.md` (the Stacks table, the count of agent images in "builds the four
+  agent images", "Create four registries", "All four are required" and the
+  `skillsRegistries` table, the routes `reviewer` row, the
   `upstreamRepos` defaults table and the `agents` table) and
   [architecture.md](architecture.md).
 
@@ -405,9 +409,10 @@ Open choices for that change:
   variables, and none whose name holds `TOKEN`, `SECRET`, `PASSWORD`, `CREDENTIAL` or
   `PRIVATE_KEY`.
 - No secrets in the image.
-- No new grant on the reviewer role. Add the id to the `test.each` lists in
-  `infra/test/infra.test.ts`, so the tests that pin the reviewer role (no Secrets
-  Manager, no registry writes, no concerns table access) cover it.
+- No new grant on the reviewer role. The tests that pin the reviewer role in
+  `infra/test/infra.test.ts` (no Secrets Manager, no registry writes, no concerns
+  table access) run for every id in `REVIEWER_IDS`. Add the id to the lists there
+  that pair it with its runtime name or broker function.
 - The reviewer's broker issues tokens with `pull_requests: write` and `metadata: read`
   only, for that reviewer's review routes. No reviewer ever gets `contents`
   permission. The only path to `contents: write` is the skills-repo broker, which the

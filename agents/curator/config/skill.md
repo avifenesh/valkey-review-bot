@@ -1,6 +1,6 @@
 ---
 name: valkey-reviewer-curator
-description: "Use when curating reviewer-feedback events for the valkey-review and valkey-glide-review agents. Covers the judgment calls the base prompt leaves open: reading polarity, bump versus create, area_bucket conventions, context hygiene and graduation."
+description: "Use when curating reviewer-feedback events for the valkey-review, valkey-glide-review and valkey-review-bot-review agents. Covers the judgment calls the base prompt leaves open: reading polarity, bump versus create, area_bucket conventions, context hygiene and graduation."
 ---
 
 # valkey-reviewer curator: judgment calls
@@ -50,10 +50,14 @@ When polarity is unclear (a one-word "ok" with no context), choose
 record does.
 
 - **Top-level directory** for monorepo roots: `glide-core`, `java`,
-  `python`, `node`, `go`, `src`, `deps`, `tests`, `tests/unit/cluster`.
+  `python`, `node`, `go`, `src`, `deps`, `tests`, `tests/unit/cluster`,
+  and for the reviewer's own repository `infra`, `webhook`, `ops`,
+  `scripts`, `docs`.
 - **One level deeper on shared roots** when the concern belongs to one
   subsystem: `src/replication.c`, `src/reply_blocking.c`,
-  `glide-core/src/client`.
+  `glide-core/src/client`, and `agents/common`, `agents/curator` or
+  `infra/lib` in the reviewer's own repository. `agents` alone is too
+  broad: it holds every reviewer and the curator.
 - **No deeper than two levels.** A bucket such as
   `src/replication.c/handshake/seed-phase` is never looked up and the
   record becomes invisible.

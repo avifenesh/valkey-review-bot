@@ -26,7 +26,7 @@ jobs:
       # the runner has.
       - name: Install dependencies
         run: |
-          for pkg in agents/common agents/curator agents/valkey-review agents/valkey-glide-review webhook ops infra scripts; do
+          for pkg in agents/common agents/curator agents/valkey-review agents/valkey-glide-review agents/valkey-review-bot-review webhook ops infra scripts; do
             echo "::group::npm ci $pkg"
             (cd "$pkg" && npm ci --no-audit --no-fund)
             echo "::endgroup::"
@@ -34,7 +34,7 @@ jobs:
       - name: Type-check and test each package
         run: |
           set -euo pipefail
-          for pkg in agents/common agents/curator agents/valkey-review agents/valkey-glide-review webhook ops infra scripts; do
+          for pkg in agents/common agents/curator agents/valkey-review agents/valkey-glide-review agents/valkey-review-bot-review webhook ops infra scripts; do
             echo "::group::$pkg"
             (cd "$pkg" && npm run --if-present typecheck && npm run --if-present test)
             echo "::endgroup::"
